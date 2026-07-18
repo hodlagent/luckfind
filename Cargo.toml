@@ -1,0 +1,84 @@
+[package]
+name = "luckfind"
+version = "0.1.0"
+edition = "2021"
+description = "Bitcoin dormant address lottery — fast secp256k1 key collision scanner"
+
+[dependencies]
+# secp256k1 scalar mult + pubkey derivation (C libsecp256k1 backend)
+secp256k1 = { version = "0.31.1", features = ["hashes", "std"] }
+
+# hashing
+# `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this
+# activates the ARMv8-Crypto SHA256/SHA256H2 instructions, giving ~3-5× SHA256
+# throughput over the pure-Rust fallback. RIPEMD160 stays in Rust (no asm backend).
+sha2  = { version = "0.10", features = ["asm"] }
+ripemd = "0.1"
+
+# GPU (Metal via wgpu + naga WGSL→MSL translation)
+wgpu    = "28"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }
+anyhow = "1"
+
+# parallelism
+rayon = "1.10"
+
+# fast non-cryptographic hash for candidate set
+rustc-hash = "2.0"
+
+# timestamp formatting in got.txt lines
+chrono = "0.4"
+
+# hex encoding for MatchEvent.compact_line()
+hex = "0.4"
+
+# address base58 encoding (no dependencies, stateless)
+base58 = "0.2"
+
+# bech32 / bech32m
+bech32 = "0.11"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# for JSON adrr-list files
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# RNG — only sys_rng (getrandom 0.4) enabled, no chacha20 / no std_rng
+rand = { version = "0.10.2", default-features = false, features = ["sys_rng"] }
+
+# stdout lock for atomic progress line
+lazy_static = "1.5"
+
+# detect num_cpus when user doesn't supply --workers
+num_cpus = "1"
+
+# base58 encoding helpers
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
+# SIGINT handler for puzzle-mode checkpoint save
+ctrlc = "3.4"
+
+[dev-dependencies]
+sha2 = "0.10"
+ripemd = "0.1"
+base58 = "0.2"
+bech32 = "0.11"
+num-bigint = "0.4"
+num-traits = "0.2"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Dev-only: ripemd reference for verifying the WGSL RIPEMD160 implementation.
+[target.'cfg(dev)'.dev-dependencies]
+ripemd = "0.1"
