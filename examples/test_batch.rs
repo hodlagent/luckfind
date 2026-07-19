@@ -23,8 +23,10 @@ fn main() -> anyhow::Result<()> {
     let matches = scanner.step()?;
     println!("GPU matches: {}", matches.len());
     if let Some(m) = matches.first() {
+        // Shader stores ripemd160 output as big-endian u32 words (kangaroo
+        // convention).  Reassemble to canonical BE bytes via to_be_bytes.
         let mut h = [0u8; 20];
-        for i in 0..5 { h[4 * i..4 * i + 4].copy_from_slice(&m.hash160[i].to_le_bytes()); }
+        for i in 0..5 { h[4 * i..4 * i + 4].copy_from_slice(&m.hash160[i].to_be_bytes()); }
         println!("GPU hash160   = {}", hex::encode(h));
         println!("{}", if h == expected { "✅ MATCH" } else { "❌ mismatch" });
     }

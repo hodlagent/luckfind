@@ -13,15 +13,21 @@ pub struct LuckfindPipeline {
 
 impl LuckfindPipeline {
     pub fn new(ctx: &GpuContext) -> Result<Self> {
+        // Shader modules are concatenated in dependency order: field/curve ops
+        // first, then sha256/ripemd160 compressors (from kangaroo v0.1.0), then a
+        // thin glue layer exposing the sha256_block/ripemd160_block interface the
+        // kernel expects, then the kernel itself.
         let field = include_str!("../shaders/field.wgsl");
         let curve = include_str!("../shaders/curve.wgsl");
-        let hash = include_str!("../shaders/hash.wgsl");
+        let sha256 = include_str!("../shaders/sha256.wgsl");
+        let ripemd160 = include_str!("../shaders/ripemd160.wgsl");
+        let hash_glue = include_str!("../shaders/hash_glue.wgsl");
         let kernel = include_str!("../shaders/luckfind.wgsl");
 
-        let constants = [("WORKGROUP_SIZE", 64.0)];
+        let constants = [("WORKGROUP_SIZE", 128.0)];
         let shader = ctx.create_shader_module(
             "Luckfind Shader",
-            &[field, curve, hash, kernel],
+            &[field, curve, sha256, ripemd160, hash_glue, kernel],
         );
         let bind_group_layout = bind_group_layout(ctx);
         let pipeline_layout = ctx.device().create_pipeline_layout(

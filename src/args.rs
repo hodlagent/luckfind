@@ -48,6 +48,20 @@ pub struct Cli {
     #[arg(long)]
     pub profile: bool,
 
+    /// Use random-subrange mode together with `--puzzle <file>`.
+    ///
+    /// Each worker still claims a random *pending* sub-range from the puzzle
+    /// worklist sequentially (key += 1), but parks it after `2^31` keys and
+    /// moves on to a fresh random one — instead of sweeping each chunk to
+    /// completion.  On parking, the current scanning position is written
+    /// back into the JSON (as in classic puzzle mode), so the sub-range is
+    /// reclaimed later and resumed with no double-scanning.  The claim order
+    /// is already random, so the net effect is a "jump around the worklist"
+    /// scan that keeps the same zero-dedup guarantee.  The target address is
+    /// read from the puzzle file; `--addrs` / `--source` are ignored.
+    #[arg(long)]
+    pub random_subrange: bool,
+
     /// Path to puzzle JSON worklist file (e.g. a btcpuzzle #76 range-split).
     ///
     /// In puzzle mode the binary:
@@ -74,8 +88,6 @@ pub enum Source {
 pub struct RuntimeLimits {
     pub duration_secs:  Option<f64>,
     pub heartbeat_secs: f64,
-    #[allow(dead_code)]
-    pub load_target:    f64,    // reserved for future load-throttle impl
 }
 
 impl Cli {

@@ -94,10 +94,18 @@ struct PuzzleCtx {
 // ── public entry point ──────────────────────────────────────────────────────
 
 /// Run the puzzle loop.  Returns total keys checked and any match events.
+///
+/// `rotate_keys` enables *random-rotation* mode: each claim scans at most this
+/// many keys before the chunk is parked (status ← "pending", `current_hex`
+/// saved) and the worker moves on to a fresh random pending chunk.  `None`
+/// preserves classic behaviour — a chunk is scanned to completion per claim.
+/// When set, `n_workers` slots each churn through random chunks, giving a
+/// "jump around the worklist" effect instead of sweeping it in order.
 pub fn run(
     path: &Path,
     n_workers: usize,
     heartbeat_secs: f64,
+    rotate_keys: Option<u64>,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
     let mut file: PuzzleFile = serde_json::from_reader(std::io::BufReader::new(
@@ -179,6 +187,7 @@ pub fn run(
                     &matches,
                     &stop_flag,
                     start,
+                    rotate_keys,
                 )
             }
         }));
@@ -315,6 +324,7 @@ pub fn run(
 
 // ── one worker loop ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn puzzle_worker(
     wid: u32,
     target_h160: [u8; 20],
@@ -323,6 +333,7 @@ fn puzzle_worker(
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
     start: Instant,
+    rotate_keys: Option<u64>,
 ) {
     let secp = secp256k1::Secp256k1::new();
     // Scalar(1) so `sk += 1` per iteration.  Also kept to preserve the SK ↔ PK
@@ -361,7 +372,14 @@ fn puzzle_worker(
             pick_random(&pendings).map(|&idx| {
                 // Narrow inner scopes so the mutable borrow of ctx ends
                 // before ctx.save() below.
-                let (chunk_id, range_bits, start_hex) = {
+                // `end_bytes` is the chunk's *true* exclusive bound, derived
+                // from its nominal start (`start_hex`).  It must NOT be
+                // derived from the resume position — resuming mid-chunk must
+                // not extend the scan past the chunk's real boundary (which
+                // would double-scan into the next chunk, or past the puzzle
+                // range).  Carried out of this scope so the scan loop can use
+                // it directly.
+                let (chunk_id, start_hex, end_bytes) = {
                     let chunk = &mut ctx.file.chunks[idx];
                     let base = parse_hex_key(&chunk.start_hex);
                     let end  = chunk_end(&base, chunk.range_bits);
@@ -378,8 +396,8 @@ fn puzzle_worker(
                     chunk.current_hex = None;
                     (
                         chunk.chunk_index,
-                        chunk.range_bits,
                         resumed.unwrap_or(chunk.start_hex.clone()),
+                        end,
                     )
                 };
                 // Persist `status = running` to disk immediately so an
@@ -390,7 +408,6 @@ fn puzzle_worker(
                     eprintln!("[puzzle] post-claim flush failed: {e}");
                 }
                 let start_bytes = parse_hex_key(&start_hex);
-                let end_bytes = chunk_end(&start_bytes, range_bits);
                 (idx, chunk_id, start_bytes, end_bytes)
             })
         };
@@ -428,7 +445,6 @@ fn puzzle_worker(
 
             if h160_eq(&pk_c, target_h160) || h160_eq(&pk_u, target_h160) {
                 let ev = MatchEvent {
-                    address: String::new(),
                     private_key: sk.secret_bytes(),
                     compressed: pk_c.to_vec(),
                     uncompressed: pk_u.to_vec(),
@@ -478,6 +494,19 @@ fn puzzle_worker(
                 }
                 if sk.secret_bytes() >= end_bytes {
                     break 'scan true;
+                }
+                // ── rotation (random-subrange mode) ───────────────────────────
+                // Park the chunk after `rotate_keys` scanned *this claim* and
+                // let the worker move on to a fresh random pending chunk.
+                // `local_count` resets every claim, so this is "per-claim
+                // budget", not cumulative across re-claims of the same chunk.
+                // A chunk narrower than the budget still finishes via the
+                // end-of-range check above, so rotation only ever kicks in for
+                // chunks wider than the budget.
+                if let Some(rot) = rotate_keys {
+                    if local_count >= rot {
+                        break 'scan false; // finalize saves current_hex + pending
+                    }
                 }
                 let cur = sk.secret_bytes();
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
@@ -546,7 +575,7 @@ pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
 
 /// Compute the exclusive upper bound (`start + 2^range_bits`) for a chunk as a
 /// 32-byte big-endian key.  `range_bits` must be ≤ 255.
-fn chunk_end(start: &[u8; 32], range_bits: u32) -> [u8; 32] {
+pub(crate) fn chunk_end(start: &[u8; 32], range_bits: u32) -> [u8; 32] {
     assert!(range_bits <= 255, "range_bits {range_bits} out of range");
     let mut result = *start;
     // 2^range_bits in a big-endian [u8; 32]:

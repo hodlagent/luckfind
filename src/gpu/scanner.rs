@@ -113,8 +113,10 @@ impl GpuScanner {
     pub fn step(&mut self) -> Result<Vec<GpuMatchOutput>> {
         self.upload_config(78)?;
 
-        let workgroups =
-            (NUM_GPU_THREADS + 63) / 64; // WORKGROUP_SIZE = 64
+        // WORKGROUP_SIZE matches the shader's @workgroup_size(WORKGROUP_SIZE)
+        // override in pipeline.rs (128 — must equal shared-array width in the
+        // shader's batch-inversion scratch).
+        let workgroups = (NUM_GPU_THREADS + 127) / 128;
 
         let mut encoder = self.ctx.device().create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Luckfind Encoder") },

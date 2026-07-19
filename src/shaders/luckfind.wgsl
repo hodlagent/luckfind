@@ -25,14 +25,15 @@ struct MatchOutput {
     hash160: array<u32, 5>, candidate_index: u32, thread_id: u32, _padding: u32,
 }
 
-// Generator point G (affine), LE limbs.
+// Generator point G (affine), LE limbs.  Matches convert::be_bytes_to_limbs:
+//   limbs[0] = lowest 32 bits of integer = BE bytes[28..32] as big-endian u32
 const GX: array<u32, 8> = array<u32, 8>(
-    0x16F81798u, 0x59F2815Bu, 0xD928CE2Du, 0xDBFC9B02u,
-    0x070B87CEu, 0x9562A055u, 0xACBBDCF9u, 0x7E66BE79u
+    0x16F81798u, 0x59F2815Bu, 0x2DCE28D9u, 0x029BFCDBu,
+    0xCE870B07u, 0x55A06295u, 0xF9DCBBACu, 0x79BE667Eu
 );
 const GY: array<u32, 8> = array<u32, 8>(
-    0xFB10D4B8u, 0x99C47D08u, 0x8A685541u, 0x8FD17B44u,
-    0x8A10E1C0u, 0xBF4FDA55u, 0x463C6A72u, 0x0483ADA7u
+    0xFB10D4B8u, 0x9C47D08Fu, 0xA6855419u, 0xFD17B448u,
+    0x0E1108A8u, 0x5DA4FBFCu, 0x26A3C465u, 0x483ADA77u
 );
 
 // Batch-inversion workgroup scratch: 2 × 4 KB = 8 KB, well under Metal's
@@ -52,29 +53,32 @@ fn limbs_to_be_words(limbs: array<u32, 8>) -> array<u32, 8> {
     return w;
 }
 
-fn pubkey_to_sha256_block(prefix: u32, x_be: array<u32, 8>) -> array<u32, 16> {
-    var m: array<u32, 16>;
-    m[0] = (prefix << 24u) | (x_be[0] >> 8u);
-    for (var i = 0u; i < 7u; i++) {
-        m[i + 1u] = ((x_be[i] & 0xFFu) << 24u) | (x_be[i + 1u] >> 8u);
+// Pack a compressed pubkey (1 prefix byte + 32 x-coordinate bytes) into the
+// 9 big-endian u32 words that sha256_33bytes expects.  Bitcoin's canonical
+// layout is [prefix, X0..X31] (prefix FIRST), so the prefix byte lands in the
+// top byte of word[0] and the 33rd byte (X31) lands in the top byte of word[8].
+// sha256_33bytes reads word[8] & 0xFF000000 for that last data byte, then pads.
+fn compressed_pubkey_to_words(prefix: u32, x_be: array<u32, 8>) -> array<u32, 9> {
+    var out: array<u32, 9>;
+    out[0] = (prefix << 24u) | (x_be[0] >> 8u);
+    for (var i = 1u; i < 8u; i++) {
+        out[i] = ((x_be[i - 1u] & 0xFFu) << 24u) | (x_be[i] >> 8u);
     }
-    m[8] = ((x_be[7] & 0xFFu) << 24u) | 0x800000u;
-    for (var i = 9u; i < 14u; i++) { m[i] = 0u; }
-    m[14] = 256u; m[15] = 0u;    // length in bits = 32 * 8
-    return m;
+    out[8] = (x_be[7] & 0xFFu) << 24u;
+    return out;
 }
 
-fn sha256_to_ripemd160_block(sha: array<u32, 8>) -> array<u32, 16> {
-    var m: array<u32, 16>;
-    for (var i = 0u; i < 8u; i = i + 1u) {
-        let be = sha[i];
-        m[i] = ((be & 0xFFu) << 24u) | ((be & 0xFF00u) << 8u)
-             | ((be & 0xFF0000u) >> 8u) | ((be & 0xFF000000u) >> 24u);
+// kangaroo's ripemd160_32bytes returns hash160 packed as big-endian u32 words.
+// The candidate buffer is filled on the CPU with little-endian u32 words
+// (see tests/gpu_batch_inv.rs), so byte-swap each word before comparing.
+fn hash160_be_to_le(h: Rmd160Hash) -> array<u32, 5> {
+    var out: array<u32, 5>;
+    for (var i = 0u; i < 5u; i = i + 1u) {
+        let w = h.h[i];
+        out[i] = ((w & 0xFFu) << 24u) | ((w & 0xFF00u) << 8u)
+               | ((w >> 8u) & 0xFF00u) | ((w >> 24u) & 0xFFu);
     }
-    m[8] = 0x00000080u;
-    for (var i = 9u; i < 15u; i++) { m[i] = 0u; }
-    m[15] = 256u;
-    return m;
+    return out;
 }
 
 fn candidate_match(h: array<u32, 5>) -> u32 {
@@ -91,15 +95,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (tid >= config.num_threads) { return; }
     let lid = gid.x & 127u;  // tid % 128
 
-    var s = states[tid];
-
+    // Declared outside the loop so the final writeback (last line) sees it.
+    var s: GpuState;
     for (var step = 0u; step < config.steps_per_call; step = step + 1u) {
-        // 1. P += G (Jacobian mixed add — ~12 field muls)
+        // ── 1. P += G (Jacobian mixed add) ──────────────────────────────────
+        // Read a FRESH copy of this thread's state at the top of every step.
+        s = states[tid];
         let p = jac_add_affine(jacobian(s.x, s.y, s.z), GX, GY);
         s.x = p.x; s.y = p.y; s.z = p.z;
         s.scalar = scalar_add_256(s.scalar, array<u32,8>(1u,0u,0u,0u,0u,0u,0u,0u));
 
-        // 2. Batch-invert 128 Z values (Montgomery trick: 1 fe_inv + 381 muls).
+        // WRITE s back to storage RIGHT AFTER the point-add.  `s` is a 128-byte
+        // struct; left alive through the Montgomery tree it would be spilled
+        // into workgroup memory and clobbered by the shared-memory ops.  By
+        // flushing it now, the later reload (step 3) sees clean post-add values.
+        states[tid] = s;
+
+        // ── 2. Batch-invert 128 Z values (Montgomery tree) ──────────────────
+        // Operates ONLY on shared memory — the local `s` is already evicted.
         shared_prod[lid] = s.z;
         workgroupBarrier();
 
@@ -204,30 +217,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         workgroupBarrier();
 
-        // 3. Affine conversion: shared_prod[lid] = 1/Z
-        let z_inv = shared_prod[lid];
+        // ── 3. Affine conversion + hash ──────────────────────────────────────
+        // Reload s from storage (flushed in step 1) so the Jacobian X/Y are the
+        // guaranteed-clean post-add values — untouched by the tree's registers.
+        s = states[tid];
+        let z_inv = shared_prod[lid];   // 1/Z from the inversion tree
         let z2_inv = fe_square(z_inv);
         let z3_inv = fe_mul(z2_inv, z_inv);
         let x_affine = fe_mul(s.x, z2_inv);
         let y_affine = fe_mul(s.y, z3_inv);
 
-        // 4. Serialize compressed pubkey
+        // 4. Serialize compressed pubkey as 9 big-endian u32 words.
         var prefix: u32;
         if ((y_affine[0] & 1u) == 0u) { prefix = 0x02u; } else { prefix = 0x03u; }
         let x_be = limbs_to_be_words(x_affine);
+        let cpk = compressed_pubkey_to_words(prefix, x_be);
 
-        // 5. SHA256
-        let sha = sha256_block(pubkey_to_sha256_block(prefix, x_be));
-
-        // 6. RIPEMD160
-        let h = ripemd160_block(sha256_to_ripemd160_block(sha));
+        // 5-6. SHA256 + RIPEMD160 (hash160) via kangaroo's verified compressors.
+        let sha = sha256_33bytes(cpk);
+        let h160 = hash160_from_sha256(sha.h);
+        // Candidate buffer is little-endian; flip kangaroo's big-endian output.
+        let h160_le = hash160_be_to_le(h160);
 
         // 7. Candidate match
-        let m = candidate_match(h);
+        let m = candidate_match(h160_le);
         if (m != 0xFFFFFFFFu) {
             let idx = atomicAdd(&match_count, 1u);
             if (idx < 256u) {
-                matches[idx] = MatchOutput(s.scalar, x_affine, y_affine, h, m, tid, 0u);
+                matches[idx] = MatchOutput(s.scalar, x_affine, y_affine, h160.h, m, tid, 0u);
             }
         }
     }

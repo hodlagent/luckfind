@@ -70,8 +70,12 @@ fn scan_one_step_finds_2g() -> bool {
 
     let m = &matches[0];
     let mut h = [0u8; 20];
+    // The shader stores ripemd160 output as big-endian u32 words (kangaroo
+    // convention — .h[0] = most-significant word of the 160-bit digest).  The
+    // ground-truth `expected` is the canonical big-endian byte array from
+    // btc::hash160, so we must reassemble with to_be_bytes (NOT to_le_bytes).
     for i in 0..5 {
-        h[4 * i..4 * i + 4].copy_from_slice(&m.hash160[i].to_le_bytes());
+        h[4 * i..4 * i + 4].copy_from_slice(&m.hash160[i].to_be_bytes());
     }
     assert_eq!(
         h, expected,

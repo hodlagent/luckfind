@@ -11,8 +11,6 @@ use crate::progress::Progress;
 /// Match surfaced by the pool.
 #[derive(Debug, Clone)]
 pub struct MatchEvent {
-    #[allow(dead_code)]
-    pub address: String,          // reserved for future: Base58 of the matching p2pkh addr
     pub private_key: [u8; 32],
     pub compressed: Vec<u8>,
     pub uncompressed: Vec<u8>,
@@ -131,7 +129,6 @@ fn worker_loop(
 
         if candidates.contains(&h_c) || candidates.contains(&h_u) {
             let ev = MatchEvent {
-                address: String::new(),
                 private_key: sk.secret_bytes(),
                 compressed: pk_c.to_vec(),
                 uncompressed: pk_u.to_vec(),
