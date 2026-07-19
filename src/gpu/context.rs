@@ -12,11 +12,14 @@ pub struct GpuContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     adapter_info: wgpu::AdapterInfo,
+    /// Queried device limits (for future feature / `--gpu-list` output).
+    #[allow(dead_code)]
     limits: wgpu::Limits,
 }
 
 /// A discovered GPU device (for `--gpu-list`).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GpuDeviceInfo {
     pub name: String,
     pub backend: wgpu::Backend,
@@ -70,10 +73,12 @@ impl GpuContext {
         &self.adapter_info.name
     }
 
+    #[allow(dead_code)]
     pub fn backend(&self) -> wgpu::Backend {
         self.adapter_info.backend
     }
 
+    #[allow(dead_code)]
     pub fn max_workgroup_size(&self) -> u32 {
         self.limits.max_compute_workgroup_size_x
     }
@@ -132,6 +137,7 @@ impl GpuContext {
 }
 
 /// Enumerate available Metal GPU devices (for `--gpu-list`).
+#[allow(dead_code)]
 pub fn enumerate_gpus() -> Vec<GpuDeviceInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,

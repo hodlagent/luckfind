@@ -15,6 +15,10 @@ pub struct GpuScanner {
     buffers: GpuBuffers,
     bind_group: wgpu::BindGroup,
     pub steps_per_call: u32,
+    /// Stride (keys per shader step). 1 = lottery; N = puzzle dense-tiling.
+    pub stride: u32,
+    /// Number of active candidate slots (1 = puzzle single target; 78 = lottery set).
+    pub num_candidates: u32,
     /// Initial scalar per thread (LE limbs), for CPU-side match verification.
     initial_scalars: Vec<[u32; 8]>,
     pub total_ops: u64,
@@ -37,7 +41,9 @@ impl GpuScanner {
             pipeline,
             buffers,
             bind_group,
-            steps_per_call: 64, // default, calibrated later
+            steps_per_call: 64,  // default, calibrated later
+            stride: 1,           // lottery default; puzzle sets this to NUM_GPU_THREADS
+            num_candidates: 78,  // lottery default; puzzle sets this to 1
             initial_scalars: Vec::new(),
             total_ops: 0,
         })
@@ -47,6 +53,7 @@ impl GpuScanner {
     ///
     /// For each of NUM_GPU_THREADS threads: generate random sk, compute pk = sk×G
     /// (one scalar mult per thread, parallelized with rayon), convert to Jacobian (z=1).
+    #[allow(dead_code)]
     pub fn init_random(&mut self, _seed: u64) -> Result<()> {
         use rand::TryRng;
         use rayon::prelude::*;
@@ -71,6 +78,8 @@ impl GpuScanner {
                         let mut y = [0u8; 32];
                         x.copy_from_slice(&encoded[1..33]);
                         y.copy_from_slice(&encoded[33..65]);
+                        let (step_px, step_py) =
+                            crate::gpu::convert::stride_step_point(self.stride);
                         return (
                             crate::gpu::convert::scalar_be_to_limbs(&buf),
                             GpuState {
@@ -78,6 +87,8 @@ impl GpuScanner {
                                 y: crate::gpu::convert::be_bytes_to_limbs(&y),
                                 z: [1, 0, 0, 0, 0, 0, 0, 0],
                                 scalar: crate::gpu::convert::scalar_be_to_limbs(&buf),
+                                step_px,
+                                step_py,
                             },
                         );
                     }
@@ -95,13 +106,67 @@ impl GpuScanner {
         Ok(())
     }
 
+    /// Deterministic seeding for puzzle mode: walker `i` starts at key
+    /// `start + i` (scalar `start+i`, point `(start+i)·G`).  With stride = N
+    /// each walker advances N keys/step, so the N walkers partition the chunk
+    /// `[start, start + N·steps_per_call)` with zero overlap.  Parallelized
+    /// with rayon (same cost model as init_random: one scalar mult per walker,
+    /// paid once per chunk).
+    ///
+    /// `start_be` is the chunk's current scan position, big-endian [u8; 32].
+    pub fn seed_range(&mut self, start_be: [u8; 32]) -> Result<()> {
+        use rayon::prelude::*;
+        let n = NUM_GPU_THREADS as usize;
+        let secp = secp256k1::Secp256k1::new();
+        let stride = self.stride;
+        assert!(stride > 0, "stride must be set before seed_range");
+        let (step_px, step_py) = crate::gpu::convert::stride_step_point(stride);
+
+        let results: Vec<([u8; 32], GpuState)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let sk_be = crate::gpu::convert::scalar_add_be(&start_be, i as u64);
+                let sk =
+                    secp256k1::SecretKey::from_byte_array(sk_be).expect("start+i < n");
+                let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+                let encoded = pk.serialize_uncompressed();
+                let mut x = [0u8; 32];
+                let mut y = [0u8; 32];
+                x.copy_from_slice(&encoded[1..33]);
+                y.copy_from_slice(&encoded[33..65]);
+                (
+                    sk_be,
+                    GpuState {
+                        x: crate::gpu::convert::be_bytes_to_limbs(&x),
+                        y: crate::gpu::convert::be_bytes_to_limbs(&y),
+                        z: [1, 0, 0, 0, 0, 0, 0, 0],
+                        scalar: crate::gpu::convert::scalar_be_to_limbs(&sk_be),
+                        step_px,
+                        step_py,
+                    },
+                )
+            })
+            .collect();
+
+        let initial_scalars: Vec<[u32; 8]> = results.iter().map(|(s, _)| {
+            crate::gpu::convert::scalar_be_to_limbs(s)
+        }).collect();
+        let states: Vec<GpuState> = results.into_iter().map(|(_, st)| st).collect();
+
+        self.ctx
+            .queue()
+            .write_buffer(&self.buffers.states, 0, bytemuck::cast_slice(&states));
+        self.initial_scalars = initial_scalars;
+        Ok(())
+    }
+
     /// Upload config buffer.
-    fn upload_config(&self, num_candidates: u32) -> Result<()> {
+    fn upload_config(&self) -> Result<()> {
         let config = GpuConfig {
             num_threads: NUM_GPU_THREADS,
             steps_per_call: self.steps_per_call,
-            num_candidates,
-            _padding: 0,
+            num_candidates: self.num_candidates,
+            stride: self.stride,
         };
         self.ctx
             .queue()
@@ -111,7 +176,7 @@ impl GpuScanner {
 
     /// Dispatch one compute pass and read back matches.
     pub fn step(&mut self) -> Result<Vec<GpuMatchOutput>> {
-        self.upload_config(78)?;
+        self.upload_config()?;
 
         // WORKGROUP_SIZE matches the shader's @workgroup_size(WORKGROUP_SIZE)
         // override in pipeline.rs (128 — must equal shared-array width in the
@@ -190,11 +255,13 @@ impl GpuScanner {
     }
 
     /// Initial scalar (LE limbs) for thread `i` — for test verification.
+    #[allow(dead_code)]
     pub fn initial_scalar_bytes(&self, i: usize) -> [u32; 8] {
         self.initial_scalars[i]
     }
 
     /// Set thread `tid`'s initial state directly (test helper).
+    #[allow(dead_code)]
     pub fn set_initial_state(
         &mut self,
         tid: usize,
@@ -212,6 +279,7 @@ impl GpuScanner {
     }
 
     /// Read back all states (for testing). Copies states buffer → staging → CPU.
+    #[allow(dead_code)]
     pub fn readback_states(&self) -> anyhow::Result<Vec<GpuState>> {
         let num = self.buffers.num_threads();
         let states_size = num as u64 * std::mem::size_of::<GpuState>() as u64;

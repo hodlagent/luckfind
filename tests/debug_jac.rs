@@ -30,11 +30,14 @@ fn one_step_jacobian_is_2g() {
     let ge = g.serialize_uncompressed();
     let mut gx = [0u8;32]; let mut gy = [0u8;32];
     gx.copy_from_slice(&ge[1..33]); gy.copy_from_slice(&ge[33..65]);
+    let (step_px, step_py) = gpu::convert::stride_step_point(1);
     scanner.set_initial_state(0, [1u32,0,0,0,0,0,0,0], gpu::GpuState {
         x: gpu::convert::be_bytes_to_limbs(&gx),
         y: gpu::convert::be_bytes_to_limbs(&gy),
         z: [1,0,0,0,0,0,0,0],
         scalar: [1,0,0,0,0,0,0,0],
+        step_px,
+        step_py,
     }).expect("set");
     scanner.steps_per_call = 1;
     let _ = scanner.step().expect("step");
@@ -65,9 +68,11 @@ fn stage1_point_add_z() {
     let ge = g.serialize_uncompressed();
     let mut gx = [0u8;32]; let mut gy = [0u8;32];
     gx.copy_from_slice(&ge[1..33]); gy.copy_from_slice(&ge[33..65]);
+    let (step_px, step_py) = gpu::convert::stride_step_point(1);
     s.set_initial_state(0, [1u32,0,0,0,0,0,0,0], gpu::GpuState {
         x: gpu::convert::be_bytes_to_limbs(&gx), y: gpu::convert::be_bytes_to_limbs(&gy),
         z: [1,0,0,0,0,0,0,0], scalar: [1,0,0,0,0,0,0,0],
+        step_px, step_py,
     }).expect("set");
     s.steps_per_call = 1;
     let _ = s.step().expect("step");

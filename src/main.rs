@@ -12,6 +12,7 @@ mod progress;
 mod report;
 mod workers;
 mod puzzle;
+mod gpu;
 // heartbeat logic lives in workers.rs::run (a separate ticker thread).
 
 use std::path::Path;

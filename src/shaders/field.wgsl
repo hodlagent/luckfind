@@ -428,9 +428,16 @@ fn fe_mul(a: array<u32, 8>, b: array<u32, 8>) -> array<u32, 8> {
         p9 = p9 + c;
     }
 
-    // Reduce p8 (first pass)
-    h = p8; p8 = 0u;
-    if (h != 0u) {
+    // Reduce p8: fold the 2^256 term using 2^256 ≡ 2^32 + 977 (mod p).  One
+    // pass rarely suffices: adding (2^32+977)*h into p0..p7 can regenerate a
+    // carry into p8.  Earlier versions dropped that carry on a fixed second
+    // pass (a latent wrong result when p0..p7 lands within 2^64 of overflow).
+    // Loop instead — each iteration strictly shrinks h toward 0, so this
+    // terminates (≤3 iterations in practice since h drops below 2^32 after
+    // the first pass and to 0/1 after the second).
+    h = p8;
+    p8 = 0u;
+    while (h != 0u) {
         t = mul_977(h);
         old = p0; p0 = p0 + t.x; c = select(0u, 1u, p0 < old);
         old = p1; p1 = p1 + t.y + c; c = select(0u, 1u, p1 < old || (c == 1u && t.y == 0u && p1 == old));
@@ -442,21 +449,8 @@ fn fe_mul(a: array<u32, 8>, b: array<u32, 8>) -> array<u32, 8> {
         old = p6; p6 = p6 + c; c = select(0u, 1u, p6 < old);
         old = p7; p7 = p7 + c; c = select(0u, 1u, p7 < old);
         p8 = p8 + c;
-    }
-
-    // Reduce p8 (second pass if needed)
-    h = p8; p8 = 0u;
-    if (h != 0u) {
-        t = mul_977(h);
-        old = p0; p0 = p0 + t.x; c = select(0u, 1u, p0 < old);
-        old = p1; p1 = p1 + t.y + c; c = select(0u, 1u, p1 < old || (c == 1u && t.y == 0u && p1 == old));
-        old = p1; p1 = p1 + h; c = c + select(0u, 1u, p1 < old);
-        old = p2; p2 = p2 + c; c = select(0u, 1u, p2 < old);
-        old = p3; p3 = p3 + c; c = select(0u, 1u, p3 < old);
-        old = p4; p4 = p4 + c; c = select(0u, 1u, p4 < old);
-        old = p5; p5 = p5 + c; c = select(0u, 1u, p5 < old);
-        old = p6; p6 = p6 + c; c = select(0u, 1u, p6 < old);
-        old = p7; p7 = p7 + c;
+        h = p8;
+        p8 = 0u;
     }
 
     var result: array<u32, 8>;
@@ -782,9 +776,16 @@ fn fe_square(a: array<u32, 8>) -> array<u32, 8> {
         p9 = p9 + c;
     }
 
-    // Reduce p8 (first pass)
-    h = p8; p8 = 0u;
-    if (h != 0u) {
+    // Reduce p8: fold the 2^256 term using 2^256 ≡ 2^32 + 977 (mod p).  One
+    // pass rarely suffices: adding (2^32+977)*h into p0..p7 can regenerate a
+    // carry into p8.  Earlier versions dropped that carry on a fixed second
+    // pass (a latent wrong result when p0..p7 lands within 2^64 of overflow).
+    // Loop instead — each iteration strictly shrinks h toward 0, so this
+    // terminates (≤3 iterations in practice since h drops below 2^32 after
+    // the first pass and to 0/1 after the second).
+    h = p8;
+    p8 = 0u;
+    while (h != 0u) {
         t = mul_977(h);
         old = p0; p0 = p0 + t.x; c = select(0u, 1u, p0 < old);
         old = p1; p1 = p1 + t.y + c; c = select(0u, 1u, p1 < old || (c == 1u && t.y == 0u && p1 == old));
@@ -796,21 +797,8 @@ fn fe_square(a: array<u32, 8>) -> array<u32, 8> {
         old = p6; p6 = p6 + c; c = select(0u, 1u, p6 < old);
         old = p7; p7 = p7 + c; c = select(0u, 1u, p7 < old);
         p8 = p8 + c;
-    }
-
-    // Reduce p8 (second pass if needed)
-    h = p8; p8 = 0u;
-    if (h != 0u) {
-        t = mul_977(h);
-        old = p0; p0 = p0 + t.x; c = select(0u, 1u, p0 < old);
-        old = p1; p1 = p1 + t.y + c; c = select(0u, 1u, p1 < old || (c == 1u && t.y == 0u && p1 == old));
-        old = p1; p1 = p1 + h; c = c + select(0u, 1u, p1 < old);
-        old = p2; p2 = p2 + c; c = select(0u, 1u, p2 < old);
-        old = p3; p3 = p3 + c; c = select(0u, 1u, p3 < old);
-        old = p4; p4 = p4 + c; c = select(0u, 1u, p4 < old);
-        old = p5; p5 = p5 + c; c = select(0u, 1u, p5 < old);
-        old = p6; p6 = p6 + c; c = select(0u, 1u, p6 < old);
-        old = p7; p7 = p7 + c;
+        h = p8;
+        p8 = 0u;
     }
 
     var result: array<u32, 8>;

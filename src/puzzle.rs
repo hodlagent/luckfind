@@ -65,6 +65,10 @@ pub struct PuzzleFile {
     pub total_chunks: u32,
     pub completed_chunks: u32,
     pub target: String,
+    /// Optional expected RIPEMD-160 hash (40 hex chars) of `target`.  When
+    /// present it is checked against the hash decoded from `target` — a mismatch
+    /// means the JSON is inconsistent and we abort.  Absent ⇒ skipped.
+    pub hash160: Option<String>,
     pub chunks: Vec<Chunk>,
 }
 
@@ -120,10 +124,37 @@ pub fn run(
     });
 
     // Convert the target BTC address to its 20-byte hash160 for fast compare.
+    // This decode happens once at startup; both CPU workers and the GPU worker
+    // reuse the resulting 20-byte value — no Base58 work on the hot path.
     let target_h160 = addrs::p2pkh_addr_to_hash160(&file.target).unwrap_or_else(|| {
         eprintln!("[puzzle] target {} is not a valid P2PKH address", file.target);
         std::process::exit(2);
     });
+
+    // If the JSON ships an expected hash160, sanity-check it against the value
+    // we just decoded from `target`.  A mismatch means the worklist is
+    // internally inconsistent — we abort rather than scan the wrong set.
+    // Absent ⇒ no check (backward-compatible with files that omit the field).
+    if let Some(ref h160_hex) = file.hash160 {
+        match hash160_from_hex(h160_hex) {
+            Some(expected) if expected == target_h160 => {
+                eprintln!("[puzzle] hash160 OK ({h160_hex})");
+            }
+            Some(_) => {
+                eprintln!(
+                    "[puzzle] hash160 MISMATCH: JSON says {h160_hex}, \
+                     target {} decodes to {}",
+                    file.target,
+                    hex::encode(target_h160)
+                );
+                std::process::exit(2);
+            }
+            None => {
+                eprintln!("[puzzle] hash160 in JSON is not valid hex: {h160_hex}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Crash-recovery: any chunk left "running" from a previous killed run was
     // in-flight — revert it to pending so it can be reclaimed.
@@ -192,6 +223,27 @@ pub fn run(
             }
         }));
     }
+
+    // ── 3b. GPU worker thread ────────────────────────────────────────────────
+    // One additional worker that claims whatever pending chunks the CPU workers
+    // haven't taken and scans them with the GPU (100k strided walkers, dense
+    // zero-overlap tiling, per-dispatch checkpoint).  Falls back to CPU-only if
+    // no Metal device is present.  Rotation is intentionally NOT passed through:
+    // with GPU saturating throughput there's no need to park-and-rotate chunks.
+    let gpu_ctx = ctx.clone();
+    let gpu_progress = progress.clone();
+    let gpu_matches = matches.clone();
+    let gpu_stop = stop_flag.clone();
+    let gpu_handle = std::thread::spawn(move || {
+        gpu_puzzle_worker(
+            target_h160,
+            gpu_ctx,
+            &gpu_progress,
+            &gpu_matches,
+            &gpu_stop,
+            start,
+        )
+    });
 
     // ── 4. heartbeat ticker: periodic save + status line ─────────────────────
     let hb_ctx = ctx.clone();
@@ -275,6 +327,7 @@ pub fn run(
     for h in handles {
         drop(h.join());
     }
+    drop(gpu_handle.join()); // GPU worker (no-op if it fell back to CPU-only)
     drop(hb_handle); // ticker sees stop flag on its next tick and exits
 
     let (final_file, final_matches) = {
@@ -540,6 +593,268 @@ fn puzzle_worker(
     }
 }
 
+// ── GPU worker ──────────────────────────────────────────────────────────────
+
+/// A deterministic sub-range claimed by the GPU worker.  Mirrors the per-chunk
+/// view the CPU worker scans (start key, exclusive end, resume position).
+struct GpuChunk {
+    idx: usize,
+    chunk_id: u32,
+    start: [u8; 32], // inclusive first key to scan (resume position if any)
+    end: [u8; 32],   // exclusive upper bound
+}
+
+/// Pick + claim a pending chunk for the GPU worker (same policy as CPU workers:
+/// random pending chunk, "running" marker, persist immediately).  Returns `None`
+/// when no pending chunks remain.
+fn gpu_claim_chunk(ctx: &mut PuzzleCtx) -> Option<GpuChunk> {
+    let pendings: Vec<usize> = ctx
+        .file
+        .chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.status == "pending")
+        .map(|(i, _)| i)
+        .collect();
+    if pendings.is_empty() {
+        return None;
+    }
+    let &idx = pick_random(&pendings)?;
+    let chunk = &mut ctx.file.chunks[idx];
+    let base = parse_hex_key(&chunk.start_hex);
+    let end = chunk_end(&base, chunk.range_bits);
+    // Resume from prior current_hex IFF it lies within [base..end); else base.
+    let resumed = chunk.current_hex.as_deref().and_then(|h| {
+        let ck = parse_hex_key(h);
+        (&ck >= &base && crate::gpu::convert::be_lt(&ck, &end)).then_some(ck)
+    });
+    let start = resumed.unwrap_or(base);
+    chunk.status = "running".to_string();
+    chunk.current_hex = None;
+    let out = Some(GpuChunk {
+        idx,
+        chunk_id: chunk.chunk_index,
+        start,
+        end,
+    });
+    if let Err(e) = ctx.save() {
+        eprintln!("[puzzle] GPU post-claim flush failed: {e}");
+    }
+    out
+}
+
+/// Finalize a GPU-scanned chunk: either finished (whole range done) or parked
+/// (SIGINT) with the current scan position preserved for resume.
+fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8; 32]) {
+    let chunk = &mut ctx.file.chunks[idx];
+    if done {
+        chunk.status = "finished".to_string();
+        chunk.current_hex = None;
+        ctx.file.completed_chunks += 1;
+    } else {
+        chunk.status = "pending".to_string();
+        chunk.current_hex = Some(hex_encode_key(&current));
+    }
+    sync_flush_chunk(ctx);
+}
+
+/// Convert a GPU match (`scalar` = winning private key as LE limbs) into the
+/// shared `MatchEvent`.  Re-derives the compressed pubkey on the CPU so the
+/// output mirrors CPU-worker matches.
+fn gpu_match_to_event(
+    m: &crate::gpu::GpuMatchOutput,
+    chunk: &GpuChunk,
+) -> MatchEvent {
+    let priv_be = crate::gpu::convert::limbs_to_be_bytes(&m.scalar);
+    let secp = secp256k1::Secp256k1::new();
+    let pk = secp256k1::SecretKey::from_byte_array(priv_be)
+        .and_then(|sk| Ok(secp256k1::PublicKey::from_secret_key(&secp, &sk)))
+        .unwrap_or(secp256k1::PublicKey::from_slice(
+            &crate::btc::GENERATOR_COMPRESSED,
+        )
+        .unwrap());
+    let compressed = pk.serialize().to_vec();
+    let uncompressed = pk.serialize_uncompressed().to_vec();
+    // Informational only: offset of the key within the chunk.  Compute it
+    // defensively — the GPU scalar is reconstructed from LE limbs and may be
+    // off by a hair, so a naive subtraction can underflow (panic).  Saturate
+    // to 0 rather than crash on what is purely a report field.
+    let key_index = if crate::gpu::convert::be_lt(&priv_be, &chunk.start) {
+        0
+    } else {
+        let diff = crate::gpu::convert::scalar_sub_be(&priv_be, &chunk.start);
+        if diff > i64::MAX as u64 {
+            0
+        } else {
+            diff
+        }
+    };
+    MatchEvent {
+        private_key: priv_be,
+        compressed,
+        uncompressed,
+        worker_id: 0, // GPU worker id — report distinguishes via key origin; kept 0
+        chunk_id: Some(chunk.chunk_id),
+        key_index,
+        elapsed: 0.0, // filled in by the caller after CPU verification
+    }
+}
+
+/// One GPU worker thread.  Claims pending chunks from the shared worklist and
+/// dense-tiles each `[start, end)` with 100k strided walkers.  Per dispatch it
+/// covers `N × steps_per_call` keys with no overlap, advancing the checkpoint.
+/// Runs alongside the CPU workers — all of them pull from the same pending
+/// queue, so CPU and GPU share the load without double-scanning.
+#[allow(clippy::too_many_arguments)]
+fn gpu_puzzle_worker(
+    target_h160: [u8; 20],
+    ctx: Arc<Mutex<PuzzleCtx>>,
+    progress: &Progress,
+    matches: &Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    start: Instant,
+) {
+    // Set up GPU.  If no Metal device is available (CI, headless) we log and
+    // fall back to CPU-only — never block the whole run on a missing GPU.
+    let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[puzzle] GPU unavailable ({e}) — running CPU-only.");
+            return;
+        }
+    };
+    eprintln!(
+        "[puzzle] GPU worker up on {}",
+        gpu_ctx.device_name()
+    );
+    let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
+    let mut scanner = match crate::gpu::GpuScanner::new(gpu_ctx, &candidates) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[puzzle] GpuScanner::new failed ({e}) — running CPU-only.");
+            return;
+        }
+    };
+    // Dense-tiling config: stride = N threads, single target candidate.
+    scanner.stride = crate::gpu::NUM_GPU_THREADS;
+    scanner.num_candidates = 1;
+
+    // Keep `rotate_keys` disabled (the user-supplied chunk queue already
+    // subdivides the range; rotation only ever made sense for CPU-only sweeps).
+
+    // Per-dispatch coverage (keys).  Constant once calibrated.
+    let dispatch_keys = crate::gpu::NUM_GPU_THREADS as u64
+        * scanner.steps_per_call as u64;
+
+    loop {
+        // ── claim a pending chunk ────────────────────────────────────────────
+        let claim = {
+            let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            gpu_claim_chunk(&mut ctx)
+        };
+        let chunk = match claim {
+            Some(c) => c,
+            None => return, // all chunks claimed/finished
+        };
+
+        // Seed walkers at `start + i` so they tile [start, start+N) with stride N.
+        if scanner.seed_range(chunk.start).is_err() {
+            eprintln!("[puzzle] GPU seed_range failed — parking chunk");
+            let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            gpu_finalize_chunk(&mut ctx, chunk.idx, false, chunk.start);
+            continue;
+        }
+
+        let mut current = chunk.start; // next key NOT yet covered
+        let mut parked = false;
+
+        // ── scan the chunk in N·steps_per_call-key dispatches ───────────────
+        loop {
+            // Decide this dispatch's step count.  A full dispatch covers
+            // `dispatch_keys` keys; the final (partial) dispatch is trimmed so the
+            // walkers land on or just past `end`.  The catch: the chunk width can
+            // exceed 2^64 (puzzle #76 spans 2^65), so we MUST NOT compute
+            // `end - current` directly (it overflows u64).  Instead we compare
+            // `end` against `current + dispatch_keys` (adding the small u64 never
+            // overflows) and only subtract once we know the remainder fits.
+            let steps = if crate::gpu::convert::be_lt(&current, &chunk.end) {
+                let reach = crate::gpu::convert::scalar_add_be(&current, dispatch_keys);
+                // `reach >= end`  ⟺  `end - current <= dispatch_keys` (no overflow).
+                if !crate::gpu::convert::be_lt(&reach, &chunk.end) {
+                    let remaining = crate::gpu::convert::scalar_sub_be(&chunk.end, &current);
+                    let n = crate::gpu::NUM_GPU_THREADS as u64;
+                    std::cmp::max(1, (remaining + n - 1) / n) as u32
+                } else {
+                    scanner.steps_per_call
+                }
+            } else {
+                0
+            };
+            if steps == 0 {
+                break; // reached the exclusive end
+            }
+            // Temporarily set steps_per_call for this (possibly final, partial)
+            // dispatch, restoring the default afterwards.
+            let saved_steps = scanner.steps_per_call;
+            scanner.steps_per_call = steps;
+            let batch = crate::gpu::NUM_GPU_THREADS as u64 * steps as u64;
+            match scanner.step() {
+                Ok(batch_matches) => {
+                    if !batch_matches.is_empty() {
+                        let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+                        for m in &batch_matches {
+                            let mut ev = gpu_match_to_event(m, &chunk);
+                            // CPU verification — a real puzzle solver never trusts the
+                            // GPU candidate flag alone: re-derive the pubkey, hash160
+                            // it, and confirm it equals the target.  Spurious GPU
+                            // matches (impossible with a 160-bit hash, but defense in
+                            // depth) are dropped here silently.
+                            let h = btc::hash160(&ev.compressed);
+                            if h == target_h160 {
+                                ev.elapsed = start.elapsed().as_secs_f64();
+                                g.push(ev);
+                            }
+                        }
+                    }
+                    progress.increment(batch);
+                }
+                Err(e) => {
+                    eprintln!("[puzzle] GPU step failed ({e}) — parking chunk");
+                    parked = true;
+                    break;
+                }
+            }
+            scanner.steps_per_call = saved_steps;
+
+            // Advance checkpoint by exactly the keys this dispatch covered.
+            current = crate::gpu::convert::scalar_add_be(&current, batch);
+
+            // Refresh the in-memory resume position (disk flush is on the ticker).
+            {
+                let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+                ctx.file.chunks[chunk.idx].current_hex = Some(hex_encode_key(&current));
+            }
+
+            if stop_flag.load(Ordering::Relaxed) {
+                parked = true;
+                break;
+            }
+        }
+
+        // ── finalize ────────────────────────────────────────────────────────
+        {
+            let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let done = !parked
+                && !crate::gpu::convert::be_lt(&current, &chunk.end);
+            gpu_finalize_chunk(&mut ctx, chunk.idx, done, current);
+        }
+
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
 // ── hex helpers ─────────────────────────────────────────────────────────────
 
 /// Parse a hex string as a 32-byte big-endian key.  Odd-length inputs get a
@@ -571,6 +886,21 @@ pub(crate) fn parse_hex_key(hex_str: &str) -> [u8; 32] {
 /// Hex-encode a 32-byte key (always 64 hex chars, no padding ambiguity).
 pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
     hex::encode(bytes)
+}
+
+/// Parse a 40-character hex string as a 20-byte hash160.  Returns `None` if the
+/// string isn't exactly 40 hex chars (the canonical RIPEMD-160 length).
+fn hash160_from_hex(s: &str) -> Option<[u8; 20]> {
+    if s.len() != 40 {
+        return None;
+    }
+    let raw = hex::decode(s).ok()?;
+    if raw.len() != 20 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&raw);
+    Some(out)
 }
 
 /// Compute the exclusive upper bound (`start + 2^range_bits`) for a chunk as a

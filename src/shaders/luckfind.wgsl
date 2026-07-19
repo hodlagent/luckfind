@@ -15,10 +15,14 @@ fn jacobian(x: array<u32, 8>, y: array<u32, 8>, z: array<u32, 8>) -> JacobianPoi
 }
 
 struct GpuConfig {
-    num_threads: u32, steps_per_call: u32, num_candidates: u32, _padding: u32,
+    num_threads: u32, steps_per_call: u32, num_candidates: u32, stride: u32,
 }
 struct GpuState {
     x: array<u32, 8>, y: array<u32, 8>, z: array<u32, 8>, scalar: array<u32, 8>,
+    // Per-walker step point (affine, LE limbs).  Lottery mode: = G (stride 1).
+    // Puzzle mode: = N*G (stride N) so walkers, seeded at start+i, interleave
+    // across the chunk with zero overlap.
+    step_px: array<u32, 8>, step_py: array<u32, 8>,
 }
 struct MatchOutput {
     scalar: array<u32, 8>, pubkey_x: array<u32, 8>, pubkey_y: array<u32, 8>,
@@ -82,7 +86,10 @@ fn hash160_be_to_le(h: Rmd160Hash) -> array<u32, 5> {
 }
 
 fn candidate_match(h: array<u32, 5>) -> u32 {
-    for (var i = 0u; i < 78u; i = i + 1u) {
+    // Bound the scan by `num_candidates` (set to 78 for the full lottery set,
+    // 1 for puzzle mode) so unused trailing slots — which read as zero and
+    // would false-match an all-zero hash160 — are never examined.
+    for (var i = 0u; i < config.num_candidates; i = i + 1u) {
         if (h[0]==candidates[i][0] && h[1]==candidates[i][1] && h[2]==candidates[i][2]
          && h[3]==candidates[i][3] && h[4]==candidates[i][4]) { return i; }
     }
@@ -97,22 +104,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Declared outside the loop so the final writeback (last line) sees it.
     var s: GpuState;
+    // Stride as an LE limb array for scalar_add_256.  `stride` fits in one limb
+    // (it's either 1 for lottery or N=100000 for puzzle), so limb[0]=stride and
+    // the high limbs are zero.
+    let stride_le = array<u32,8>(config.stride, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
     for (var step = 0u; step < config.steps_per_call; step = step + 1u) {
-        // ── 1. P += G (Jacobian mixed add) ──────────────────────────────────
-        // Read a FRESH copy of this thread's state at the top of every step.
+        // ── 1. read current state + batch-invert 128 Z values ───────────────
+        // Hash-then-advance ordering: we check the key the walker is currently
+        // ON, then stride past it.  This makes deterministic tiling gap-free
+        // — dispatch d covers [start + d·S·N, start + (d+1)·S·N) contiguously.
+        // (For the random lottery the ordering is immaterial.)
         s = states[tid];
-        let p = jac_add_affine(jacobian(s.x, s.y, s.z), GX, GY);
-        s.x = p.x; s.y = p.y; s.z = p.z;
-        s.scalar = scalar_add_256(s.scalar, array<u32,8>(1u,0u,0u,0u,0u,0u,0u,0u));
-
-        // WRITE s back to storage RIGHT AFTER the point-add.  `s` is a 128-byte
-        // struct; left alive through the Montgomery tree it would be spilled
-        // into workgroup memory and clobbered by the shared-memory ops.  By
-        // flushing it now, the later reload (step 3) sees clean post-add values.
-        states[tid] = s;
-
-        // ── 2. Batch-invert 128 Z values (Montgomery tree) ──────────────────
-        // Operates ONLY on shared memory — the local `s` is already evicted.
         shared_prod[lid] = s.z;
         workgroupBarrier();
 
@@ -217,10 +219,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         workgroupBarrier();
 
-        // ── 3. Affine conversion + hash ──────────────────────────────────────
-        // Reload s from storage (flushed in step 1) so the Jacobian X/Y are the
-        // guaranteed-clean post-add values — untouched by the tree's registers.
-        s = states[tid];
+        // ── 3. Affine conversion (pre-advance state) + hash ────────────────
+        // `s` is still the state we read at the top of this step (before any
+        // advance) — that's the key we are checking now.  The Jacobian X/Y/Z
+        // were untouched by the inversion tree (which only used shared memory).
         let z_inv = shared_prod[lid];   // 1/Z from the inversion tree
         let z2_inv = fe_square(z_inv);
         let z3_inv = fe_mul(z2_inv, z_inv);
@@ -247,7 +249,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 matches[idx] = MatchOutput(s.scalar, x_affine, y_affine, h160.h, m, tid, 0u);
             }
         }
-    }
 
-    states[tid] = s;
+        // ── 8. Advance to the next key ───────────────────────────────────────
+        // Done AFTER the hash so the seed key itself is checked (gap-free
+        // tiling).  Point and scalar advance by the stride; the scalar tracks
+        // the private key for match reporting.
+        let p = jac_add_affine(jacobian(s.x, s.y, s.z), s.step_px, s.step_py);
+        s.x = p.x; s.y = p.y; s.z = p.z;
+        s.scalar = scalar_add_256(s.scalar, stride_le);
+        states[tid] = s;
+    }
 }

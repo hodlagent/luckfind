@@ -32,7 +32,9 @@ pub struct GpuConfig {
     pub num_threads: u32,
     pub steps_per_call: u32,
     pub num_candidates: u32,
-    pub _padding: u32,
+    /// Keys advanced per shader step (`P += stride·G`, `scalar += stride`).
+    /// 1 = lottery (step = G); N = puzzle dense-tiling (step = N·G).
+    pub stride: u32,
 }
 
 /// Matches the WGSL `GeneratorPoint` layout. 64 bytes.
@@ -44,7 +46,7 @@ pub struct GeneratorPoint {
     pub gy: [u32; 8],
 }
 
-/// 128 bytes — matches WGSL `GpuState` (3× Jacobian + scalar).
+/// 192 bytes — matches WGSL `GpuState` (3× Jacobian + scalar + step point).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuState {
@@ -52,6 +54,9 @@ pub struct GpuState {
     pub y: [u32; 8],
     pub z: [u32; 8],
     pub scalar: [u32; 8],
+    /// Per-walker affine step point (LE limbs). Lottery: = G. Puzzle: = N·G.
+    pub step_px: [u32; 8],
+    pub step_py: [u32; 8],
 }
 
-const _: [(); 128] = [(); std::mem::size_of::<GpuState>()];
+const _: [(); 192] = [(); std::mem::size_of::<GpuState>()];

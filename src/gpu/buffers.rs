@@ -83,6 +83,7 @@ impl GpuBuffers {
         })
     }
 
+    #[allow(dead_code)]
     pub fn num_threads(&self) -> u32 {
         (self.states.size() / size_of::<GpuState>() as u64) as u32
     }
