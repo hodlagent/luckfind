@@ -714,7 +714,7 @@ fn gpu_puzzle_worker(
     stop_flag: &AtomicBool,
     start: Instant,
 ) {
-    // Set up GPU.  If no Metal device is available (CI, headless) we log and
+    // Set up GPU.  If no GPU device is available (CI, headless) we log and
     // fall back to CPU-only — never block the whole run on a missing GPU.
     let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
         Ok(c) => c,
