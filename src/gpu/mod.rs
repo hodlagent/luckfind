@@ -1,4 +1,4 @@
-//! GPU-accelerated secp256k1 scanner backend (Metal via wgpu + naga WGSL→MSL).
+//! GPU-accelerated secp256k1 scanner backend (cross-platform via wgpu + naga).
 //!
 //! 100k independent GPU threads each walk `P += G` with per-step hash160
 //! comparison against a candidate set of Bitcoin addresses.  The bottleneck
