@@ -22,6 +22,9 @@ pub struct GpuScanner {
     /// Initial scalar per thread (LE limbs), for CPU-side match verification.
     initial_scalars: Vec<[u32; 8]>,
     pub total_ops: u64,
+    /// Milliseconds to sleep after each dispatch (throttles GPU to leave
+    /// headroom for display rendering; 0 = run at full speed).
+    pub sleep_ms: u64,
 }
 
 impl GpuScanner {
@@ -41,11 +44,15 @@ impl GpuScanner {
             pipeline,
             buffers,
             bind_group,
-            steps_per_call: 64,  // default, calibrated later
+            steps_per_call: 1,   // 1 step × 100k threads = 100k keys/dispatch (avoids TDR)
             stride: 1,           // lottery default; puzzle sets this to NUM_GPU_THREADS
             num_candidates: 78,  // lottery default; puzzle sets this to 1
             initial_scalars: Vec::new(),
             total_ops: 0,
+            #[cfg(target_os = "macos")]
+            sleep_ms: 0,         // macOS: no throttle needed
+            #[cfg(not(target_os = "macos"))]
+            sleep_ms: 24,        // Windows/Linux: throttle to leave headroom for display
         })
     }
 
@@ -183,6 +190,19 @@ impl GpuScanner {
         // shader's batch-inversion scratch).
         let workgroups = (NUM_GPU_THREADS + 127) / 128;
 
+        // Create a fresh staging buffer for each dispatch.  We cannot reuse a
+        // staging buffer after a failed map_async because wgpu 28 leaves its
+        // internal mapping state dirty, causing "Buffer is already mapped"
+        // panics on reuse.
+        let matches_byte_size = self.buffers.matches_byte_size();
+        let staging_size = 4u64 + matches_byte_size;
+        let staging = self.ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: staging_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let mut encoder = self.ctx.device().create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Luckfind Encoder") },
         );
@@ -195,19 +215,18 @@ impl GpuScanner {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
-        // Copy match_count + matches → staging.
-        let matches_byte_size = self.buffers.matches_byte_size();
+        // Copy match_count + matches → fresh staging.
         encoder.copy_buffer_to_buffer(
             &self.buffers.match_count,
             0,
-            self.buffers.staging(),
+            &staging,
             0,
             4,
         );
         encoder.copy_buffer_to_buffer(
             &self.buffers.matches,
             0,
-            self.buffers.staging(),
+            &staging,
             4,
             matches_byte_size,
         );
@@ -215,12 +234,32 @@ impl GpuScanner {
 
         self.total_ops += NUM_GPU_THREADS as u64 * self.steps_per_call as u64;
 
-        // Read back.
-        let staging = self.buffers.staging();
+        // Read back (consumes the staging buffer).
+        let matches = self.readback_matches(&staging)?;
+
+        // Reset match_count for next dispatch.
+        self.ctx
+            .queue()
+            .write_buffer(&self.buffers.match_count, 0, &[0u8; 4]);
+
+        // Throttle: sleep to leave GPU headroom for display rendering.
+        if self.sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+        }
+
+        Ok(matches)
+    }
+
+    /// Read back matches from a fresh staging buffer.
+    ///
+    /// The staging buffer is consumed (dropped) after this call.  On success
+    /// we explicitly unmap before dropping; on failure the buffer is already
+    /// destroyed at the wgpu level so we just propagate the error.
+    fn readback_matches(&self, staging: &wgpu::Buffer) -> Result<Vec<GpuMatchOutput>> {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
-            tx.send(res).unwrap();
+            tx.send(res).ok();
         });
         self.ctx
             .device()
@@ -229,6 +268,7 @@ impl GpuScanner {
                 timeout: None,
             })
             .map_err(|e| anyhow::anyhow!("GPU poll failed: {e:?}"))?;
+
         rx.recv()
             .map_err(|e| anyhow::anyhow!("map callback dropped: {e}"))?
             .map_err(|e| anyhow::anyhow!("buffer map failed: {e:?}"))?;
@@ -245,11 +285,6 @@ impl GpuScanner {
         }
         drop(data);
         staging.unmap();
-
-        // Reset match_count for next dispatch.
-        self.ctx
-            .queue()
-            .write_buffer(&self.buffers.match_count, 0, &[0u8; 4]);
 
         Ok(matches)
     }
