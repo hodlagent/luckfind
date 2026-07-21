@@ -1,8 +1,9 @@
-//! GPU context — Metal-only device management via wgpu 28 + pollster.
+//! GPU context — cross-platform device management via wgpu 28 + pollster.
 //!
-//! Adapted from kangaroo's `gpu_crypto/context.rs` but stripped to Metal-only
-//! (luckfind targets Apple Silicon).  Keeps: `create_shader_module` (3-source
-//! WGSL concatenation), `create_buffer`, `create_buffer_init`, device/queue.
+//! Adapted from kangaroo's `gpu_crypto/context.rs`.  Uses `Backends::all()` so
+//! it works on Metal (macOS), Vulkan (Windows/Linux), and DX12 (Windows).
+//! Keeps: `create_shader_module` (3-source WGSL concatenation), `create_buffer`,
+//! `create_buffer_init`, device/queue.
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -26,14 +27,15 @@ pub struct GpuDeviceInfo {
 }
 
 impl GpuContext {
-    /// Initialize the Metal backend on the given adapter index.
+    /// Initialize the GPU backend on the given adapter index.
+    /// Uses all available backends for the platform (Metal on macOS, Vulkan/DX12 on Windows/Linux).
     pub async fn new(device_index: u32) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::METAL).await;
+        let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
         let adapter = adapters
             .into_iter()
             .nth(device_index as usize)
@@ -136,16 +138,16 @@ impl GpuContext {
     }
 }
 
-/// Enumerate available Metal GPU devices (for `--gpu-list`).
+/// Enumerate available GPU devices (for `--gpu-list`).
 #[allow(dead_code)]
 pub fn enumerate_gpus() -> Vec<GpuDeviceInfo> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::METAL,
+        backends: wgpu::Backends::all(),
         ..Default::default()
     });
     pollster::block_on(async {
         instance
-            .enumerate_adapters(wgpu::Backends::METAL)
+            .enumerate_adapters(wgpu::Backends::all())
             .await
             .into_iter()
             .map(|a| {
