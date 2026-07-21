@@ -1,14 +1,20 @@
 //! GPU buffer management — config, states, candidates, matches, match_count.
 //!
 //! Simplified from kangaroo's `gpu/buffers.rs`: no double-buffering (matches
-//! are rare; we read back once per dispatch).  5 buffers + 1 staging buffer.
+//! are rare; we read back once per dispatch). 5 buffers.
+//!
+//! Note: the staging buffer is NOT stored here because after a failed
+//! `map_async` the buffer's internal mapping state is left dirty (wgpu 28
+//! does not reset `mc.mapped_range` on failure), which would cause
+//! "Buffer is already mapped" panics on reuse. Instead, a fresh staging
+//! buffer is created for each dispatch.
 
 use super::{GpuConfig, GpuContext, GpuMatchOutput, GpuState};
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Maximum number of matches we retain between readbacks.
-const MAX_MATCHES: u32 = 256;
+pub(crate) const MAX_MATCHES: u32 = 256;
 
 pub struct GpuBuffers {
     device: Arc<wgpu::Device>,
@@ -17,8 +23,6 @@ pub struct GpuBuffers {
     pub candidates: wgpu::Buffer,
     pub matches: wgpu::Buffer,
     pub match_count: wgpu::Buffer,
-    /// Staging buffer for reading back match_count + matches.
-    staging: wgpu::Buffer,
 }
 
 impl GpuBuffers {
@@ -63,15 +67,6 @@ impl GpuBuffers {
             1,
         )?;
 
-        let matches_byte_size = (MAX_MATCHES as u64) * size_of::<GpuMatchOutput>() as u64;
-        let staging_size = 4u64 + matches_byte_size;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: staging_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Ok(Self {
             device,
             config,
@@ -79,7 +74,6 @@ impl GpuBuffers {
             candidates: candidates_buf,
             matches,
             match_count,
-            staging,
         })
     }
 
@@ -90,10 +84,6 @@ impl GpuBuffers {
 
     pub fn matches_byte_size(&self) -> u64 {
         (MAX_MATCHES as u64) * size_of::<GpuMatchOutput>() as u64
-    }
-
-    pub fn staging(&self) -> &wgpu::Buffer {
-        &self.staging
     }
 
     /// Build the bind group for the luckfind pipeline.
