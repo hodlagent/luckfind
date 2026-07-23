@@ -66,6 +66,56 @@ fn bs58_encode(data: &[u8]) -> String {
     String::from_utf8(mapped).unwrap_or_default()
 }
 
+/// Decode a base58-encoded string back into its raw bytes.
+///
+/// The inverse of `bs58_encode`: leading `'1'` characters map to leading `0x00`
+/// bytes, and any character outside the base58 alphabet returns `None`.
+fn bs58_decode(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() { return Some(Vec::new()); }
+    let mut digits: Vec<u8> = Vec::new();
+    for ch in input.bytes() {
+        let idx = B58_ALPHABET.iter().position(|&a| a == ch)?;
+        let mut carry = idx as u32;
+        for d in digits.iter_mut() {
+            carry += (*d as u32) * 58;
+            *d = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 {
+            digits.push((carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let leading_zeros = input.bytes().take_while(|&b| b == b'1').count();
+    digits.reverse();
+    let mut out = vec![0u8; leading_zeros];
+    out.extend_from_slice(&digits);
+    Some(out)
+}
+
+/// Parse a legacy Base58Check Bitcoin address (P2PKH starting with `1`, or P2SH
+/// starting with `3`) and return the 20-byte RIPEMD-160 hash it commits to.
+///
+/// Returns `None` if the input is not valid base58, is not exactly 25 bytes
+/// after decoding, or fails the 4-byte checksum verification.  The version byte
+/// is discarded — callers that need it can read `address.as_bytes()[0]`
+/// (`0x00` = P2PKH, `0x05` = P2SH).
+pub fn legacy_address_hash160(address: &str) -> Option<[u8; 20]> {
+    let decoded = bs58_decode(address)?;
+    if decoded.len() != 25 {
+        return None;
+    }
+    let (payload, checksum) = decoded.split_at(21);
+    let c1 = sha2::Sha256::digest(payload);
+    let c2 = sha2::Sha256::digest(c1);
+    if c2[..4] != *checksum {
+        return None;
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&payload[1..]);
+    Some(hash)
+}
+
 #[inline(always)]
 pub fn base58check(payload: &[u8]) -> String {
     let c1 = sha2::Sha256::digest(payload);
