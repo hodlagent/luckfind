@@ -48,24 +48,6 @@ pub struct Cli {
     #[arg(long)]
     pub profile: bool,
 
-    /// Use random-split mode together with `--puzzle <file>`.
-    ///
-    /// Workers claim a random *pending* sub-range and scan it sequentially
-    /// (key += 1).  When the worklist is below the cap (1024 × 1024), claiming
-    /// a sub-range *splits* it in two at a random point: the worker scans the
-    /// upper half and parks the lower half as a fresh pending chunk with a new
-    /// id.  This produces a "jump around the key space" scan instead of a
-    /// low-to-high sweep, while keeping the same zero-dedup guarantee.
-    ///
-    /// Sub-ranges narrower than 2^31 keys are scanned to completion in one
-    /// claim; wider ones are parked after 2^31 keys and resumed later (the
-    /// classic rotation mechanism).  On parking or SIGINT (Ctrl+C) the current
-    /// scanning position is written back into the JSON so the sub-range is
-    /// reclaimed later and resumed with no double-scanning.  The target address
-    /// is read from the puzzle file; `--addrs` / `--source` are ignored.
-    #[arg(long)]
-    pub random_subrange: bool,
-
     /// Path to puzzle JSON worklist file (e.g. a btcpuzzle #76 range-split).
     ///
     /// In puzzle mode the binary:
@@ -73,14 +55,15 @@ pub struct Cli {
     ///     `end_hex`, `status`; the old `start_hex`/`range_bits` format is
     ///     auto-migrated on load),
     ///   - picks a random *pending* sub-range per worker (splitting it when
-    ///     under the cap, see `--random-subrange`),
+    ///     under the cap — 随机挑选 + 随机拆分策略),
     ///   - scans its keys sequentially from `current_hex` → `end_hex` (key += 1),
+    ///   - 每处理 2^31 个 keys 就停放当前子区间并重新选择（旋转策略），
     ///   - marks the sub-range `finished` once the whole range is done,
     ///   - on SIGINT (Ctrl+C) writes the current scanning position back into
     ///     the JSON so the next run resumes exactly from there.
     ///
     /// Hex values that are shorter than 64 chars are left-padded to a full
-   /// 32-byte key (high bytes zero-filled).
+    /// 32-byte key (high bytes zero-filled).
     #[arg(long)]
     pub puzzle: Option<String>,
 }

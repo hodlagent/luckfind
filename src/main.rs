@@ -37,20 +37,18 @@ fn main() {
 
     // ── puzzle mode: deterministic sub-range scan from a worklist JSON ───────
     if let Some(ref puzzle_path) = cli.puzzle {
-        // In random-subrange mode each claim processes at most 2^31 keys before
-        // parking the chunk and moving on to a fresh *random* pending chunk —
-        // the claim order is already random (see pick_random), so this turns an
-        // in-order sweep into a jump-around scan with the same zero-dedup
-        // guarantee.  `--addrs` / `--source` are ignored: the target comes from
-        // the puzzle file.
-        if cli.random_subrange && cli.addrs.is_some() {
-            eprintln!("[puzzle] --addrs / --source are ignored in random-subrange mode — target comes from the puzzle file.");
+        // 每处理 2^31 个 keys 就停放当前子区间并重新选择（旋转策略）。
+        // `local_count` 每次 claim 重置，所以这是 per-claim 的旋转预算，不是累计的。
+        // 旋转后 worker 回到 claim_random_chunk，按随机性策略重新选子区间：
+        //   - 子区间数 < 1024×1024：随机选一个 pending 区间，拆分为 [x,d] 和 [d,y]，
+        //     保存到 JSON，选择 [d,y] 开始计算。
+        //   - 子区间数 ≥ 1024×1024：从 pending 中随机选择一个直接计算。
+        // 子区间宽度 ≤ 2^31 时一次完成（scan_budget 精确终止），不触发旋转。
+        // 2^31 keys per claim ≈ 2.15×10^9。
+        if cli.addrs.is_some() {
+            eprintln!("[puzzle] --addrs / --source are ignored in puzzle mode — target comes from the puzzle file.");
         }
-        // 2^31 keys per claim ≈ 2.15×10^9; `local_count` resets every claim so
-        // this is a per-claim rotation budget, not cumulative.
-        // 2^31 keys per claim ≈ 2.15×10^9; `local_count` resets every claim so
-        // this is a per-claim rotation budget, not cumulative.
-        let rotate_keys = if cli.random_subrange { Some(1u64 << 31) } else { None };
+        let rotate_keys = Some(1u64 << 31);
         let (stats, matches) = puzzle::run(
             Path::new(puzzle_path),
             cli.workers(),
@@ -60,11 +58,6 @@ fn main() {
         let _ = stats; // progress already printed by puzzle::run
         report::flush_got(&matches, Some(Path::new(&cli.output_dir)));
         return;
-    }
-
-    if cli.random_subrange {
-        eprintln!("[puzzle] --random-subrange requires --puzzle <file> (the target address is read from the puzzle worklist).");
-        std::process::exit(2);
     }
 
     let addrs = addrs::load_candidates(cli.addrs.as_deref());
