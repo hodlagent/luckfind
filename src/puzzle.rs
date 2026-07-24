@@ -1,33 +1,45 @@
 //! Puzzle-mode scanner.
 //!
-//! Reads a btcpuzzle-style worklist JSON file that subdivides a puzzle
-//! key-range into `chunks`.  Each chunk defines:
+//! Reads a worklist JSON file that subdivides a puzzle key-range into
+//! sub-range `chunks`.  Each chunk defines:
 //!
-//! - `start_hex`:  leftmost private key in the sub-range.  May be < 64 hex
-//!   chars; it is always zero-padded on the *left* (high bytes) to a full
-//!   32-byte secp256k1 key.
-//! - `range_bits`: width of the sub-range, so the chunk spans `2^range_bits`
-//!   keys `[start, start + 2^range_bits)`.
-//! - `status`:     `"pending"`, `"running"`, or `"finished"`.
-//! - `current_hex` (optional): scan progress written back so that on resume
-//!   the next run starts here.
+//! - `id`:           stable identifier (monotonic; new ids are assigned as
+//!                    chunks are split).
+//! - `current_hex`:  the effective left bound AND the resume position.  May be
+//!                    < 64 hex chars; it is always zero-padded on the *left*
+//!                    (high bytes) to a full 32-byte secp256k1 key.  Scanning
+//!                    advances this; on resume the worker starts here.  Always
+//!                    set (never null).
+//! - `end_hex`:      exclusive upper bound; never changes for a given chunk.
+//! - `status`:       `"pending"`, `"running"`, or `"finished"`.
 //!
 //! Per worker: pick a random *pending* chunk, claim it (status = "running"),
-//! then walk every key `current ..= end` by scalar +1 (the same tight `+= 1`
+//! then walk every key `current .. end` by scalar +1 (the same tight `+= 1`
 //! loop used in lottery mode for speed).  When the whole sub-range is done,
 //! the chunk is marked `finished`.  On SIGINT (Ctrl+C) every worker flushes
 //! its current scanning position into the worklist JSON, reverts the chunk
 //! to `"pending"`, and exits — so a later invocation resumes cleanly.
 //!
-//! Current bytes saved per chunk:
+//! **Random-split strategy.**  The worklist starts with one chunk per
+//! puzzle-range subdivision and grows dynamically: when a worker claims a
+//! pending chunk `[x, y)` and the worklist is below the cap
+//! (`MAX_CHUNKS = 1024 × 1024`), it splits the chunk at a random point
+//! `d ∈ (x, y)`, scans the upper half `[d, y)`, and parks the lower half
+//! `[x, d)` as a fresh pending chunk with a new id.  Once the cap is reached
+//! workers simply scan the picked chunk directly.  Sub-ranges narrower than
+//! `ROTATION_BUDGET = 2^31` keys are scanned to completion in one claim;
+//! wider ones use the rotation mechanism (park after `2^31` keys, resume
+//! later).  This gives a "jump around the key space" scan with the same
+//! zero-dedup guarantee as a sequential sweep.
+//!
+//! Bytes saved per chunk:
 //!
 //! ```json
 //! {
-//!   "chunk_index": 42,
-//!   "start_hex": "8200000000000000000",
-//!   "range_bits": 65,
-//!   "status": "pending",
-//!   "current_hex": "821a3f ... e2"   // last key processed on abort; cleared on finish
+//!   "id": 42,
+//!   "current_hex": "8200000000000000000",
+//!   "end_hex": "8400000000000000000",
+//!   "status": "pending"
 //! }
 //! ```
 
@@ -36,6 +48,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use num_bigint::BigUint;
+use num_traits::One;
 use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +57,16 @@ use crate::addrs;
 use crate::btc;
 use crate::progress::Progress;
 use crate::workers::{fmt_comma, MatchEvent};
+
+/// Maximum number of sub-ranges the worklist may grow to via splitting.
+/// 1024 × 1024 = 1_048_576.  Once reached, workers stop splitting and just
+/// scan the picked sub-range (with rotation if it exceeds the per-claim budget).
+const MAX_CHUNKS: usize = 1024 * 1024;
+
+/// Per-claim scan budget.  Sub-ranges narrower than this are scanned to
+/// completion in one claim; wider ones are parked after this many keys and
+/// resumed later (the existing "rotation" mechanism).
+const ROTATION_BUDGET: u64 = 1u64 << 31;
 
 /// Wall-clock interval (seconds) between worklist auto-saves on the ticker.
 /// The ticker holds the PuzzleCtx lock briefly, serialising disk writes
@@ -54,15 +78,17 @@ const SAVE_INTERVAL_SECS: u64 = 600;
 
 // ── worklist JSON shape ──────────────────────────────────────────────────────
 
-/// On-disk puzzle worklist.  Mirrors the btcpuzzle range-split format plus the
-/// optional `current_hex` field used for checkpointing.
+/// On-disk puzzle worklist.  The overall puzzle range is `[start_hex, end_hex)`;
+/// `chunks` holds the live sub-ranges that partition (part of) that range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PuzzleFile {
     pub puzzle_number: u32,
     pub total_bits: u32,
     #[serde(default)]
     pub chunk_bits_used: u32,
+    #[serde(default)]
     pub total_chunks: u32,
+    #[serde(default)]
     pub completed_chunks: u32,
     pub target: String,
     /// Optional expected RIPEMD-160 hash (40 hex chars) of `target`.  When
@@ -70,20 +96,46 @@ pub struct PuzzleFile {
     /// means the JSON is inconsistent and we abort.  Absent ⇒ skipped.
     pub hash160: Option<String>,
     pub chunks: Vec<Chunk>,
+
+    // ── new fields (random-split strategy) ─────────────────────────────────────
+    /// Overall puzzle range `[start_hex, end_hex)`.  For puzzle 76 this is
+    /// `[2^75, 2^76)`.  Derived from `total_bits` on migration when absent.
+    #[serde(default)]
+    pub start_hex: String,
+    #[serde(default)]
+    pub end_hex: String,
+    /// Monotonic counter for assigning ids to newly split-off chunks.
+    #[serde(default)]
+    pub next_id: u32,
 }
 
 /// A single sub-range in the puzzle worklist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
-    pub chunk_index: u32,
-    pub start_hex: String,
-    pub range_bits: u32,
+    #[serde(default)]
+    pub id: u32,
+    /// Most-recent scan position AND the effective left bound of the sub-range.
+    /// Scanning advances this; on resume the worker starts here.  Always set.
+    #[serde(default)]
+    pub current_hex: String,
+    /// Exclusive upper bound.  Never changes for a given chunk.
+    #[serde(default)]
+    pub end_hex: String,
     pub status: String,
 
-    /// Snapshot of the most recent key processed; `None` until first scan
-    /// starts.  When present, the next chunk iteration resumes from here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_hex: Option<String>,
+    // ── legacy fields (old worklist format); cleared on migration.
+    // Skipped on serialization so the on-disk format stays clean (new chunks
+    // never carry them).  `#[serde(default)]` lets old JSON deserialize.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub chunk_index: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub start_hex: String,
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub range_bits: u32,
+}
+
+fn u32_is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 // ── runtime state ────────────────────────────────────────────────────────────
@@ -93,6 +145,72 @@ pub struct Chunk {
 struct PuzzleCtx {
     file: PuzzleFile,
     path: PathBuf,
+}
+
+// ── migration: old worklist format → new random-split format ─────────────────
+
+/// Migrate an old-format worklist (with `start_hex` + `range_bits` per chunk) to
+/// the new random-split format (`current_hex` + `end_hex`).  Detection heuristic:
+/// a chunk is "old format" iff `range_bits != 0` (old chunks always carry
+/// `range_bits: 65`; new chunks default to 0) or `end_hex` is empty.  Idempotent:
+/// new-format chunks are left untouched.
+fn migrate_puzzle_file(file: &mut PuzzleFile) {
+    // Assign ids from a fresh monotonic counter seeded above every existing
+    // id.  Using a counter (rather than chunk_index) means a re-run after a
+    // killed partial-migration can never collide with an id already written:
+    // every new id is strictly greater than all pre-existing ones, regardless
+    // of chunk_index values or how far the previous run got.
+    let mut next_free = file
+        .chunks
+        .iter()
+        .map(|c| c.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    for c in &mut file.chunks {
+        let legacy = c.range_bits != 0 || c.end_hex.is_empty();
+        if !legacy {
+            continue;
+        }
+
+        let base = parse_hex_key(&c.start_hex);
+        let end = chunk_end(&base, c.range_bits);
+
+        c.end_hex = hex_encode_key(&end);
+        c.id = next_free;
+        next_free = next_free.saturating_add(1);
+
+        // Resume position: keep the old current_hex iff it lies in [base, end);
+        // otherwise self-heal to the chunk's nominal start (preserving the
+        // original short-hex representation, matching the existing resume
+        // logic).
+        if c.current_hex.is_empty() {
+            c.current_hex = c.start_hex.clone();
+        } else {
+            let cur = parse_hex_key(&c.current_hex);
+            let in_range = cur >= base && crate::gpu::convert::be_lt(&cur, &end);
+            if !in_range {
+                c.current_hex = c.start_hex.clone();
+            }
+        }
+
+        // Zero legacy fields so they don't serialize on the next save and don't
+        // re-trigger migration.
+        c.range_bits = 0;
+        c.start_hex = String::new();
+        c.chunk_index = 0;
+    }
+
+    file.next_id = next_free;
+    file.total_chunks = file.chunks.len() as u32;
+
+    // Derive overall puzzle range [2^total_bits, 2^(total_bits+1)) when absent.
+    if file.start_hex.is_empty() {
+        let start = BigUint::one() << file.total_bits; // 2^total_bits
+        let end = BigUint::one() << (file.total_bits + 1); // 2^(total_bits+1)
+        file.start_hex = hex_encode_key(&biguint_to_32be(&start));
+        file.end_hex = hex_encode_key(&biguint_to_32be(&end));
+    }
 }
 
 // ── public entry point ──────────────────────────────────────────────────────
@@ -155,6 +273,10 @@ pub fn run(
             }
         }
     }
+
+    // Migrate an old-format worklist (start_hex + range_bits) to the new
+    // random-split format (current_hex + end_hex).  Idempotent on new files.
+    migrate_puzzle_file(&mut file);
 
     // Crash-recovery: any chunk left "running" from a previous killed run was
     // in-flight — revert it to pending so it can be reclaimed.
@@ -287,7 +409,7 @@ pub fn run(
                     .chunks
                     .iter()
                     .filter(|c| c.status == "running")
-                    .map(|c| c.chunk_index)
+                    .map(|c| c.id)
                     .collect();
                 let idxs_label = if running_idxs.len() <= 8 {
                     format!("{:?}", running_idxs)
@@ -404,82 +526,38 @@ fn puzzle_worker(
     let point_g = crate::btc::generator_public_key();
 
     loop {
-        // ── pick + claim a pending chunk ────────────────────────────────────
+        // ── pick + claim a pending chunk (with optional split) ──────────────
+        // `claim_random_chunk` picks a random pending chunk, splits it in two
+        // (when under the cap and it has >1 key), marks the scanned half
+        // "running", and persists.  It returns None only when no claimable
+        // pending chunk remains.  Empty chunks are finalized-and-retried
+        // internally so the worker never sees a spurious "all done".
         let claim = {
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-            // Only *pending* chunks are claimable.  "running" chunks belong to
-            // another worker — trying to re-claim them would double-scan.
-            // Crash recovery (a chunk left "running" by a killed run) is
-            // handled at startup, where we reset those back to "pending".
-            let pendings: Vec<usize> = ctx
-                .file
-                .chunks
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.status == "pending")
-                .map(|(i, _)| i)
-                .collect();
-            if pendings.is_empty() {
-                return; // all done
-            }
-            pick_random(&pendings).map(|&idx| {
-                // Narrow inner scopes so the mutable borrow of ctx ends
-                // before ctx.save() below.
-                // `end_bytes` is the chunk's *true* exclusive bound, derived
-                // from its nominal start (`start_hex`).  It must NOT be
-                // derived from the resume position — resuming mid-chunk must
-                // not extend the scan past the chunk's real boundary (which
-                // would double-scan into the next chunk, or past the puzzle
-                // range).  Carried out of this scope so the scan loop can use
-                // it directly.
-                let (chunk_id, start_hex, end_bytes) = {
-                    let chunk = &mut ctx.file.chunks[idx];
-                    let base = parse_hex_key(&chunk.start_hex);
-                    let end  = chunk_end(&base, chunk.range_bits);
-                    // Resume from prior current_hex IFF it lies strictly
-                    // within [base..end).  Otherwise fall back to base —
-                    // this self-heals a corrupt / out-of-range checkpoint.
-                    let resumed = chunk.current_hex.as_deref().and_then(|h| {
-                        let ck = parse_hex_key(h);
-                        (ck >= base && ck < end).then_some(h.to_owned())
-                    });
-                    chunk.status = "running".to_string();
-                    // Drop stale checkpoint — worker re-establishes its
-                    // own as it scans.
-                    chunk.current_hex = None;
-                    (
-                        chunk.chunk_index,
-                        resumed.unwrap_or(chunk.start_hex.clone()),
-                        end,
-                    )
-                };
-                // Persist `status = running` to disk immediately so an
-                // observer reading the JSON right after this claim sees it.
-                // Without this the status only surfaces on the next
-                // heartbeat auto-save (up to SAVE_INTERVAL_SECS away).
-                if let Err(e) = ctx.save() {
-                    eprintln!("[puzzle] post-claim flush failed: {e}");
-                }
-                let start_bytes = parse_hex_key(&start_hex);
-                (idx, chunk_id, start_bytes, end_bytes)
-            })
+            claim_random_chunk(&mut ctx)
         };
 
-        let (idx, chunk_id, start_bytes, end_bytes) = match claim {
+        let claimed = match claim {
             Some(c) => c,
-            None => return,
+            None => return, // all done
         };
+        let (idx, chunk_id, start_bytes, end_bytes) = (claimed.idx, claimed.id, claimed.start, claimed.end);
 
         let mut sk = match secp256k1::SecretKey::from_byte_array(start_bytes) {
             Ok(k) => k,
             Err(_) => {
-                // The nominal `start_hex` is outside [1, n-1]; skip this chunk.
+                // The start key is outside [1, n-1]; skip this chunk.
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[idx].status = "pending".to_string();
+                ctx.file.chunks[idx].current_hex = hex_encode_key(&start_bytes);
                 continue;
             }
         };
         let mut local_count = 0u64;
+
+        // Scan budget: `Some(n)` when the sub-range width ≤ ROTATION_BUDGET
+        // (scan exactly n keys to completion); `None` when wider (use rotation).
+        let budget: Option<u64> = scan_budget(&start_bytes, &end_bytes);
 
         // 初始一次完整标量乘 `pk = sk * G`。之后循环不再做标量乘，只用点加
         // `pk = pk + G` 推进 —— 比每步 from_secret_key 便宜 10-20×。
@@ -529,15 +607,23 @@ fn puzzle_worker(
                 progress.increment(1000);
             }
 
-            // ── boundary check (amortised ~2000× like lottery) ─────────────
+            // ── NEW: exact-termination for small chunks (every iteration) ─
+            // For budgeted chunks (width ≤ 2^31) this is the *only* termination
+            // that matters and it prevents overshoot past end_bytes between the
+            // 2048-cadence checks (a sub-2048-key chunk would otherwise run the
+            // hot path 2048 times before the first boundary check).
+            if let Some(b) = budget {
+                if local_count >= b {
+                    break 'scan true;
+                }
+            }
+
+            // ── 2048-cadence housekeeping ─────────────────────────────────
             // Every 2048 iterations we do three cheap things:
             //   1. SIGINT flag — break out if the user pressed Ctrl+C.
             //   2. End-of-range — break out if we've scanned the whole chunk.
             //   3. Refresh in-memory current_hex — this is the snapshot the
-            //      ticker persists to disk every SAVE_INTERVAL_SECS.  Writing
-            //      it every 2048 iterations (~5 ms at 500 kkeys/s) means the
-            //      ticker almost always has a fresh resume point, bounding
-            //      the worst-case loss to a few microseconds of scanning.
+            //      ticker persists to disk every SAVE_INTERVAL_SECS.
             // The release backend compiles the `is_multiple_of` modulo to a
             // single `test` instruction; the predictor lock-stamps the
             // not-taken path so the hot loop stays tight.
@@ -545,25 +631,33 @@ fn puzzle_worker(
                 if stop_flag.load(Ordering::Relaxed) {
                     break 'scan false;
                 }
-                if sk.secret_bytes() >= end_bytes {
-                    break 'scan true;
-                }
-                // ── rotation (random-subrange mode) ───────────────────────────
-                // Park the chunk after `rotate_keys` scanned *this claim* and
-                // let the worker move on to a fresh random pending chunk.
-                // `local_count` resets every claim, so this is "per-claim
-                // budget", not cumulative across re-claims of the same chunk.
-                // A chunk narrower than the budget still finishes via the
-                // end-of-range check above, so rotation only ever kicks in for
-                // chunks wider than the budget.
-                if let Some(rot) = rotate_keys {
-                    if local_count >= rot {
-                        break 'scan false; // finalize saves current_hex + pending
+
+                // End-of-range and rotation only apply to *unbudgeted* (wide)
+                // chunks.  For budgeted chunks the per-iteration check above
+                // already guarantees we stop exactly at the end, so these are
+                // skipped to keep rotation from firing on a chunk that fits
+                // in one go.
+                if budget.is_none() {
+                    if sk.secret_bytes() >= end_bytes {
+                        break 'scan true;
+                    }
+                    // ── rotation (random-subrange mode) ───────────────────────
+                    // Park the chunk after `rotate_keys` scanned *this claim*
+                    // and let the worker move on to a fresh random pending
+                    // chunk.  `local_count` resets every claim, so this is
+                    // "per-claim budget", not cumulative across re-claims of
+                    // the same chunk.
+                    if let Some(rot) = rotate_keys {
+                        if local_count >= rot {
+                            break 'scan false; // finalize saves current_hex + pending
+                        }
                     }
                 }
+
+                // Refresh in-memory resume position (ticker persists it).
                 let cur = sk.secret_bytes();
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-                ctx.file.chunks[idx].current_hex = Some(hex_encode_key(&cur));
+                ctx.file.chunks[idx].current_hex = hex_encode_key(&cur);
                 // Disk persist happens on the ticker every SAVE_INTERVAL_SECS;
                 // here we only refresh the in-memory snapshot.
             }
@@ -577,12 +671,12 @@ fn puzzle_worker(
             let chunk = &mut ctx.file.chunks[idx];
             if done {
                 chunk.status = "finished".to_string();
-                chunk.current_hex = None;
+                chunk.current_hex = chunk.end_hex.clone(); // fully consumed
                 ctx.file.completed_chunks += 1;
             } else {
                 // either SIGINT or scalar overflow — preserve progress & re-enable
                 chunk.status = "pending".to_string();
-                chunk.current_hex = Some(hex_encode_key(&sk.secret_bytes()));
+                chunk.current_hex = hex_encode_key(&sk.secret_bytes());
             }
             sync_flush_chunk(&mut ctx);
         }
@@ -604,43 +698,18 @@ struct GpuChunk {
     end: [u8; 32],   // exclusive upper bound
 }
 
-/// Pick + claim a pending chunk for the GPU worker (same policy as CPU workers:
-/// random pending chunk, "running" marker, persist immediately).  Returns `None`
-/// when no pending chunks remain.
+/// Pick + claim a pending chunk for the GPU worker.  Delegates to the shared
+/// `claim_random_chunk` helper (so the GPU participates in random splitting) and
+/// maps the result onto a `GpuChunk`.  Returns `None` when no pending chunks
+/// remain.
 fn gpu_claim_chunk(ctx: &mut PuzzleCtx) -> Option<GpuChunk> {
-    let pendings: Vec<usize> = ctx
-        .file
-        .chunks
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.status == "pending")
-        .map(|(i, _)| i)
-        .collect();
-    if pendings.is_empty() {
-        return None;
-    }
-    let &idx = pick_random(&pendings)?;
-    let chunk = &mut ctx.file.chunks[idx];
-    let base = parse_hex_key(&chunk.start_hex);
-    let end = chunk_end(&base, chunk.range_bits);
-    // Resume from prior current_hex IFF it lies within [base..end); else base.
-    let resumed = chunk.current_hex.as_deref().and_then(|h| {
-        let ck = parse_hex_key(h);
-        (&ck >= &base && crate::gpu::convert::be_lt(&ck, &end)).then_some(ck)
-    });
-    let start = resumed.unwrap_or(base);
-    chunk.status = "running".to_string();
-    chunk.current_hex = None;
-    let out = Some(GpuChunk {
-        idx,
-        chunk_id: chunk.chunk_index,
-        start,
-        end,
-    });
-    if let Err(e) = ctx.save() {
-        eprintln!("[puzzle] GPU post-claim flush failed: {e}");
-    }
-    out
+    let claimed = claim_random_chunk(ctx)?;
+    Some(GpuChunk {
+        idx: claimed.idx,
+        chunk_id: claimed.id,
+        start: claimed.start,
+        end: claimed.end,
+    })
 }
 
 /// Finalize a GPU-scanned chunk: either finished (whole range done) or parked
@@ -649,11 +718,11 @@ fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8;
     let chunk = &mut ctx.file.chunks[idx];
     if done {
         chunk.status = "finished".to_string();
-        chunk.current_hex = None;
+        chunk.current_hex = chunk.end_hex.clone();
         ctx.file.completed_chunks += 1;
     } else {
         chunk.status = "pending".to_string();
-        chunk.current_hex = Some(hex_encode_key(&current));
+        chunk.current_hex = hex_encode_key(&current);
     }
     sync_flush_chunk(ctx);
 }
@@ -832,7 +901,7 @@ fn gpu_puzzle_worker(
             // Refresh the in-memory resume position (disk flush is on the ticker).
             {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-                ctx.file.chunks[chunk.idx].current_hex = Some(hex_encode_key(&current));
+                ctx.file.chunks[chunk.idx].current_hex = hex_encode_key(&current);
             }
 
             if stop_flag.load(Ordering::Relaxed) {
@@ -927,6 +996,169 @@ pub(crate) fn chunk_end(start: &[u8; 32], range_bits: u32) -> [u8; 32] {
     result
 }
 
+// ── random-split helpers ─────────────────────────────────────────────────────
+
+/// Convert a `BigUint` to a 32-byte big-endian key, left-padding with zeros.
+/// Safe because all values here are < 2^76.
+fn biguint_to_32be(v: &BigUint) -> [u8; 32] {
+    let bytes = v.to_bytes_be();
+    assert!(
+        bytes.len() <= 32,
+        "key {} exceeds 32 bytes ({} bytes)",
+        v,
+        bytes.len()
+    );
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    out
+}
+
+/// Uniform random `BigUint` in `[0, limit)`.  Generates `ceil(bits/8) + 8` random
+/// bytes (the extra 8 dilute modulo bias to < 2^-64, negligible for scan
+/// distribution) and reduces modulo `limit`.  `limit` must be ≥ 1.
+fn random_below(limit: &BigUint) -> BigUint {
+    assert!(
+        &BigUint::one() <= limit,
+        "random_below: limit must be >= 1"
+    );
+    let nbytes = limit.to_bytes_be().len(); // == ceil(bits/8) for limit > 0
+    let mut buf = vec![0u8; nbytes + 8]; // extra bytes remove modulo bias
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .expect("OS entropy source always available");
+    let v = BigUint::from_bytes_be(&buf);
+    &v % limit
+}
+
+/// Big-endian random `d` strictly between `x` and `y` (i.e. `x < d < y`).
+/// Caller guarantees `y - x > 1` (check via `can_split`).
+fn random_split_point(x: &[u8; 32], y: &[u8; 32]) -> [u8; 32] {
+    let xb = BigUint::from_bytes_be(x);
+    let yb = BigUint::from_bytes_be(y);
+    let range = &yb - &xb; // BigUint, ≥ 2
+    let modulus = &range - BigUint::one(); // range - 1 ≥ 1
+
+    // random offset in [0, range-2], then +1 → offset in [1, range-1]
+    let mut offset = random_below(&modulus);
+    offset += BigUint::one();
+
+    let d = xb + offset;
+    biguint_to_32be(&d)
+}
+
+/// Big-endian difference `end - start` as a BigUint.  Precondition: `end >= start`.
+fn be_diff(end: &[u8; 32], start: &[u8; 32]) -> BigUint {
+    BigUint::from_bytes_be(end) - BigUint::from_bytes_be(start)
+}
+
+/// True iff the sub-range `[start, end)` contains more than one key, i.e. a split
+/// point strictly between `start` and `end` exists.
+fn can_split(start: &[u8; 32], end: &[u8; 32]) -> bool {
+    let two = BigUint::from(2u32);
+    be_diff(end, start) >= two
+}
+
+/// Scan budget for a sub-range.  Returns `Some(n)` when the sub-range width is
+/// ≤ ROTATION_BUDGET (scan exactly `n` keys to completion); `None` when it is
+/// wider (use the rotation mechanism and ignore the exact width).
+fn scan_budget(start: &[u8; 32], end: &[u8; 32]) -> Option<u64> {
+    let diff = be_diff(end, start);
+    let budget = BigUint::from(ROTATION_BUDGET);
+    if diff > budget {
+        None
+    } else {
+        Some(diff.to_u64_digits().first().copied().unwrap_or(0))
+    }
+}
+
+// ── claim / split result ─────────────────────────────────────────────────────
+
+/// A sub-range claimed by a worker (CPU or GPU).  `start` is the inclusive
+/// first key to scan; `end` is the exclusive upper bound.
+struct ClaimedChunk {
+    idx: usize,
+    id: u32,
+    start: [u8; 32],
+    end: [u8; 32],
+}
+
+/// Pick a random pending chunk, optionally split it (when under the cap and it
+/// has >1 key), mark the scanned half "running", and persist.  Returns `None`
+/// only when no claimable pending chunk exists.  Empty chunks (`current >= end`)
+/// are finalized as finished and skipped (the loop retries with another chunk).
+fn claim_random_chunk(ctx: &mut PuzzleCtx) -> Option<ClaimedChunk> {
+    loop {
+        let pendings: Vec<usize> = ctx
+            .file
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.status == "pending")
+            .map(|(i, _)| i)
+            .collect();
+        if pendings.is_empty() {
+            return None;
+        }
+
+        let &idx = pick_random(&pendings)?;
+
+        // Read bounds (copy out to end the borrow before mutating).
+        let (cur_hex, end_hex, id) = {
+            let c = &ctx.file.chunks[idx];
+            (c.current_hex.clone(), c.end_hex.clone(), c.id)
+        };
+        let cur = parse_hex_key(&cur_hex);
+        let end = parse_hex_key(&end_hex);
+
+        // Empty chunk — finalize as finished, persist, and try another.
+        if !crate::gpu::convert::be_lt(&cur, &end) {
+            let c = &mut ctx.file.chunks[idx];
+            c.status = "finished".to_string();
+            c.current_hex = end_hex.clone();
+            ctx.file.completed_chunks += 1;
+            ctx.file.total_chunks = ctx.file.chunks.len() as u32;
+            sync_flush_chunk(ctx);
+            continue;
+        }
+
+        let scan_start = if ctx.file.chunks.len() < MAX_CHUNKS && can_split(&cur, &end) {
+            // Split [cur, end) at a random d with cur < d < end.
+            // Scan [d, end); park [cur, d) as a fresh pending chunk.
+            let d = random_split_point(&cur, &end);
+
+            ctx.file.chunks.push(Chunk {
+                id: ctx.file.next_id,
+                current_hex: hex_encode_key(&cur),
+                end_hex: hex_encode_key(&d),
+                status: "pending".to_string(),
+                chunk_index: 0,
+                start_hex: String::new(),
+                range_bits: 0,
+            });
+            ctx.file.next_id = ctx.file.next_id.saturating_add(1);
+            ctx.file.total_chunks = ctx.file.chunks.len() as u32;
+
+            let c = &mut ctx.file.chunks[idx];
+            c.current_hex = hex_encode_key(&d); // new left bound
+            c.status = "running".to_string();
+            d
+        } else {
+            // At cap or too narrow to split: scan [cur, end) directly.
+            let c = &mut ctx.file.chunks[idx];
+            c.status = "running".to_string();
+            cur
+        };
+
+        sync_flush_chunk(ctx);
+        return Some(ClaimedChunk {
+            idx,
+            id,
+            start: scan_start,
+            end,
+        });
+    }
+}
+
 /// Compare a serialised compressed/uncompressed pubkey against the target's
 /// 20-byte hash160.  Inlinable, branchless-friendly wrapper around what used
 /// to be two separate `hash160` calls on the hot path.
@@ -985,5 +1217,328 @@ impl PuzzleCtx {
         std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── biguint_to_32be round-trips with parse_hex_key ─────────────────────────
+
+    #[test]
+    fn test_biguint_to_32be_roundtrip() {
+        // Zero
+        let z = BigUint::from(0u32);
+        assert_eq!(biguint_to_32be(&z), [0u8; 32]);
+
+        // 2^75 (puzzle 76 start)
+        let v = BigUint::one() << 75;
+        let bytes = biguint_to_32be(&v);
+        assert_eq!(parse_hex_key(&hex_encode_key(&bytes)), bytes);
+
+        // Small value
+        let v = BigUint::from(0x42u32);
+        let bytes = biguint_to_32be(&v);
+        assert_eq!(bytes[31], 0x42);
+        assert_eq!(bytes[..31], [0u8; 31]);
+    }
+
+    #[test]
+    fn test_biguint_to_32be_puzzle76_range() {
+        // start = 2^75, end = 2^76
+        let start = BigUint::one() << 75;
+        let end = BigUint::one() << 76;
+        let s = parse_hex_key(&hex_encode_key(&biguint_to_32be(&start)));
+        let e = parse_hex_key(&hex_encode_key(&biguint_to_32be(&end)));
+        assert!(crate::gpu::convert::be_lt(&s, &e));
+        // Verify against known hex for 2^75 and 2^76:
+        //   2^75 = 0x00...0800...00  (byte[22] = 0x08)
+        //   2^76 = 0x00...1000...00  (byte[22] = 0x10)
+        assert_eq!(
+            hex_encode_key(&s),
+            "0000000000000000000000000000000000000000000008000000000000000000"
+        );
+        assert_eq!(
+            hex_encode_key(&e),
+            "0000000000000000000000000000000000000000000010000000000000000000"
+        );
+    }
+
+    // ── scan_budget ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scan_budget_small() {
+        // [0, 2^31) → Some(2^31)
+        let start = [0u8; 32];
+        let end = parse_hex_key("80000000"); // 2^31
+        assert_eq!(scan_budget(&start, &end), Some(1u64 << 31));
+    }
+
+    #[test]
+    fn test_scan_budget_at_boundary() {
+        // [0, 2^31 + 1) → None (exceeds budget)
+        let start = [0u8; 32];
+        let end = parse_hex_key("80000001"); // 2^31 + 1
+        assert_eq!(scan_budget(&start, &end), None);
+    }
+
+    #[test]
+    fn test_scan_budget_tiny() {
+        // [0, 1) → Some(1)
+        let start = [0u8; 32];
+        let end = parse_hex_key("1"); // 1
+        assert_eq!(scan_budget(&start, &end), Some(1));
+    }
+
+    #[test]
+    fn test_scan_budget_wide_high_bytes_differ() {
+        // High bytes differ → width ≥ 2^64 > 2^31 → None
+        let start = [0u8; 32];
+        // 2^248: byte[0] = 0x01, rest zero → far exceeds 2^31
+        let end = parse_hex_key("0100000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(scan_budget(&start, &end), None);
+    }
+
+    // ── can_split ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_can_split_adjacent() {
+        // [5, 6) → width 1 → cannot split
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[31] = 0x05;
+        b[31] = 0x06;
+        assert!(!can_split(&a, &b));
+    }
+
+    #[test]
+    fn test_can_split_two_keys() {
+        // [5, 7) → width 2 → can split (only d=6)
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[31] = 0x05;
+        b[31] = 0x07;
+        assert!(can_split(&a, &b));
+    }
+
+    #[test]
+    fn test_can_split_wide() {
+        // High bytes differ → definitely can split
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        a[0] = 0x00;
+        b[0] = 0x01;
+        assert!(can_split(&a, &b));
+    }
+
+    #[test]
+    fn test_can_split_empty() {
+        // [5, 5) → width 0 → cannot split
+        let mut a = [0u8; 32];
+        a[31] = 0x05;
+        assert!(!can_split(&a, &a));
+    }
+
+    // ── random_split_point ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_random_split_point_strict_between() {
+        // Run many samples to ensure d is always strictly between x and y.
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x[31] = 0x10; // 16
+        y[31] = 0x20; // 32
+        for _ in 0..1000 {
+            let d = random_split_point(&x, &y);
+            assert!(
+                crate::gpu::convert::be_lt(&x, &d),
+                "d ({}) must be > x ({})",
+                hex_encode_key(&d),
+                hex_encode_key(&x)
+            );
+            assert!(
+                crate::gpu::convert::be_lt(&d, &y),
+                "d ({}) must be < y ({})",
+                hex_encode_key(&d),
+                hex_encode_key(&y)
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_split_point_wide_range() {
+        // Wide range (2^65) like the initial puzzle 76 chunks.
+        let x = parse_hex_key("8000000000000000000");
+        let y = parse_hex_key("8020000000000000000"); // x + 2^65
+        for _ in 0..100 {
+            let d = random_split_point(&x, &y);
+            assert!(crate::gpu::convert::be_lt(&x, &d));
+            assert!(crate::gpu::convert::be_lt(&d, &y));
+        }
+    }
+
+    #[test]
+    fn test_random_split_point_non_degenerate() {
+        // Ensure d != x and d != y (no degenerate split into an empty half).
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x[31] = 0x00;
+        y[31] = 0x10;
+        for _ in 0..1000 {
+            let d = random_split_point(&x, &y);
+            assert_ne!(d, x, "split point must not equal x");
+            assert_ne!(d, y, "split point must not equal y");
+        }
+    }
+
+    // ── migration ──────────────────────────────────────────────────────────────
+
+    fn old_format_chunk(chunk_index: u32, start_hex: &str, range_bits: u32, current_hex: Option<&str>) -> Chunk {
+        Chunk {
+            id: 0,
+            current_hex: current_hex.unwrap_or("").to_string(),
+            end_hex: String::new(),
+            status: "pending".to_string(),
+            chunk_index,
+            start_hex: start_hex.to_string(),
+            range_bits,
+        }
+    }
+
+    #[test]
+    fn test_migrate_basic() {
+        let mut file = PuzzleFile {
+            puzzle_number: 76,
+            total_bits: 75,
+            chunk_bits_used: 65,
+            total_chunks: 2,
+            completed_chunks: 0,
+            target: "1DJh2eHFYQfACPmrvpyWc8MSTYKh7w9eRF".to_string(),
+            hash160: None,
+            chunks: vec![
+                old_format_chunk(0, "8000000000000000000", 65, None),
+                old_format_chunk(1, "8020000000000000000", 65, Some("8020000000000000000")),
+            ],
+            start_hex: String::new(),
+            end_hex: String::new(),
+            next_id: 0,
+        };
+
+        migrate_puzzle_file(&mut file);
+
+        // Fresh-counter ids start above max(existing ids)=0: chunk 0 → 1, chunk 1 → 2.
+        assert_eq!(file.chunks[0].id, 1);
+        assert_eq!(file.chunks[0].current_hex, "8000000000000000000");
+        assert!(!file.chunks[0].end_hex.is_empty());
+        assert_eq!(file.chunks[0].range_bits, 0);
+        assert_eq!(file.chunks[0].start_hex, "");
+        assert_eq!(file.chunks[0].chunk_index, 0);
+
+        // Chunk 1: current_hex preserved
+        assert_eq!(file.chunks[1].id, 2);
+        assert_eq!(file.chunks[1].current_hex, "8020000000000000000");
+
+        // end_hex = start + 2^range_bits
+        let base0 = parse_hex_key("8000000000000000000");
+        let expected_end0 = chunk_end(&base0, 65);
+        assert_eq!(
+            parse_hex_key(&file.chunks[0].end_hex),
+            expected_end0,
+            "chunk 0 end_hex mismatch"
+        );
+
+        // next_id follows the fresh counter
+        assert_eq!(file.next_id, 3);
+        assert_eq!(file.total_chunks, 2);
+
+        // File-level range: [2^75, 2^76)
+        assert_eq!(
+            file.start_hex,
+            "0000000000000000000000000000000000000000000008000000000000000000"
+        );
+        assert_eq!(
+            file.end_hex,
+            "0000000000000000000000000000000000000000000010000000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_migrate_self_heals_out_of_range_current_hex() {
+        // current_hex outside [base, end) → self-heal to base
+        let mut file = PuzzleFile {
+            puzzle_number: 76,
+            total_bits: 75,
+            chunk_bits_used: 65,
+            total_chunks: 1,
+            completed_chunks: 0,
+            target: "1DJh2eHFYQfACPmrvpyWc8MSTYKh7w9eRF".to_string(),
+            hash160: None,
+            chunks: vec![old_format_chunk(
+                0,
+                "8000000000000000000",
+                65,
+                Some("9999999999999999999"), // out of range
+            )],
+            start_hex: String::new(),
+            end_hex: String::new(),
+            next_id: 0,
+        };
+
+        migrate_puzzle_file(&mut file);
+        assert_eq!(file.chunks[0].current_hex, "8000000000000000000");
+    }
+
+    #[test]
+    fn test_migrate_idempotent_on_new_format() {
+        // A file already in new format should not be altered.
+        let mut file = PuzzleFile {
+            puzzle_number: 76,
+            total_bits: 75,
+            chunk_bits_used: 0,
+            total_chunks: 1,
+            completed_chunks: 0,
+            target: "1DJh2eHFYQfACPmrvpyWc8MSTYKh7w9eRF".to_string(),
+            hash160: None,
+            chunks: vec![Chunk {
+                id: 42,
+                current_hex: "8000000000000000000".to_string(),
+                end_hex: "8020000000000000000".to_string(),
+                status: "pending".to_string(),
+                chunk_index: 0,
+                start_hex: String::new(),
+                range_bits: 0,
+            }],
+            start_hex: "0000000000000000000000000000000000000000000008000000000000000000".to_string(),
+            end_hex: "0000000000000000000000000000000000000000000010000000000000000000".to_string(),
+            next_id: 43,
+        };
+
+        migrate_puzzle_file(&mut file);
+
+        assert_eq!(file.chunks[0].id, 42);
+        assert_eq!(file.chunks[0].current_hex, "8000000000000000000");
+        assert_eq!(file.chunks[0].end_hex, "8020000000000000000");
+        assert_eq!(file.next_id, 43); // unchanged
+    }
+
+    // ── random_below sanity ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_random_below_in_range() {
+        let limit = BigUint::from(100u32);
+        for _ in 0..1000 {
+            let v = random_below(&limit);
+            assert!(v < limit);
+        }
+    }
+
+    #[test]
+    fn test_random_below_large() {
+        let limit = BigUint::one() << 65; // matches initial chunk width
+        for _ in 0..100 {
+            let v = random_below(&limit);
+            assert!(v < limit);
+        }
     }
 }

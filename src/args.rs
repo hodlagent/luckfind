@@ -48,33 +48,39 @@ pub struct Cli {
     #[arg(long)]
     pub profile: bool,
 
-    /// Use random-subrange mode together with `--puzzle <file>`.
+    /// Use random-split mode together with `--puzzle <file>`.
     ///
-    /// Each worker still claims a random *pending* sub-range from the puzzle
-    /// worklist sequentially (key += 1), but parks it after `2^31` keys and
-    /// moves on to a fresh random one — instead of sweeping each chunk to
-    /// completion.  On parking, the current scanning position is written
-    /// back into the JSON (as in classic puzzle mode), so the sub-range is
-    /// reclaimed later and resumed with no double-scanning.  The claim order
-    /// is already random, so the net effect is a "jump around the worklist"
-    /// scan that keeps the same zero-dedup guarantee.  The target address is
-    /// read from the puzzle file; `--addrs` / `--source` are ignored.
+    /// Workers claim a random *pending* sub-range and scan it sequentially
+    /// (key += 1).  When the worklist is below the cap (1024 × 1024), claiming
+    /// a sub-range *splits* it in two at a random point: the worker scans the
+    /// upper half and parks the lower half as a fresh pending chunk with a new
+    /// id.  This produces a "jump around the key space" scan instead of a
+    /// low-to-high sweep, while keeping the same zero-dedup guarantee.
+    ///
+    /// Sub-ranges narrower than 2^31 keys are scanned to completion in one
+    /// claim; wider ones are parked after 2^31 keys and resumed later (the
+    /// classic rotation mechanism).  On parking or SIGINT (Ctrl+C) the current
+    /// scanning position is written back into the JSON so the sub-range is
+    /// reclaimed later and resumed with no double-scanning.  The target address
+    /// is read from the puzzle file; `--addrs` / `--source` are ignored.
     #[arg(long)]
     pub random_subrange: bool,
 
     /// Path to puzzle JSON worklist file (e.g. a btcpuzzle #76 range-split).
     ///
     /// In puzzle mode the binary:
-    ///   - reads the JSON (subdivided sub-ranges, each with `start_hex`,
-    ///     `range_bits`, `status`),
-    ///   - picks a random *pending* sub-range per worker,
-    ///   - scans its keys sequentially from `start` → `end` (key += 1),
+    ///   - reads the JSON (subdivided sub-ranges, each with `current_hex`,
+    ///     `end_hex`, `status`; the old `start_hex`/`range_bits` format is
+    ///     auto-migrated on load),
+    ///   - picks a random *pending* sub-range per worker (splitting it when
+    ///     under the cap, see `--random-subrange`),
+    ///   - scans its keys sequentially from `current_hex` → `end_hex` (key += 1),
     ///   - marks the sub-range `finished` once the whole range is done,
     ///   - on SIGINT (Ctrl+C) writes the current scanning position back into
     ///     the JSON so the next run resumes exactly from there.
     ///
     /// Hex values that are shorter than 64 chars are left-padded to a full
-    /// 32-byte key (high bytes zero-filled).
+   /// 32-byte key (high bytes zero-filled).
     #[arg(long)]
     pub puzzle: Option<String>,
 }
