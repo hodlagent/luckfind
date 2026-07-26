@@ -35,7 +35,7 @@ fn scan_one_step_finds_2g() -> bool {
     }
 
     let mut scanner = GpuScanner::new(ctx, &cand).expect("GpuScanner::new");
-    scanner.init_random(42).expect("init_random");
+    scanner.init_random(luckfind::puzzles::puzzle_set()).expect("init_random");
 
     // Overwrite thread 0 with G (Jacobian z=1, scalar 1) so step 0 checks G.
     let ge = g.serialize_uncompressed();

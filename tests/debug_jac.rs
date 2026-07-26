@@ -25,7 +25,7 @@ fn one_step_jacobian_is_2g() {
 
     let cand = vec![[0u32; 5]; 78];
     let mut scanner = GpuScanner::new(ctx, &cand).expect("new");
-    scanner.init_random(42).expect("init");
+    scanner.init_random(luckfind::puzzles::puzzle_set()).expect("init");
     let g = secp256k1::PublicKey::from_slice(&luckfind::btc::GENERATOR_COMPRESSED).unwrap();
     let ge = g.serialize_uncompressed();
     let mut gx = [0u8;32]; let mut gy = [0u8;32];
@@ -63,7 +63,7 @@ fn stage1_point_add_z() {
     };
     let cand = vec![[0u32; 5]; 78];
     let mut s = GpuScanner::new(ctx, &cand).expect("new");
-    s.init_random(42).expect("init");
+    s.init_random(luckfind::puzzles::puzzle_set()).expect("init");
     let g = secp256k1::PublicKey::from_slice(&luckfind::btc::GENERATOR_COMPRESSED).unwrap();
     let ge = g.serialize_uncompressed();
     let mut gx = [0u8;32]; let mut gy = [0u8;32];

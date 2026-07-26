@@ -4,10 +4,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::puzzles::{CandidateSet, PuzzleSet};
+use crate::puzzles::PuzzleSet;
 use crate::progress::Progress;
-
-use rand::TryRng;
 
 /// Runtime limits for the worker pool.
 pub struct RuntimeLimits {
@@ -17,10 +15,8 @@ pub struct RuntimeLimits {
 
 /// What the lottery workers scan against.
 pub enum ScanTarget {
-    /// Default: embedded 78 puzzles, range-constrained key generation.
+    /// Embedded 78 puzzles, range-constrained key generation in [2^70, 2^160).
     PuzzleSet(&'static PuzzleSet),
-    /// --addrs mode: arbitrary addresses, full 256-bit space, no ranges.
-    Full256(CandidateSet),
 }
 
 /// Match surfaced by the pool.
@@ -41,8 +37,12 @@ pub fn run(
     n_workers: usize,
     target: ScanTarget,
     limits: RuntimeLimits,
+    gpu: bool,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
-    let progress = Arc::new(Progress::new(n_workers as u64));
+    // GPU worker counts as an extra "worker" for the heartbeat's alive counter
+    // when enabled.
+    let n_total = n_workers + gpu as usize;
+    let progress = Arc::new(Progress::new(n_total as u64));
     let matches = Arc::new(std::sync::Mutex::new(Vec::<MatchEvent>::new()));
     let deadline = limits
         .duration_secs
@@ -55,16 +55,32 @@ pub fn run(
             let matches = matches.clone();
 
             // Clone the scan target for each worker.
-            let worker_target = match &target {
-                ScanTarget::PuzzleSet(ps) => WorkerMode::Puzzle(*ps),
-                ScanTarget::Full256(cand) => WorkerMode::Full(cand.clone()),
-            };
+            let ScanTarget::PuzzleSet(ps) = &target;
+            let worker_target = WorkerMode::Puzzle(*ps);
 
             thread::spawn(move || {
                 worker_loop(wid as u32, &worker_target, &progress, &matches, deadline, start);
             })
         })
         .collect();
+
+    // ── GPU lottery worker (optional) ────────────────────────────────────────
+    // One additional worker that scans with the GPU (100k independent random
+    // walkers, re-seeded every RESEED_INTERVAL_KEYS).  Shares the same progress
+    // and matches as the CPU workers.  Falls back to CPU-only if no GPU device.
+    let gpu_handle = if gpu {
+        let ScanTarget::PuzzleSet(ps) = &target;
+        let gpu_progress = progress.clone();
+        let gpu_matches = matches.clone();
+        let gpu_deadline = deadline;
+        let gpu_start = start;
+        let ps = *ps; // &'static — copy the reference into the closure.
+        Some(thread::spawn(move || {
+            crate::gpu::lottery::worker(ps, gpu_progress, gpu_matches, gpu_deadline, gpu_start);
+        }))
+    } else {
+        None
+    };
 
     // ── heartbeat ticker (just print line, no channel) ───────────────
     let hb_progress = progress.clone();
@@ -97,6 +113,12 @@ pub fn run(
     for h in handles {
         let _ = h.join();
     }
+    // Join the GPU worker (if spawned).  It observes the same deadline as the
+    // CPU workers, so it should already be finishing; this just ensures we
+    // wait for its final match flush before reporting.
+    if let Some(h) = gpu_handle {
+        let _ = h.join();
+    }
     // Signal the heartbeat ticker to stop and wait for it.  Without the join,
     // the ticker could print a stray heartbeat after workers have finished.
     drop(hb_handle);
@@ -111,7 +133,6 @@ pub fn run(
 /// Per-worker scan mode, resolved once before the thread spawns.
 enum WorkerMode {
     Puzzle(&'static PuzzleSet),
-    Full(CandidateSet),
 }
 
 fn worker_loop(
@@ -135,18 +156,9 @@ fn worker_loop(
     let point_g = crate::btc::generator_public_key();
 
     // Initialize based on mode.
-    let (mut sk, mut pk) = match mode {
-        WorkerMode::Full(_) => {
-            let sk = new_key();
-            let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
-            (sk, pk)
-        }
-        WorkerMode::Puzzle(ps) => {
-            let sk = new_key_puzzle(ps);
-            let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
-            (sk, pk)
-        }
-    };
+    let WorkerMode::Puzzle(ps) = mode;
+    let mut sk = new_key_puzzle(ps);
+    let mut pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
 
     let mut local_count = 0u64;
 
@@ -157,19 +169,17 @@ fn worker_loop(
                 break;
             }
 
-            // End-of-range check (puzzle mode only).
-            // If the key has left its current range (reached the end, walked into
-            // a gap, or exceeded 2^160), re-seed with a fresh puzzle + key.
-            if let WorkerMode::Puzzle(ps) = mode {
-                let sk_bytes = sk.secret_bytes();
-                let still_in_range = find_active_range(ps, &sk_bytes)
-                    .map(|active| crate::puzzles::be_lt(&sk_bytes, &active.end))
-                    .unwrap_or(false);
-                if !still_in_range {
-                    sk = new_key_puzzle(ps);
-                    pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
-                    local_count = 0;
-                }
+            // End-of-range check: if the key has left its current range (reached
+            // the end, walked into a gap, or exceeded 2^160), re-seed with a fresh
+            // puzzle + key.
+            let sk_bytes = sk.secret_bytes();
+            let still_in_range = find_active_range(ps, &sk_bytes)
+                .map(|active| crate::puzzles::be_lt(&sk_bytes, &active.end))
+                .unwrap_or(false);
+            if !still_in_range {
+                sk = new_key_puzzle(ps);
+                pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+                local_count = 0;
             }
         }
 
@@ -179,19 +189,11 @@ fn worker_loop(
         let h_c = crate::btc::hash160(&pk_c);
         let h_u = crate::btc::hash160(&pk_u);
 
-        let hit = match mode {
-            WorkerMode::Full(cand) => cand.contains(&h_c) || cand.contains(&h_u),
-            WorkerMode::Puzzle(ps) => ps.contains(&h_c) || ps.contains(&h_u),
-        };
+        let hit = ps.contains(&h_c) || ps.contains(&h_u);
 
         if hit {
-            let puzzle_number = match mode {
-                WorkerMode::Full(_) => None,
-                WorkerMode::Puzzle(ps) => {
-                    ps.puzzle_number_for_hash160(&h_c)
-                        .or_else(|| ps.puzzle_number_for_hash160(&h_u))
-                }
-            };
+            let puzzle_number = ps.puzzle_number_for_hash160(&h_c)
+                .or_else(|| ps.puzzle_number_for_hash160(&h_u));
             let ev = MatchEvent {
                 private_key: sk.secret_bytes(),
                 compressed: pk_c.to_vec(),
@@ -248,21 +250,6 @@ fn new_key_puzzle(ps: &PuzzleSet) -> secp256k1::SecretKey {
     ps.generate_key_in_range(range, &mut buf);
     secp256k1::SecretKey::from_byte_array(buf)
         .expect("key_in_range always produces a valid key in [2^70, 2^160)")
-}
-
-/// Generate a random 32-byte key in [1, n-1] for full-space scanning.
-fn new_key() -> secp256k1::SecretKey {
-    let mut buf = [0u8; 32];
-    loop {
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut buf)
-            .expect("OS entropy source always available");
-        if buf.iter().any(|b| *b != 0) && buf.iter().any(|b| *b != 0xff) {
-            if let Ok(sk) = secp256k1::SecretKey::from_byte_array(buf) {
-                return sk;
-            }
-        }
-    }
 }
 
 /// Format an integer with comma separators.

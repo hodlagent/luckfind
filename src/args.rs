@@ -21,15 +21,6 @@ pub struct Cli {
     #[arg(short = 'l', long, default_value = "1.0")]
     pub load: f64,
 
-    /// Path to candidate JSON file (default: built-in 78-address list).
-    #[arg(short = 'a', long)]
-    pub addrs: Option<String>,
-
-    /// `builtin` (78 built-in addresses) or `file` (`--addrs`).
-    /// Defaults to `file` when `--addrs` is given, else `builtin`.
-    #[arg(short = 's', long, value_enum)]
-    pub source: Option<Source>,
-
     /// Directory for match output files.
     #[arg(short = 'o', long, default_value = ".")]
     pub output_dir: String,
@@ -66,12 +57,6 @@ pub struct Cli {
     /// 32-byte key (high bytes zero-filled).
     #[arg(long)]
     pub puzzle: Option<String>,
-}
-
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum Source {
-    Builtin,
-    File,
 }
 
 impl Cli {

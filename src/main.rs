@@ -45,9 +45,6 @@ fn main() {
         //   - 子区间数 ≥ 1024×1024：从 pending 中随机选择一个直接计算。
         // 子区间宽度 ≤ 2^31 时一次完成（scan_budget 精确终止），不触发旋转。
         // 2^31 keys per claim ≈ 2.15×10^9。
-        if cli.addrs.is_some() {
-            eprintln!("[puzzle] --addrs / --source are ignored in puzzle mode — target comes from the puzzle file.");
-        }
         let rotate_keys = Some(1u64 << 31);
         let (stats, matches) = puzzle::run(
             Path::new(puzzle_path),
@@ -60,27 +57,27 @@ fn main() {
         return;
     }
 
-    // Choose scan target: --addrs uses custom address list (full 256-bit space),
-    // otherwise use the embedded 78-puzzle set (range-constrained generation).
-    let target = if let Some(path) = cli.addrs.as_deref() {
-        let candidates = puzzles::load_candidates(Some(path));
-        if candidates.is_empty() {
-            eprintln!("  ⚠️  NO CANDIDATES LOADED — check external JSON file is valid P2PK addresses.");
-            return;
-        }
-        workers::ScanTarget::Full256(candidates)
-    } else {
-        let ps = puzzles::puzzle_set();
-        eprintln!("  🧩 Loaded {} puzzles, key space [2^70, 2^160)", ps.len());
-        workers::ScanTarget::PuzzleSet(ps)
-    };
+    // Default mode: lottery against the embedded 78-puzzle set
+    // (range-constrained key generation in [2^70, 2^160)).
+    let ps = puzzles::puzzle_set();
+    eprintln!("  🧩 Loaded {} puzzles, key space [2^70, 2^160)", ps.len());
+    let target = workers::ScanTarget::PuzzleSet(ps);
 
     let start = Instant::now();
     let limits = workers::RuntimeLimits {
         duration_secs: cli.duration.map(|m| m * 60.0),
         heartbeat_secs: cli.heartbeat,
     };
-    let (stats, matches) = workers::run(cli.workers(), target, limits);
+
+    // Enable the GPU lottery worker when a GPU device is available.  The worker
+    // falls back to CPU-only internally if device initialization fails, so this
+    // is a best-effort gate — cheap to try, harmless if it fails.
+    let gpu = crate::gpu::GpuContext::new_blocking(0).is_ok();
+    if gpu {
+        eprintln!("  [GPU] device detected — enabling GPU lottery worker.");
+    }
+
+    let (stats, matches) = workers::run(cli.workers(), target, limits, gpu);
 
     println!();
     report::final_report(&stats, &matches, &start);

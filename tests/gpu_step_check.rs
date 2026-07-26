@@ -42,9 +42,9 @@ fn new_scanner(stride: u32) -> Option<GpuScanner> {
     scanner.stride = stride;
     scanner.num_candidates = 1;
     // init_random populates initial_scalars so set_initial_state / seed_range's
-    // internal readback has a buffer to patch.  Seed is arbitrary (states are
-    // overwritten by the per-test seeding anyway).
-    scanner.init_random(42).expect("init_random");
+    // internal readback has a buffer to patch.  Pass the puzzle set (states are
+    // overwritten by the per-test seeding anyway, so the seed content is irrelevant).
+    scanner.init_random(luckfind::puzzles::puzzle_set()).expect("init_random");
     Some(scanner)
 }
 
@@ -198,7 +198,7 @@ fn channel_a_match_output_matches_cpu() {
             sc.stride = 1;
             sc.num_candidates = 1;
             sc.steps_per_call = steps;
-            sc.init_random(42).expect("init_random");
+            sc.init_random(luckfind::puzzles::puzzle_set()).expect("init_random");
             seed_at(&mut sc, *sk_be);
             let matches = sc.step().expect("step");
             assert!(

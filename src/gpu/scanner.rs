@@ -56,13 +56,17 @@ impl GpuScanner {
         })
     }
 
-    /// Initialize states with random starting points.
+    /// Initialize states with random starting points inside the puzzle key space.
     ///
-    /// For each of NUM_GPU_THREADS threads: generate random sk, compute pk = sk×G
-    /// (one scalar mult per thread, parallelized with rayon), convert to Jacobian (z=1).
-    #[allow(dead_code)]
-    pub fn init_random(&mut self, _seed: u64) -> Result<()> {
-        use rand::TryRng;
+    /// For each of NUM_GPU_THREADS threads: generate a range-constrained sk (uniform
+    /// within a randomly-chosen puzzle range, weighted by range size — mirrors the
+    /// CPU `new_key_puzzle` path), compute pk = sk×G (one scalar mult per thread,
+    /// parallelized with rayon), convert to Jacobian (z=1).
+    ///
+    /// Range-constrained generation is critical: the puzzle key space [2^70, 2^160)
+    /// is ~2^-96 of the full curve order. Uniform random starts would almost never
+    /// land in a productive region, wasting nearly all GPU work.
+    pub fn init_random(&mut self, puzzle_set: &crate::puzzles::PuzzleSet) -> Result<()> {
         use rayon::prelude::*;
 
         let n = NUM_GPU_THREADS as usize;
@@ -72,34 +76,33 @@ impl GpuScanner {
         let results: Vec<([u32; 8], GpuState)> = (0..n)
             .into_par_iter()
             .map(|_| {
+                // Range-constrained key generation — same policy as CPU new_key_puzzle.
                 let mut buf = [0u8; 32];
-                loop {
-                    rand::rngs::SysRng
-                        .try_fill_bytes(&mut buf)
-                        .expect("OS entropy");
-                    if let Ok(sk) = secp256k1::SecretKey::from_byte_array(buf) {
-                        let pk =
-                            secp256k1::PublicKey::from_secret_key(&secp, &sk);
-                        let encoded = pk.serialize_uncompressed();
-                        let mut x = [0u8; 32];
-                        let mut y = [0u8; 32];
-                        x.copy_from_slice(&encoded[1..33]);
-                        y.copy_from_slice(&encoded[33..65]);
-                        let (step_px, step_py) =
-                            crate::gpu::convert::stride_step_point(self.stride);
-                        return (
-                            crate::gpu::convert::scalar_be_to_limbs(&buf),
-                            GpuState {
-                                x: crate::gpu::convert::be_bytes_to_limbs(&x),
-                                y: crate::gpu::convert::be_bytes_to_limbs(&y),
-                                z: [1, 0, 0, 0, 0, 0, 0, 0],
-                                scalar: crate::gpu::convert::scalar_be_to_limbs(&buf),
-                                step_px,
-                                step_py,
-                            },
-                        );
-                    }
-                }
+                let idx = puzzle_set.pick_random_puzzle();
+                let range = &puzzle_set.ranges()[idx];
+                puzzle_set.generate_key_in_range(range, &mut buf);
+                let sk = secp256k1::SecretKey::from_byte_array(buf)
+                    .expect("generate_key_in_range always produces a valid key in [2^70, 2^160)");
+                let pk =
+                    secp256k1::PublicKey::from_secret_key(&secp, &sk);
+                let encoded = pk.serialize_uncompressed();
+                let mut x = [0u8; 32];
+                let mut y = [0u8; 32];
+                x.copy_from_slice(&encoded[1..33]);
+                y.copy_from_slice(&encoded[33..65]);
+                let (step_px, step_py) =
+                    crate::gpu::convert::stride_step_point(self.stride);
+                (
+                    crate::gpu::convert::scalar_be_to_limbs(&buf),
+                    GpuState {
+                        x: crate::gpu::convert::be_bytes_to_limbs(&x),
+                        y: crate::gpu::convert::be_bytes_to_limbs(&y),
+                        z: [1, 0, 0, 0, 0, 0, 0, 0],
+                        scalar: crate::gpu::convert::scalar_be_to_limbs(&buf),
+                        step_px,
+                        step_py,
+                    },
+                )
             })
             .collect();
 

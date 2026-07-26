@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     let mut cand = vec![[0u32; 5]; 78];
     for i in 0..5 { cand[0][i] = u32::from_le_bytes(expected[4 * i..4 * i + 4].try_into().unwrap()); }
     let mut scanner = GpuScanner::new(ctx, &cand)?;
-    scanner.init_random(42)?;
+    scanner.init_random(luckfind::puzzles::puzzle_set())?;
     let g = secp256k1::PublicKey::from_slice(&luckfind::btc::GENERATOR_COMPRESSED).unwrap();
     let ge = g.serialize_uncompressed();
     let mut gx = [0u8; 32]; let mut gy = [0u8; 32];

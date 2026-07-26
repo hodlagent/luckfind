@@ -5,11 +5,10 @@
 //! generate keys *only* inside the covered key space — a ~2^96× improvement over
 //! scanning the full 256-bit space.
 
-use std::path::Path;
 use std::sync::OnceLock;
 
 use rand::TryRng;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 // ── Embedded puzzle data ─────────────────────────────────────────────────────
 //
@@ -325,67 +324,6 @@ fn is_power_of_two_32(key: &[u8; 32]) -> bool {
     seen_bit // must have seen exactly one bit
 }
 
-// ── Legacy address-list API (for --addrs mode) ───────────────────────────────
-
-/// 20-byte hash160 set — used by `--addrs` custom-file mode and tests.
-pub type CandidateSet = FxHashSet<[u8; 20]>;
-
-use std::io::BufReader;
-use std::fs::File;
-
-/// Parse "1…" Base58 address into 20-byte hash160.
-pub(crate) fn p2pkh_addr_to_hash160(addr: &str) -> Option<[u8; 20]> {
-    use sha2::Digest;
-    let raw = base58::FromBase58::from_base58(addr).ok()?;
-    if raw.len() < 5 {
-        return None;
-    }
-    let (payload, checksum) = raw.split_at(raw.len() - 4);
-    if payload[0] != 0x00 {
-        return None;
-    } // P2PKH version byte
-    let hash = sha2::Sha256::digest(sha2::Sha256::digest(payload));
-    let expect = &hash[..4];
-    if expect != checksum {
-        return None;
-    }
-    if payload.len() != 21 {
-        return None;
-    } // 1 + 20 (compressed P2PKH)
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&payload[1..21]);
-    Some(out)
-}
-
-/// Load candidates from file or return empty set on error.
-pub fn load_candidates(path: Option<&str>) -> CandidateSet {
-    let raw: Vec<String> = match path {
-        Some(p) => read_addrs_file(p),
-        None => return CandidateSet::default(),
-    };
-    raw.iter()
-        .filter_map(|a| p2pkh_addr_to_hash160(a))
-        .collect()
-}
-
-/// Read a JSON address list (a JSON array of Base58 address strings).
-fn read_addrs_file<P: AsRef<Path>>(p: P) -> Vec<String> {
-    let f = match File::open(p) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[luckfind] warning: address list not readable: {}", e);
-            return vec![];
-        }
-    };
-    let r = BufReader::new(f);
-
-    if let Ok(v) = serde_json::from_reader::<_, Vec<String>>(r) {
-        return v;
-    }
-    eprintln!("[luckfind] warning: unrecognised JSON shape in address file");
-    vec![]
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -400,7 +338,7 @@ mod tests {
     #[test]
     fn all_hash160_unique() {
         let ps = puzzle_set();
-        let mut seen = FxHashSet::default();
+        let mut seen = rustc_hash::FxHashSet::default();
         for r in ps.ranges() {
             assert!(seen.insert(r.hash160), "duplicate hash160 for puzzle {}", r.puzzle_number);
         }

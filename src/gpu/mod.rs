@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod buffers;
 pub mod scanner;
 pub mod convert;
+pub mod lottery;
 
 pub use context::GpuContext;
 pub use scanner::{GpuScanner, GpuMatchOutput};

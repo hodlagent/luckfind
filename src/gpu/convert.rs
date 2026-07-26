@@ -91,6 +91,23 @@ pub fn hash160_to_candidates(h160: &[u8; 20]) -> Vec<[u32; 5]> {
     cand
 }
 
+/// Build a full 78-slot candidate buffer from a `PuzzleSet` — every puzzle's
+/// hash160 fills its slot (in range order).  The shader's candidate array is
+/// fixed at 78 slots; `num_candidates = 78` checks them all.  Used by the GPU
+/// lottery worker, which scans against the full embedded puzzle set.
+pub fn puzzle_set_to_candidates(ps: &crate::puzzles::PuzzleSet) -> Vec<[u32; 5]> {
+    let nranges = ps.ranges().len();
+    assert!(nranges <= 78, "more than 78 puzzle ranges cannot fit the GPU candidate buffer");
+    let mut cand = vec![[0u32; 5]; 78];
+    for (i, range) in ps.ranges().iter().enumerate() {
+        for j in 0..5 {
+            cand[i][j] =
+                u32::from_le_bytes(range.hash160[4 * j..4 * j + 4].try_into().unwrap());
+        }
+    }
+    cand
+}
+
 /// Big-endian comparison of two 32-byte keys.  `a < b` lexicographically as
 /// unsigned integers.
 pub fn be_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
