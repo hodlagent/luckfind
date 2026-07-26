@@ -74,11 +74,6 @@ pub enum Source {
     File,
 }
 
-pub struct RuntimeLimits {
-    pub duration_secs:  Option<f64>,
-    pub heartbeat_secs: f64,
-}
-
 impl Cli {
     pub fn parse() -> Self {
         <Self as clap::Parser>::parse()

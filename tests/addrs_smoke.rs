@@ -71,22 +71,15 @@ fn known_vector_bip_p2pkh_priv1() {
 
 #[test]
 fn all_78_builtins_unique_and_valid() {
-    let txt = include_str!("../src/addrs.rs");
-    let mut addrs = vec![];
-    for line in txt.lines() {
-        let t = line.trim();
-        if let Some(i) = t.strip_prefix('"').and_then(|s| s.strip_suffix("\",")) {
-            if i.starts_with('1') && (25..=36).contains(&i.len()) {
-                addrs.push(i);
-            }
-        }
-    }
-    assert_eq!(addrs.len(), 78, "builtin list length = {}", addrs.len());
+    let ps = luckfind::addrs::puzzle_set();
+    assert_eq!(ps.len(), 78, "embedded puzzle count = {}", ps.len());
 
-    let v: Vec<[u8; 20]> = addrs.iter().filter_map(|a| my_p2pkh_parse(a)).collect();
-    assert_eq!(v.len(), 78, "expected 78 good parses, got {}", v.len());
-    let unique: std::collections::HashSet<[u8; 20]> = v.iter().copied().collect();
-    assert_eq!(unique.len(), 78, "expected 78 unique, got {}", unique.len());
+    // All hash160 values must be unique.
+    let mut seen = std::collections::HashSet::<[u8; 20]>::new();
+    for r in ps.ranges() {
+        assert!(seen.insert(r.hash160), "duplicate hash160 for puzzle {}", r.puzzle_number);
+    }
+    assert_eq!(seen.len(), 78, "expected 78 unique hash160s");
 }
 
 #[test]

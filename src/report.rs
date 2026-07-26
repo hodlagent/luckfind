@@ -21,11 +21,16 @@ pub fn final_report(progress: &Progress, matches: &[MatchEvent], start: &Instant
     } else {
         println!("  ✅ {} match(es) total:", matches.len());
         for (i, m) in matches.iter().enumerate() {
+            let puzzle_label = match m.puzzle_number {
+                Some(n) => format!(" puzzle={n}"),
+                None    => String::new(),
+            };
             println!(
-                "     #{}  worker #{}  idx={}  pk_hex={}",
+                "     #{}  worker #{}  idx={}{}  pk_hex={}",
                 i + 1,
                 m.worker_id,
                 crate::workers::fmt_comma(m.key_index),
+                puzzle_label,
                 hex::encode(m.private_key),
             );
         }
@@ -54,12 +59,17 @@ pub fn flush_got(matches: &[MatchEvent], output_dir: Option<&Path>) {
             Some(id) => format!(" chunk={id}"),
             None      => String::new(),
         };
+        let puzzle_label = match m.puzzle_number {
+            Some(n) => format!(" puzzle={n}"),
+            None    => String::new(),
+        };
         let _ = writeln!(
             f,
-            "ts={} worker={}{} idx={} sk_hex={} pk_c={} pk_u={} elapsed={:.2}s",
+            "ts={} worker={}{}{} idx={} sk_hex={} pk_c={} pk_u={} elapsed={:.2}s",
             chrono::Utc::now().to_rfc3339(),
             m.worker_id,
             chunk_label,
+            puzzle_label,
             m.key_index,
             hex::encode(m.private_key),
             hex::encode(&m.compressed),

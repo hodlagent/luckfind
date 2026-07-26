@@ -60,19 +60,27 @@ fn main() {
         return;
     }
 
-    let addrs = addrs::load_candidates(cli.addrs.as_deref());
-    if addrs.is_empty() {
-        eprintln!("  ⚠️  NO CANDIDATES LOADED — check external JSON file is valid P2PK addresses.");
-        eprintln!("     Built-in set available via `--source builtin` or omit `--addrs`.");
-        return;
-    }
+    // Choose scan target: --addrs uses custom address list (full 256-bit space),
+    // otherwise use the embedded 78-puzzle set (range-constrained generation).
+    let target = if let Some(path) = cli.addrs.as_deref() {
+        let addrs = addrs::load_candidates(Some(path));
+        if addrs.is_empty() {
+            eprintln!("  ⚠️  NO CANDIDATES LOADED — check external JSON file is valid P2PK addresses.");
+            return;
+        }
+        workers::ScanTarget::Full256(addrs)
+    } else {
+        let ps = addrs::puzzle_set();
+        eprintln!("  🧩 Loaded {} puzzles, key space [2^70, 2^160)", ps.len());
+        workers::ScanTarget::PuzzleSet(ps)
+    };
 
     let start = Instant::now();
-    let limits = args::RuntimeLimits {
+    let limits = workers::RuntimeLimits {
         duration_secs: cli.duration.map(|m| m * 60.0),
         heartbeat_secs: cli.heartbeat,
     };
-    let (stats, matches) = workers::run(cli.workers(), addrs, limits);
+    let (stats, matches) = workers::run(cli.workers(), target, limits);
 
     println!();
     report::final_report(&stats, &matches, &start);

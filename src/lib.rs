@@ -7,5 +7,10 @@ pub mod addrs;
 pub mod btc;
 pub mod progress;
 pub mod gpu;
+pub mod workers;
+
+// Re-export key types for integration tests and external consumers.
+pub use addrs::{PuzzleRange, PuzzleSet};
+pub use workers::ScanTarget;
 
 // workers / report / puzzle intentionally private — only the binary uses them.

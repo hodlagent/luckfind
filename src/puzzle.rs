@@ -510,6 +510,9 @@ fn puzzle_worker(
     start: Instant,
     rotate_keys: Option<u64>,
 ) {
+    // Puzzle number is constant for this worker's lifetime — capture once.
+    let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
+
     let secp = secp256k1::Secp256k1::new();
     // Scalar(1) so `sk += 1` per iteration.  Also kept to preserve the SK ↔ PK
     // pairing: sk.add_tweak advances the private key, pk.combine(&G) advances
@@ -583,6 +586,7 @@ fn puzzle_worker(
                     chunk_id: Some(chunk_id),
                     key_index: local_count,
                     elapsed: start.elapsed().as_secs_f64(),
+                    puzzle_number,
                 };
                 if let Ok(mut g) = matches.lock() {
                     g.push(ev);
@@ -766,6 +770,7 @@ fn gpu_match_to_event(
         chunk_id: Some(chunk.chunk_id),
         key_index,
         elapsed: 0.0, // filled in by the caller after CPU verification
+        puzzle_number: None,
     }
 }
 
