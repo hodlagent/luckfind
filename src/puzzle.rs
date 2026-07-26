@@ -53,7 +53,7 @@ use num_traits::One;
 use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
-use crate::addrs;
+use crate::puzzles;
 use crate::btc;
 use crate::progress::Progress;
 use crate::workers::{fmt_comma, MatchEvent};
@@ -244,7 +244,7 @@ pub fn run(
     // Convert the target BTC address to its 20-byte hash160 for fast compare.
     // This decode happens once at startup; both CPU workers and the GPU worker
     // reuse the resulting 20-byte value — no Base58 work on the hot path.
-    let target_h160 = addrs::p2pkh_addr_to_hash160(&file.target).unwrap_or_else(|| {
+    let target_h160 = puzzles::p2pkh_addr_to_hash160(&file.target).unwrap_or_else(|| {
         eprintln!("[puzzle] target {} is not a valid P2PKH address", file.target);
         std::process::exit(2);
     });

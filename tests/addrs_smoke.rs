@@ -71,7 +71,7 @@ fn known_vector_bip_p2pkh_priv1() {
 
 #[test]
 fn all_78_builtins_unique_and_valid() {
-    let ps = luckfind::addrs::puzzle_set();
+    let ps = luckfind::puzzles::puzzle_set();
     assert_eq!(ps.len(), 78, "embedded puzzle count = {}", ps.len());
 
     // All hash160 values must be unique.

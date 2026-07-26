@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::addrs::{CandidateSet, PuzzleSet};
+use crate::puzzles::{CandidateSet, PuzzleSet};
 use crate::progress::Progress;
 
 use rand::TryRng;
@@ -163,7 +163,7 @@ fn worker_loop(
             if let WorkerMode::Puzzle(ps) = mode {
                 let sk_bytes = sk.secret_bytes();
                 let still_in_range = find_active_range(ps, &sk_bytes)
-                    .map(|active| crate::addrs::be_lt(&sk_bytes, &active.end))
+                    .map(|active| crate::puzzles::be_lt(&sk_bytes, &active.end))
                     .unwrap_or(false);
                 if !still_in_range {
                     sk = new_key_puzzle(ps);
@@ -225,7 +225,7 @@ fn worker_loop(
 
 /// Find which puzzle range (if any) a key belongs to by checking the highest set bit.
 /// Returns the PuzzleRange if found.
-fn find_active_range<'a>(ps: &'a PuzzleSet, key: &[u8; 32]) -> Option<&'a crate::addrs::PuzzleRange> {
+fn find_active_range<'a>(ps: &'a PuzzleSet, key: &[u8; 32]) -> Option<&'a crate::puzzles::PuzzleRange> {
     // Find highest set bit in the 32-byte key.
     let mut bit_pos = None;
     for (i, &b) in key.iter().enumerate() {

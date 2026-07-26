@@ -5,7 +5,7 @@
 //! pipeline wall-clock), NOT the hash160 (~25ns/key).  A GPU port must
 //! accelerate the EC op to move the needle; GPU hashing alone would not.
 
-mod addrs;
+mod puzzles;
 mod args;
 mod btc;
 mod progress;
@@ -63,14 +63,14 @@ fn main() {
     // Choose scan target: --addrs uses custom address list (full 256-bit space),
     // otherwise use the embedded 78-puzzle set (range-constrained generation).
     let target = if let Some(path) = cli.addrs.as_deref() {
-        let addrs = addrs::load_candidates(Some(path));
-        if addrs.is_empty() {
+        let candidates = puzzles::load_candidates(Some(path));
+        if candidates.is_empty() {
             eprintln!("  ⚠️  NO CANDIDATES LOADED — check external JSON file is valid P2PK addresses.");
             return;
         }
-        workers::ScanTarget::Full256(addrs)
+        workers::ScanTarget::Full256(candidates)
     } else {
-        let ps = addrs::puzzle_set();
+        let ps = puzzles::puzzle_set();
         eprintln!("  🧩 Loaded {} puzzles, key space [2^70, 2^160)", ps.len());
         workers::ScanTarget::PuzzleSet(ps)
     };
