@@ -8,12 +8,6 @@ description = "Bitcoin dormant address lottery — fast secp256k1 key collision 
 # secp256k1 scalar mult + pubkey derivation (C libsecp256k1 backend)
 secp256k1 = { version = "0.31.1", features = ["hashes", "std"] }
 
-# hashing
-# `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this
-# activates the ARMv8-Crypto SHA256/SHA256H2 instructions, giving ~3-5× SHA256
-# throughput over the pure-Rust fallback. RIPEMD160 stays in Rust (no asm backend).
-sha2  = { version = "0.10", features = ["asm"] }
-ripemd = "0.1"
 
 # GPU (Metal via wgpu + naga WGSL→MSL translation)
 wgpu    = "28"
@@ -62,6 +56,25 @@ num-integer = "0.1"
 
 # SIGINT handler for puzzle-mode checkpoint save
 ctrlc = "3.4"
+
+
+# hashing
+# `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this
+# activates the ARMv8-Crypto SHA256/SHA256H2 instructions, giving ~3-5× SHA256
+# throughput over the pure-Rust fallback. RIPEMD160 stays in Rust (no asm backend).
+ripemd = "0.1"
+
+# 针对 macOS 开启 asm 特性
+[target.'cfg(target_os = "macos")'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
+# 针对 Windows 关闭 asm 特性（改用纯 Rust 实现）
+[target.'cfg(target_os = "windows")'.dependencies]
+sha2 = { version = "0.10" }
+
+# 针对 Linux 开启 asm 特性
+[target.'cfg(target_os = "linux")'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 sha2 = "0.10"
