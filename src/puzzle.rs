@@ -68,14 +68,6 @@ const MAX_CHUNKS: usize = 1024 * 1024;
 /// resumed later (the existing "rotation" mechanism).
 const ROTATION_BUDGET: u64 = 1u64 << 31;
 
-/// Wall-clock interval (seconds) between worklist auto-saves on the ticker.
-/// The ticker holds the PuzzleCtx lock briefly, serialising disk writes
-/// away from the worker hot path.  Workers update in-memory `current_hex`
-/// every 2048 iterations (see the scan loop); the ticker persists whatever
-/// it sees every SAVE_INTERVAL_SECS.  10 minutes is cheap and bounds the
-/// worst-case resume loss to ~5 ms of scanning (2048 keys at 500 kkeys/s).
-const SAVE_INTERVAL_SECS: u64 = 600;
-
 // ── worklist JSON shape ──────────────────────────────────────────────────────
 
 /// On-disk puzzle worklist.  The overall puzzle range is `[start_hex, end_hex)`;
@@ -770,14 +762,13 @@ pub fn run(
         )
     });
 
-    // ── 4. heartbeat ticker: periodic save + status line ─────────────────────
+    // ── 4. heartbeat ticker: status line only (no periodic DB save) ──────────
     let hb_ctx = ctx.clone();
     let hb_stop = stop_flag.clone();
     let hb_progress = progress.clone();
     let hb_handle = std::thread::spawn(move || {
         let mut prev_total = 0u64;
         let mut prev_time = Instant::now();
-        let mut last_save = Instant::now();
         loop {
             std::thread::sleep(Duration::from_secs_f64(heartbeat_secs));
             if hb_stop.load(Ordering::Relaxed) {
@@ -837,14 +828,6 @@ pub fn run(
                 )
             };
             eprintln!("  {s}");
-
-            // Throttled disk save on the heartbeat cadence.
-            if now.duration_since(last_save) >= Duration::from_secs(SAVE_INTERVAL_SECS) {
-                let mut ctx = hb_ctx.lock().unwrap_or_else(|e| e.into_inner());
-                if ctx.save().is_ok() {
-                    last_save = now;
-                }
-            }
         }
     });
 
@@ -1033,8 +1016,8 @@ fn puzzle_worker(
             // Every 2048 iterations we do three cheap things:
             //   1. SIGINT flag — break out if the user pressed Ctrl+C.
             //   2. End-of-range — break out if we've scanned the whole chunk.
-            //   3. Refresh in-memory current_hex — this is the snapshot the
-            //      ticker persists to disk every SAVE_INTERVAL_SECS.
+            //   3. Refresh in-memory current_hex — the resume position, flushed
+            //      to the DB at rotation/finalize (claim end).
             // The release backend compiles the `is_multiple_of` modulo to a
             // single `test` instruction; the predictor lock-stamps the
             // not-taken path so the hot loop stays tight.
@@ -1065,22 +1048,20 @@ fn puzzle_worker(
                     }
                 }
 
-                // Refresh in-memory resume position (ticker persists it).
+                // Refresh in-memory resume position (persisted at finalize).
                 let cur = sk.secret_bytes();
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[idx].current_hex = hex_encode_key(&cur);
-                // Mark dirty so the ticker's next save_dirty flushes this
-                // chunk's latest position.  Without this, the in-memory
-                // progress made between ticker ticks would never reach the DB.
+                // Mark dirty so the chunk's position is flushed whenever a save
+                // happens (rotation/finalize, claim, or the final save).
                 ctx.mark_dirty(chunk_id);
-                // Disk persist happens on the ticker every SAVE_INTERVAL_SECS;
-                // here we only refresh the in-memory snapshot.
             }
         };
 
         // ── finalize the chunk ──────────────────────────────────────────────
         // On disk right away — the chunk's new status + current_hex must be
-        // visible to a future run, not just to the next ticker auto-save.
+        // visible to a future run; this is the sole DB write for the claim
+        // (rotation/finalize/empty-chunk paths all sync-flush here).
         {
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
             let chunk = &mut ctx.file.chunks[idx];
@@ -1329,7 +1310,7 @@ fn gpu_puzzle_worker(
             current = crate::gpu::convert::scalar_add_be(&current, batch);
             scanned_keys += batch;
 
-            // Refresh the in-memory resume position (disk flush is on the ticker).
+            // Refresh the in-memory resume position (persisted at finalize).
             {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[chunk.idx].current_hex = hex_encode_key(&current);
