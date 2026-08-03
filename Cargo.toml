@@ -57,6 +57,9 @@ num-integer = "0.1"
 # SIGINT handler for puzzle-mode checkpoint save
 ctrlc = "3.4"
 
+# SQLite for puzzle worklist persistence (.db format)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 
 # hashing
 # `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this

@@ -1,7 +1,7 @@
 //! Puzzle-mode scanner.
 //!
-//! Reads a worklist JSON file that subdivides a puzzle key-range into
-//! sub-range `chunks`.  Each chunk defines:
+//! Reads a worklist file (JSON or SQLite `.db`) that subdivides a puzzle
+//! key-range into sub-range `chunks`.  Each chunk defines:
 //!
 //! - `id`:           stable identifier (monotonic; new ids are assigned as
 //!                    chunks are split).
@@ -43,6 +43,7 @@
 //! }
 //! ```
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -140,10 +141,41 @@ fn u32_is_zero(v: &u32) -> bool {
 // ── runtime state ────────────────────────────────────────────────────────────
 
 /// Shared state across workers: the parsed worklist and the path to persist to.
+/// All runtime saves go to `db_path` (SQLite); the JSON worklist (if any) is
+/// only a one-time import and never written again.
+///
+/// `dirty` tracks chunk IDs whose in-memory state has changed since the last
+/// save and need to be flushed to the DB.  This lets us UPDATE/INSERT only the
+/// handful of chunks that actually changed (on claim, split, park, finalize)
+/// instead of rewriting the entire 1M-row table on every save.
 #[derive(Debug)]
 struct PuzzleCtx {
     file: PuzzleFile,
-    path: PathBuf,
+    db_path: PathBuf,
+    dirty: HashSet<u32>,
+}
+
+impl PuzzleCtx {
+    fn new(file: PuzzleFile, db_path: PathBuf) -> Self {
+        Self {
+            file,
+            db_path,
+            dirty: HashSet::new(),
+        }
+    }
+
+    /// Mark a chunk dirty so the next `save_dirty` flushes it to the DB.
+    fn mark_dirty(&mut self, id: u32) {
+        self.dirty.insert(id);
+    }
+
+    /// Mark every chunk dirty.  Used after migration when loading from DB: the
+    /// upgraded in-memory state must be rewritten to the DB on the first save.
+    fn mark_all_dirty(&mut self) {
+        for c in &self.file.chunks {
+            self.dirty.insert(c.id);
+        }
+    }
 }
 
 // ── migration: old worklist format → new random-split format ─────────────────
@@ -153,7 +185,10 @@ struct PuzzleCtx {
 /// a chunk is "old format" iff `range_bits != 0` (old chunks always carry
 /// `range_bits: 65`; new chunks default to 0) or `end_hex` is empty.  Idempotent:
 /// new-format chunks are left untouched.
-fn migrate_puzzle_file(file: &mut PuzzleFile) {
+///
+/// Returns `true` if any chunk was migrated (so the caller can mark all chunks
+/// dirty and persist the upgraded state on the next save).
+fn migrate_puzzle_file(file: &mut PuzzleFile) -> bool {
     // Assign ids from a fresh monotonic counter seeded above every existing
     // id.  Using a counter (rather than chunk_index) means a re-run after a
     // killed partial-migration can never collide with an id already written:
@@ -166,11 +201,13 @@ fn migrate_puzzle_file(file: &mut PuzzleFile) {
         .max()
         .unwrap_or(0)
         .saturating_add(1);
+    let mut changed = false;
     for c in &mut file.chunks {
         let legacy = c.range_bits != 0 || c.end_hex.is_empty();
         if !legacy {
             continue;
         }
+        changed = true;
 
         let base = parse_hex_key(&c.start_hex);
         let end = chunk_end(&base, c.range_bits);
@@ -210,6 +247,305 @@ fn migrate_puzzle_file(file: &mut PuzzleFile) {
         file.start_hex = hex_encode_key(&biguint_to_32be(&start));
         file.end_hex = hex_encode_key(&biguint_to_32be(&end));
     }
+
+    changed
+}
+
+// ── SQLite persistence (.db format) ──────────────────────────────────────────
+
+/// Status codes stored in the SQLite `chunks.status` column.  Shared convention
+/// with the Python `scripts/split.py` writer.
+const STATUS_PENDING: i64 = 0;
+const STATUS_RUNNING: i64 = 1;
+const STATUS_FINISHED: i64 = 2;
+
+fn status_str_to_int(s: &str) -> i64 {
+    match s {
+        "pending" => STATUS_PENDING,
+        "running" => STATUS_RUNNING,
+        "finished" => STATUS_FINISHED,
+        _ => STATUS_PENDING,
+    }
+}
+
+fn status_int_to_str(v: i64) -> &'static str {
+    match v {
+        STATUS_PENDING => "pending",
+        STATUS_RUNNING => "running",
+        STATUS_FINISHED => "finished",
+        _ => "pending",
+    }
+}
+
+/// Schema version written into the `meta` table.  Lets us detect/format-mismatch
+/// on load and migrate later if the schema evolves.
+const DB_SCHEMA_VERSION: i64 = 1;
+
+/// Create a fresh SQLite worklist DB from an in-memory `PuzzleFile`.  This is the
+/// "JSON import" path: the first run from a `.json` worklist writes a `.db`
+/// sibling and all subsequent saves go there.
+fn create_db_from_file(path: &Path, file: &PuzzleFile) -> Result<(), String> {
+    let conn =
+        rusqlite::Connection::open(path).map_err(|e| format!("create {}: {}", path.display(), e))?;
+
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS meta (
+            puzzle_number    INTEGER NOT NULL,
+            total_bits       INTEGER NOT NULL,
+            chunk_bits_used  INTEGER NOT NULL,
+            total_chunks     INTEGER NOT NULL,
+            completed_chunks INTEGER NOT NULL,
+            target           TEXT NOT NULL,
+            hash160          TEXT,
+            range_start      BLOB(32) NOT NULL,
+            range_end        BLOB(32) NOT NULL,
+            next_id          INTEGER NOT NULL,
+            schema_version   INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS chunks (
+            id      INTEGER PRIMARY KEY,
+            current BLOB(32) NOT NULL,
+            end     BLOB(32) NOT NULL,
+            status  INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
+        ",
+    )
+    .map_err(|e| format!("create schema in {}: {}", path.display(), e))?;
+
+    let range_start = parse_hex_key(&file.start_hex);
+    let range_end = parse_hex_key(&file.end_hex);
+
+    conn.execute(
+        "INSERT INTO meta VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rusqlite::params![
+            file.puzzle_number as i64,
+            file.total_bits as i64,
+            file.chunk_bits_used as i64,
+            file.total_chunks as i64,
+            file.completed_chunks as i64,
+            &file.target,
+            &file.hash160,
+            &range_start[..],
+            &range_end[..],
+            file.next_id as i64,
+            DB_SCHEMA_VERSION,
+        ],
+    )
+    .map_err(|e| format!("insert meta into {}: {}", path.display(), e))?;
+
+    let mut stmt = conn
+        .prepare("INSERT INTO chunks (id, current, end, status) VALUES (?, ?, ?, ?)")
+        .map_err(|e| e.to_string())?;
+    for chunk in &file.chunks {
+        let cur = parse_hex_key(&chunk.current_hex);
+        let end = parse_hex_key(&chunk.end_hex);
+        stmt.execute(rusqlite::params![
+            chunk.id as i64,
+            &cur[..],
+            &end[..],
+            status_str_to_int(&chunk.status),
+        ])
+        .map_err(|e| format!("insert chunk #{} into {}: {}", chunk.id, path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+/// Load a `PuzzleFile` from a SQLite worklist DB.
+fn load_from_db(path: &Path) -> Result<PuzzleFile, String> {
+    let conn =
+        rusqlite::Connection::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+
+    // Read the single meta row.
+    let (puzzle_number, total_bits, chunk_bits_used, total_chunks, completed_chunks, target, hash160, range_start_blob, range_end_blob, next_id, _schema_ver) = conn
+        .query_row(
+            "SELECT puzzle_number, total_bits, chunk_bits_used, total_chunks, \
+                    completed_chunks, target, hash160, range_start, range_end, \
+                    next_id, schema_version FROM meta",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("read meta from {}: {}", path.display(), e))?;
+
+    let mut range_start = [0u8; 32];
+    range_start
+        .copy_from_slice(&range_start_blob);
+    let mut range_end = [0u8; 32];
+    range_end.copy_from_slice(&range_end_blob);
+
+    // Read all chunks.
+    let mut stmt = conn
+        .prepare("SELECT id, current, end, status FROM chunks ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let chunk_rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut chunks = Vec::new();
+    for row in chunk_rows {
+        let (id, cur_blob, end_blob, status_int) = row.map_err(|e| e.to_string())?;
+        let mut cur = [0u8; 32];
+        cur.copy_from_slice(&cur_blob);
+        let mut end = [0u8; 32];
+        end.copy_from_slice(&end_blob);
+        chunks.push(Chunk {
+            id: id as u32,
+            current_hex: hex_encode_key(&cur),
+            end_hex: hex_encode_key(&end),
+            status: status_int_to_str(status_int).to_string(),
+            chunk_index: 0,
+            start_hex: String::new(),
+            range_bits: 0,
+        });
+    }
+
+    Ok(PuzzleFile {
+        puzzle_number: puzzle_number as u32,
+        total_bits: total_bits as u32,
+        chunk_bits_used: chunk_bits_used as u32,
+        total_chunks: total_chunks as u32,
+        completed_chunks: completed_chunks as u32,
+        target,
+        hash160,
+        chunks,
+        start_hex: hex_encode_key(&range_start),
+        end_hex: hex_encode_key(&range_end),
+        next_id: next_id as u32,
+    })
+}
+
+/// Full-sync the entire `PuzzleFile` to SQLite (DELETE all chunks + re-INSERT).
+/// Not on the hot path — `save_dirty` handles incremental saves.  Kept as a
+/// primitive for tests, DB compaction, and the `save_all` escape hatch.
+#[allow(dead_code)]
+fn save_to_db(path: &Path, file: &PuzzleFile) -> Result<(), String> {
+    let mut conn =
+        rusqlite::Connection::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    tx.execute("DELETE FROM chunks", [])
+        .map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO chunks (id, current, end, status) VALUES (?, ?, ?, ?)")
+            .map_err(|e| e.to_string())?;
+        for chunk in &file.chunks {
+            let cur = parse_hex_key(&chunk.current_hex);
+            let end = parse_hex_key(&chunk.end_hex);
+            stmt.execute(rusqlite::params![
+                chunk.id as i64,
+                &cur[..],
+                &end[..],
+                status_str_to_int(&chunk.status),
+            ])
+            .map_err(|e| format!("write chunk #{} to {}: {}", chunk.id, path.display(), e))?;
+        }
+    }
+
+    tx.execute(
+        "UPDATE meta SET total_chunks = ?, completed_chunks = ?, next_id = ?",
+        rusqlite::params![
+            file.total_chunks as i64,
+            file.completed_chunks as i64,
+            file.next_id as i64,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Incremental save: flush only the chunks whose IDs are in `dirty` to the DB.
+/// Each dirty chunk is written with INSERT OR REPLACE (covers both "existing
+/// chunk was updated" and "brand-new chunk was split off").  Uses a transaction
+/// so a crash mid-write cannot corrupt the DB.  Clears `dirty` on success.
+///
+/// This is the hot-path save: a claim touches 1-2 chunks, a rotation touches 1,
+/// a Ctrl+C finalizes ≤ n_workers.  Even at the 1M-chunk cap we write O(1)
+/// rows instead of O(N).
+fn save_dirty(ctx: &mut PuzzleCtx) -> Result<(), String> {
+    if ctx.dirty.is_empty() {
+        return Ok(());
+    }
+
+    // Snapshot the dirty IDs and clear the set up front.  This way, if a chunk
+    // is modified again while we're mid-write (e.g. the ticker fires during a
+    // worker's claim), the new modification will be caught by the *next* save
+    // rather than lost.
+    let dirty_ids: Vec<u32> = ctx.dirty.drain().collect();
+
+    let mut conn = rusqlite::Connection::open(&ctx.db_path)
+        .map_err(|e| format!("open {}: {}", ctx.db_path.display(), e))?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR REPLACE INTO chunks (id, current, end, status) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .map_err(|e| e.to_string())?;
+
+        for id in &dirty_ids {
+            // Resolve the chunk by id.  A chunk may have been marked dirty and
+            // then removed (shouldn't happen with the current logic, but be
+            // defensive) — skip it.
+            let chunk = match ctx.file.chunks.iter().find(|c| c.id == *id) {
+                Some(c) => c,
+                None => continue,
+            };
+            let cur = parse_hex_key(&chunk.current_hex);
+            let end = parse_hex_key(&chunk.end_hex);
+            stmt.execute(rusqlite::params![
+                chunk.id as i64,
+                &cur[..],
+                &end[..],
+                status_str_to_int(&chunk.status),
+            ])
+            .map_err(|e| format!("write chunk #{} to {}: {}", chunk.id, ctx.db_path.display(), e))?;
+        }
+    }
+
+    // Meta fields (total_chunks, completed_chunks, next_id) are mutable and may
+    // have changed alongside the dirty chunks — keep them in sync.
+    tx.execute(
+        "UPDATE meta SET total_chunks = ?, completed_chunks = ?, next_id = ?",
+        rusqlite::params![
+            ctx.file.total_chunks as i64,
+            ctx.file.completed_chunks as i64,
+            ctx.file.next_id as i64,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ── public entry point ──────────────────────────────────────────────────────
@@ -229,16 +565,67 @@ pub fn run(
     rotate_keys: Option<u64>,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
-    let mut file: PuzzleFile = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(path).unwrap_or_else(|e| {
-            eprintln!("[puzzle] cannot open {}: {}", path.display(), e);
+    //
+    // Format detection:
+    //   • `.db`  → load directly from SQLite.
+    //   • `.json` → if a sibling `{n}.db` already exists, load from that
+    //               (JSON is ignored — it was only the initial import);
+    //               otherwise load from JSON and create the `.db` for all
+    //               future saves.
+    //
+    // JSON is thus a one-time import format; the DB is the runtime source of
+    // truth and the only thing we ever write back to.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+
+    let (mut file, db_path) = match ext.as_deref() {
+        Some("db") => {
+            let file = load_from_db(path).unwrap_or_else(|e| {
+                eprintln!("[puzzle] {e}");
+                std::process::exit(2);
+            });
+            (file, path.to_path_buf())
+        }
+        Some("json") => {
+            // Derive the sibling `.db` path: same directory & stem, `.db` ext.
+            let db_path = path.with_extension("db");
+            if db_path.exists() {
+                eprintln!(
+                    "[puzzle] found existing database {} — loading from it \
+                     (ignoring {})",
+                    db_path.display(),
+                    path.display()
+                );
+                let file = load_from_db(&db_path).unwrap_or_else(|e| {
+                    eprintln!("[puzzle] {e}");
+                    std::process::exit(2);
+                });
+                (file, db_path)
+            } else {
+                // First run from JSON: parse it, then create the DB.
+                let file: PuzzleFile = serde_json::from_reader(std::io::BufReader::new(
+                    std::fs::File::open(path).unwrap_or_else(|e| {
+                        eprintln!("[puzzle] cannot open {}: {}", path.display(), e);
+                        std::process::exit(2);
+                    }),
+                ))
+                .unwrap_or_else(|e| {
+                    eprintln!("[puzzle] invalid JSON in {}: {}", path.display(), e);
+                    std::process::exit(2);
+                });
+                (file, db_path)
+            }
+        }
+        _ => {
+            eprintln!(
+                "[puzzle] unsupported file extension (expected .json or .db): {}",
+                path.display()
+            );
             std::process::exit(2);
-        }),
-    ))
-    .unwrap_or_else(|e| {
-        eprintln!("[puzzle] invalid JSON in {}: {}", path.display(), e);
-        std::process::exit(2);
-    });
+        }
+    };
 
     // Convert the target BTC address to its 20-byte hash160 for fast compare.
     // This decode happens once at startup; both CPU workers and the GPU worker
@@ -248,8 +635,8 @@ pub fn run(
         std::process::exit(2);
     });
 
-    // If the JSON ships an expected hash160, sanity-check it against the value
-    // we just decoded from `target`.  A mismatch means the worklist is
+    // If the worklist ships an expected hash160, sanity-check it against the
+    // value we just decoded from `target`.  A mismatch means the worklist is
     // internally inconsistent — we abort rather than scan the wrong set.
     // Absent ⇒ no check (backward-compatible with files that omit the field).
     if let Some(ref h160_hex) = file.hash160 {
@@ -267,7 +654,7 @@ pub fn run(
                 std::process::exit(2);
             }
             None => {
-                eprintln!("[puzzle] hash160 in JSON is not valid hex: {h160_hex}");
+                eprintln!("[puzzle] hash160 in worklist is not valid hex: {h160_hex}");
                 std::process::exit(2);
             }
         }
@@ -275,7 +662,7 @@ pub fn run(
 
     // Migrate an old-format worklist (start_hex + range_bits) to the new
     // random-split format (current_hex + end_hex).  Idempotent on new files.
-    migrate_puzzle_file(&mut file);
+    let migrated = migrate_puzzle_file(&mut file);
 
     // Crash-recovery: any chunk left "running" from a previous killed run was
     // in-flight — revert it to pending so it can be reclaimed.
@@ -285,10 +672,29 @@ pub fn run(
         }
     }
 
-    let summary = chunk_summary(&file);
+    // If we loaded from JSON and the DB doesn't exist yet, create it now so all
+    // subsequent saves go to the DB.  The JSON is never written again.
+    if !db_path.exists() {
+        eprintln!("[puzzle] creating database {} (future saves go here)", db_path.display());
+        create_db_from_file(&db_path, &file).unwrap_or_else(|e| {
+            eprintln!("[puzzle] failed to create database: {e}");
+            std::process::exit(2);
+        });
+    }
+
+    // Build the shared state.  If migration changed any chunk and we loaded
+    // from DB (not JSON import, which already wrote everything fresh above),
+    // the DB still holds the pre-migration state — mark every chunk dirty so
+    // the first save_dirty rewrites them all in the new format.
+    let mut ctx = PuzzleCtx::new(file, db_path);
+    if migrated {
+        ctx.mark_all_dirty();
+    }
+
+    let summary = chunk_summary(&ctx.file);
     println!(
         "[puzzle #{}] target={}  chunks={}  (pending={}, running={}, finished={})",
-        file.puzzle_number, file.target, file.total_chunks, summary.0, summary.1, summary.2,
+        ctx.file.puzzle_number, ctx.file.target, ctx.file.total_chunks, summary.0, summary.1, summary.2,
     );
 
     if summary.0 + summary.1 == 0 {
@@ -297,10 +703,7 @@ pub fn run(
     }
 
     // ── 2. shared state + SIGINT flag ───────────────────────────────────────
-    let ctx = Arc::new(Mutex::new(PuzzleCtx {
-        file,
-        path: path.to_path_buf(),
-    }));
+    let ctx = Arc::new(Mutex::new(ctx));
     let progress = Arc::new(Progress::new(n_workers as u64));
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -436,7 +839,7 @@ pub fn run(
 
             // Throttled disk save on the heartbeat cadence.
             if now.duration_since(last_save) >= Duration::from_secs(SAVE_INTERVAL_SECS) {
-                let ctx = hb_ctx.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ctx = hb_ctx.lock().unwrap_or_else(|e| e.into_inner());
                 if ctx.save().is_ok() {
                     last_save = now;
                 }
@@ -452,7 +855,7 @@ pub fn run(
     drop(hb_handle); // ticker sees stop flag on its next tick and exits
 
     let (final_file, final_matches) = {
-        let ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = ctx.save() {
             eprintln!("[puzzle] final save failed: {e}");
         }
@@ -548,10 +951,14 @@ fn puzzle_worker(
         let mut sk = match secp256k1::SecretKey::from_byte_array(start_bytes) {
             Ok(k) => k,
             Err(_) => {
-                // The start key is outside [1, n-1]; skip this chunk.
+                // The start key is outside [1, n-1]; skip this chunk.  Revert
+                // the chunk from "running" (set during claim) back to "pending"
+                // and persist the change so a future run doesn't re-claim it.
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[idx].status = "pending".to_string();
                 ctx.file.chunks[idx].current_hex = hex_encode_key(&start_bytes);
+                ctx.mark_dirty(chunk_id);
+                sync_flush_chunk(&mut ctx);
                 continue;
             }
         };
@@ -661,6 +1068,10 @@ fn puzzle_worker(
                 let cur = sk.secret_bytes();
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[idx].current_hex = hex_encode_key(&cur);
+                // Mark dirty so the ticker's next save_dirty flushes this
+                // chunk's latest position.  Without this, the in-memory
+                // progress made between ticker ticks would never reach the DB.
+                ctx.mark_dirty(chunk_id);
                 // Disk persist happens on the ticker every SAVE_INTERVAL_SECS;
                 // here we only refresh the in-memory snapshot.
             }
@@ -681,6 +1092,9 @@ fn puzzle_worker(
                 chunk.status = "pending".to_string();
                 chunk.current_hex = hex_encode_key(&sk.secret_bytes());
             }
+            // Mark dirty: the next save_dirty flushes just this chunk (plus
+            // whatever else is dirty) in one transaction.
+            ctx.mark_dirty(chunk_id);
             sync_flush_chunk(&mut ctx);
         }
 
@@ -718,6 +1132,7 @@ fn gpu_claim_chunk(ctx: &mut PuzzleCtx) -> Option<GpuChunk> {
 /// Finalize a GPU-scanned chunk: either finished (whole range done) or parked
 /// (SIGINT) with the current scan position preserved for resume.
 fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8; 32]) {
+    let id = ctx.file.chunks[idx].id;
     let chunk = &mut ctx.file.chunks[idx];
     if done {
         chunk.status = "finished".to_string();
@@ -727,6 +1142,7 @@ fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8;
         chunk.status = "pending".to_string();
         chunk.current_hex = hex_encode_key(&current);
     }
+    ctx.mark_dirty(id);
     sync_flush_chunk(ctx);
 }
 
@@ -906,6 +1322,7 @@ fn gpu_puzzle_worker(
             {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 ctx.file.chunks[chunk.idx].current_hex = hex_encode_key(&current);
+                ctx.mark_dirty(chunk.chunk_id);
             }
 
             if stop_flag.load(Ordering::Relaxed) {
@@ -1121,6 +1538,7 @@ fn claim_random_chunk(ctx: &mut PuzzleCtx) -> Option<ClaimedChunk> {
             c.current_hex = end_hex.clone();
             ctx.file.completed_chunks += 1;
             ctx.file.total_chunks = ctx.file.chunks.len() as u32;
+            ctx.mark_dirty(id);
             sync_flush_chunk(ctx);
             continue;
         }
@@ -1130,8 +1548,9 @@ fn claim_random_chunk(ctx: &mut PuzzleCtx) -> Option<ClaimedChunk> {
             // Scan [d, end); park [cur, d) as a fresh pending chunk.
             let d = random_split_point(&cur, &end);
 
+            let new_id = ctx.file.next_id;
             ctx.file.chunks.push(Chunk {
-                id: ctx.file.next_id,
+                id: new_id,
                 current_hex: hex_encode_key(&cur),
                 end_hex: hex_encode_key(&d),
                 status: "pending".to_string(),
@@ -1145,11 +1564,20 @@ fn claim_random_chunk(ctx: &mut PuzzleCtx) -> Option<ClaimedChunk> {
             let c = &mut ctx.file.chunks[idx];
             c.current_hex = hex_encode_key(&d); // new left bound
             c.status = "running".to_string();
+
+            // Mark BOTH chunks dirty: the updated original (now running, new
+            // left bound) and the freshly inserted pending half.  The next
+            // save_dirty will INSERT OR REPLACE both in one transaction — so
+            // the new sub-range is persisted to the DB *before* we start
+            // scanning it.
+            ctx.mark_dirty(id);
+            ctx.mark_dirty(new_id);
             d
         } else {
             // At cap or too narrow to split: scan [cur, end) directly.
             let c = &mut ctx.file.chunks[idx];
             c.status = "running".to_string();
+            ctx.mark_dirty(id);
             cur
         };
 
@@ -1214,13 +1642,17 @@ fn chunk_summary(file: &PuzzleFile) -> (usize, usize, usize) {
 }
 
 impl PuzzleCtx {
-    /// Persist the worklist back to disk atomically (write-temp + rename).
-    fn save(&self) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(&self.file).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
+    /// Incremental save: flush only dirty chunks to the DB.  This is the
+    /// hot-path save used by claim, rotation, finalize, ticker, and Ctrl+C.
+    fn save(&mut self) -> Result<(), String> {
+        save_dirty(self)
+    }
+
+    /// Full-sync save (rewrites the entire chunks table).  Escape hatch for
+    /// maintenance / compaction — not used on the hot path.
+    #[allow(dead_code)]
+    fn save_all(&self) -> Result<(), String> {
+        save_to_db(&self.db_path, &self.file)
     }
 }
 
@@ -1544,5 +1976,63 @@ mod tests {
             let v = random_below(&limit);
             assert!(v < limit);
         }
+    }
+
+    // ── SQLite round-trip ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sqlite_roundtrip() {
+        // Build a small PuzzleFile in memory.  Note: `current_hex` uses the
+        // short form ("8000…000") that JSON worklists commonly carry; the DB
+        // round-trip canonicalises it to full 64-char hex via hex_encode_key.
+        // The values are equal modulo parse_hex_key, so we compare parsed keys.
+        let file = PuzzleFile {
+            puzzle_number: 42,
+            total_bits: 75,
+            chunk_bits_used: 66,
+            total_chunks: 3,
+            completed_chunks: 0,
+            target: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+            hash160: None,
+            chunks: vec![
+                Chunk { id: 0, current_hex: "8000000000000000000".into(), end_hex: "8000000000000000001".into(), status: "pending".into(), chunk_index: 0, start_hex: String::new(), range_bits: 0 },
+                Chunk { id: 1, current_hex: "8000000000000000001".into(), end_hex: "8000000000000000002".into(), status: "running".into(), chunk_index: 0, start_hex: String::new(), range_bits: 0 },
+                Chunk { id: 2, current_hex: "8000000000000000002".into(), end_hex: "8000000000000000003".into(), status: "finished".into(), chunk_index: 0, start_hex: String::new(), range_bits: 0 },
+            ],
+            start_hex: "0000000000000000000000000000000000000000000008000000000000000000".into(),
+            end_hex: "0000000000000000000000000000000000000000000010000000000000000000".into(),
+            next_id: 3,
+        };
+
+        let tmp = std::env::temp_dir().join("luckfind_test_roundtrip.db");
+        let _ = std::fs::remove_file(&tmp);
+
+        // Create DB from the file.
+        create_db_from_file(&tmp, &file).expect("create_db_from_file");
+
+        // Load it back.
+        let loaded = load_from_db(&tmp).expect("load_from_db");
+
+        assert_eq!(loaded.puzzle_number, file.puzzle_number);
+        assert_eq!(loaded.total_bits, file.total_bits);
+        assert_eq!(loaded.target, file.target);
+        assert_eq!(loaded.total_chunks, file.total_chunks);
+        assert_eq!(loaded.next_id, file.next_id);
+        assert_eq!(loaded.chunks.len(), file.chunks.len());
+        for (a, b) in loaded.chunks.iter().zip(file.chunks.iter()) {
+            assert_eq!(a.id, b.id);
+            // Compare parsed keys (short hex == full hex modulo parse_hex_key).
+            assert_eq!(parse_hex_key(&a.current_hex), parse_hex_key(&b.current_hex));
+            assert_eq!(parse_hex_key(&a.end_hex), parse_hex_key(&b.end_hex));
+            assert_eq!(a.status, b.status);
+        }
+
+        // Save again (full sync path) and reload — exercises save_to_db.
+        save_to_db(&tmp, &loaded).expect("save_to_db");
+        let reloaded = load_from_db(&tmp).expect("load_from_db 2");
+        assert_eq!(reloaded.chunks.len(), file.chunks.len());
+        assert_eq!(reloaded.chunks[1].status, "running");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -39,10 +39,10 @@ pub struct Cli {
     #[arg(long)]
     pub profile: bool,
 
-    /// Path to puzzle JSON worklist file (e.g. a btcpuzzle #76 range-split).
+    /// Path to puzzle worklist file (`.json` or `.db`).
     ///
     /// In puzzle mode the binary:
-    ///   - reads the JSON (subdivided sub-ranges, each with `current_hex`,
+    ///   - reads the worklist (subdivided sub-ranges, each with `current_hex`,
     ///     `end_hex`, `status`; the old `start_hex`/`range_bits` format is
     ///     auto-migrated on load),
     ///   - picks a random *pending* sub-range per worker (splitting it when
@@ -51,7 +51,14 @@ pub struct Cli {
     ///   - 每处理 2^31 个 keys 就停放当前子区间并重新选择（旋转策略），
     ///   - marks the sub-range `finished` once the whole range is done,
     ///   - on SIGINT (Ctrl+C) writes the current scanning position back into
-    ///     the JSON so the next run resumes exactly from there.
+    ///     the worklist so the next run resumes exactly from there.
+    ///
+    /// Format handling:
+    ///   - `.db` (SQLite): loaded directly; all saves go here.
+    ///   - `.json`: if a sibling `{n}.db` already exists, the DB is loaded
+    ///     (JSON is ignored — it was only the initial import); otherwise the
+    ///     JSON is loaded and a `.db` is created for all future saves.
+    ///     JSON is thus a one-time import format.
     ///
     /// Hex values that are shorter than 64 chars are left-padded to a full
     /// 32-byte key (high bytes zero-filled).

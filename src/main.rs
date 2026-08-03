@@ -35,13 +35,15 @@ fn main() {
         return;
     }
 
-    // ── puzzle mode: deterministic sub-range scan from a worklist JSON ───────
+    // ── puzzle mode: deterministic sub-range scan from a worklist file ────────
+    // Supports `.db` (SQLite, the runtime format) and `.json` (one-time import;
+    // a `.db` sibling is created on first run and used for all future saves).
     if let Some(ref puzzle_path) = cli.puzzle {
         // 每处理 2^31 个 keys 就停放当前子区间并重新选择（旋转策略）。
         // `local_count` 每次 claim 重置，所以这是 per-claim 的旋转预算，不是累计的。
         // 旋转后 worker 回到 claim_random_chunk，按随机性策略重新选子区间：
         //   - 子区间数 < 1024×1024：随机选一个 pending 区间，拆分为 [x,d] 和 [d,y]，
-        //     保存到 JSON，选择 [d,y] 开始计算。
+        //     保存到数据库，选择 [d,y] 开始计算。
         //   - 子区间数 ≥ 1024×1024：从 pending 中随机选择一个直接计算。
         // 子区间宽度 ≤ 2^31 时一次完成（scan_budget 精确终止），不触发旋转。
         // 2^31 keys per claim ≈ 2.15×10^9。
