@@ -1435,11 +1435,17 @@ pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
     hex::encode(bytes)
 }
 
-/// Abbreviated hex of the high 8 bytes of a key (16 hex chars).  The low bytes
-/// are usually irrelevant for identifying a puzzle sub-range, so a truncated
-/// form keeps the claim log lines short.
+/// Hex of a key with leading zero bytes stripped.  Puzzle sub-ranges sit at
+/// 2^(N-1)..2^N, so the high bytes are all zero — showing them (0000…0000) is
+/// noise.  This prints the significant part, e.g. 2^70 → "4000000000000000".
 fn abbr_hex(k: &[u8; 32]) -> String {
-    hex::encode(&k[..8])
+    let s = hex::encode(k);
+    let t = s.trim_start_matches('0');
+    if t.is_empty() {
+        "0".to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 /// Parse a 40-character hex string as a 20-byte hash160.  Returns `None` if the
@@ -2099,5 +2105,29 @@ mod tests {
         assert_eq!(reloaded.chunks[1].status, "running");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── abbr_hex strips leading zero bytes (puzzle ranges sit at 2^(N-1)..2^N) ─
+
+    #[test]
+    fn test_abbr_hex_strips_leading_zeros() {
+        // 2^70 (puzzle #71 start) → low 8 bytes hold 0x4000…; high bytes zero.
+        let mut start = [0u8; 32];
+        start[24] = 0x40; // 2^70 = 0x4000_0000_0000_0000 in bytes 24..31
+        assert_eq!(abbr_hex(&start), "4000000000000000");
+
+        // 2^71 (puzzle #71 end) = 0x8000_0000_0000_0000.
+        let mut end = [0u8; 32];
+        end[24] = 0x80;
+        assert_eq!(abbr_hex(&end), "8000000000000000");
+
+        // A split point partway into the range keeps its significant digits.
+        let mut mid = [0u8; 32];
+        mid[24] = 0x5a;
+        mid[31] = 0x01;
+        assert_eq!(abbr_hex(&mid), "5a00000000000001");
+
+        // All-zero key degrades to "0" rather than an empty string.
+        assert_eq!(abbr_hex(&[0u8; 32]), "0");
     }
 }
