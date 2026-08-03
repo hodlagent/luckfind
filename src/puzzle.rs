@@ -752,8 +752,8 @@ pub fn run(
     // One additional worker that claims whatever pending chunks the CPU workers
     // haven't taken and scans them with the GPU (100k strided walkers, dense
     // zero-overlap tiling, per-dispatch checkpoint).  Falls back to CPU-only if
-    // no Metal device is present.  Rotation is intentionally NOT passed through:
-    // with GPU saturating throughput there's no need to park-and-rotate chunks.
+    // no Metal device is present.  Rotation is passed through so the GPU worker
+    // participates in the same per-claim park-and-rotate strategy as the CPUs.
     let gpu_ctx = ctx.clone();
     let gpu_progress = progress.clone();
     let gpu_matches = matches.clone();
@@ -766,6 +766,7 @@ pub fn run(
             &gpu_matches,
             &gpu_stop,
             start,
+            rotate_keys,
         )
     });
 
@@ -1194,6 +1195,10 @@ fn gpu_match_to_event(
 /// covers `N × steps_per_call` keys with no overlap, advancing the checkpoint.
 /// Runs alongside the CPU workers — all of them pull from the same pending
 /// queue, so CPU and GPU share the load without double-scanning.
+///
+/// When `rotate_keys` is `Some(n)`, the chunk is parked after `n` keys scanned
+/// this claim and a fresh random pending chunk is claimed, mirroring the CPU
+/// worker's per-claim rotation budget.
 #[allow(clippy::too_many_arguments)]
 fn gpu_puzzle_worker(
     target_h160: [u8; 20],
@@ -1202,6 +1207,7 @@ fn gpu_puzzle_worker(
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
     start: Instant,
+    rotate_keys: Option<u64>,
 ) {
     // Set up GPU.  If no GPU device is available (CI, headless) we log and
     // fall back to CPU-only — never block the whole run on a missing GPU.
@@ -1228,8 +1234,11 @@ fn gpu_puzzle_worker(
     scanner.stride = crate::gpu::NUM_GPU_THREADS;
     scanner.num_candidates = 1;
 
-    // Keep `rotate_keys` disabled (the user-supplied chunk queue already
-    // subdivides the range; rotation only ever made sense for CPU-only sweeps).
+    // Rotation budget for this worker.  `Some(n)` parks the current chunk after
+    // `n` keys scanned *this claim* (mirrors the CPU worker's `local_count`) and
+    // moves on to a fresh random pending chunk; `None` scans to completion.
+    // The GPU can saturate throughput quickly, so with a 2^31 budget it rotates
+    // every ~3 minutes instead of plowing one huge chunk forever.
 
     // Per-dispatch coverage (keys).  Constant once calibrated.
     let dispatch_keys = crate::gpu::NUM_GPU_THREADS as u64
@@ -1256,6 +1265,7 @@ fn gpu_puzzle_worker(
 
         let mut current = chunk.start; // next key NOT yet covered
         let mut parked = false;
+        let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
 
         // ── scan the chunk in N·steps_per_call-key dispatches ───────────────
         loop {
@@ -1317,6 +1327,7 @@ fn gpu_puzzle_worker(
 
             // Advance checkpoint by exactly the keys this dispatch covered.
             current = crate::gpu::convert::scalar_add_be(&current, batch);
+            scanned_keys += batch;
 
             // Refresh the in-memory resume position (disk flush is on the ticker).
             {
@@ -1328,6 +1339,20 @@ fn gpu_puzzle_worker(
             if stop_flag.load(Ordering::Relaxed) {
                 parked = true;
                 break;
+            }
+
+            // ── rotation ────────────────────────────────────────────────────
+            // Park after `rotate_keys` keys scanned *this claim* and let the
+            // loop claim a fresh random pending chunk.  `scanned_keys` resets
+            // every claim, so this is a per-claim budget exactly like the CPU
+            // worker's `local_count`.  Setting `parked` makes finalize mark the
+            // chunk back to "pending" (resume position preserved) instead of
+            // "finished", so it is picked up again later.
+            if let Some(rot) = rotate_keys {
+                if scanned_keys >= rot {
+                    parked = true;
+                    break;
+                }
             }
         }
 
