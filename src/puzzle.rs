@@ -68,6 +68,36 @@ const MAX_CHUNKS: usize = 1024 * 1024;
 /// resumed later (the existing "rotation" mechanism).
 const ROTATION_BUDGET: u64 = 1u64 << 31;
 
+// ── terminal output coordination ─────────────────────────────────────────────
+// The heartbeat rewrites a single status line in place with `\r` (no trailing
+// newline).  Full log lines (claims, errors, final report) must first
+// terminate any open status line so they start at column 0 instead of the
+// cursor's mid-line position.  `TERM_LINE` serializes the two so a claim line
+// can't be clobbered by a status rewrite (or vice versa).
+
+struct TermLine {
+    open: bool,
+}
+
+static TERM_LINE: Mutex<TermLine> = Mutex::new(TermLine { open: false });
+
+/// Rewrite the in-place status line (carriage return + ANSI clear-to-EOL).
+fn term_status(s: &str) {
+    let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
+    eprint!("\r{s}\x1b[K");
+    g.open = true;
+}
+
+/// Emit a full log line, terminating any open status line first.
+fn term_line(s: &str) {
+    let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.open {
+        eprint!("\r\n"); // drop the cursor to column 0 of the next line
+        g.open = false;
+    }
+    eprintln!("{s}");
+}
+
 // ── worklist JSON shape ──────────────────────────────────────────────────────
 
 /// On-disk puzzle worklist.  The overall puzzle range is `[start_hex, end_hex)`;
@@ -707,10 +737,10 @@ pub fn run(
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            eprintln!("\n[puzzle] Ctrl+C — saving progress and stopping workers …");
+            term_line("[puzzle] Ctrl+C — saving progress and stopping workers …");
         } else {
             // Second Ctrl+C hard-aborts (default behaviour).
-            eprintln!("\n[puzzle] second Ctrl+C — aborting immediately");
+            term_line("[puzzle] second Ctrl+C — aborting immediately");
             std::process::exit(130);
         }
     })
@@ -827,7 +857,8 @@ pub fn run(
                     fmt_comma(rate as u64),
                 )
             };
-            eprintln!("  {s}");
+            // In-place status update — rewrites the same line; no newline.
+            term_status(&format!("  {s}"));
         }
     });
 
@@ -841,7 +872,7 @@ pub fn run(
     let (final_file, final_matches) = {
         let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = ctx.save() {
-            eprintln!("[puzzle] final save failed: {e}");
+            term_line(&format!("[puzzle] final save failed: {e}"));
         }
         let fm = match Arc::try_unwrap(matches) {
             Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
@@ -851,7 +882,9 @@ pub fn run(
     };
 
     // ── 6. final report ─────────────────────────────────────────────────────
-    eprintln!();
+    // `term_line("")` terminates any open in-place status line (if the last
+    // output was a claim, it's a no-op) and emits the separating blank line.
+    term_line("");
     eprintln!("──────────────────────────────────────────────────");
     eprintln!("  PUZZLE SCAN COMPLETE  (#{})", final_file.puzzle_number);
     eprintln!("──────────────────────────────────────────────────");
@@ -931,6 +964,15 @@ fn puzzle_worker(
             None => return, // all done
         };
         let (idx, chunk_id, start_bytes, end_bytes) = (claimed.idx, claimed.id, claimed.start, claimed.end);
+
+        // Append a log line each time a fresh sub-range is claimed (the only
+        // full-line output during steady scanning — heartbeat status rewrites
+        // its own line in place).
+        term_line(&format!(
+            "[claim] w={wid} chunk={chunk_id} range={}..{}",
+            abbr_hex(&start_bytes),
+            abbr_hex(&end_bytes),
+        ));
 
         let mut sk = match secp256k1::SecretKey::from_byte_array(start_bytes) {
             Ok(k) => k,
@@ -1195,19 +1237,19 @@ fn gpu_puzzle_worker(
     let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[puzzle] GPU unavailable ({e}) — running CPU-only.");
+            term_line(&format!("[puzzle] GPU unavailable ({e}) — running CPU-only."));
             return;
         }
     };
-    eprintln!(
+    term_line(&format!(
         "[puzzle] GPU worker up on {}",
         gpu_ctx.device_name()
-    );
+    ));
     let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
     let mut scanner = match crate::gpu::GpuScanner::new(gpu_ctx, &candidates) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[puzzle] GpuScanner::new failed ({e}) — running CPU-only.");
+            term_line(&format!("[puzzle] GpuScanner::new failed ({e}) — running CPU-only."));
             return;
         }
     };
@@ -1236,9 +1278,18 @@ fn gpu_puzzle_worker(
             None => return, // all chunks claimed/finished
         };
 
+        // Append a log line each time a fresh sub-range is claimed, mirroring
+        // the CPU workers (heartbeat status keeps rewriting its own line).
+        term_line(&format!(
+            "[claim] w=GPU chunk={} range={}..{}",
+            chunk.chunk_id,
+            abbr_hex(&chunk.start),
+            abbr_hex(&chunk.end),
+        ));
+
         // Seed walkers at `start + i` so they tile [start, start+N) with stride N.
         if scanner.seed_range(chunk.start).is_err() {
-            eprintln!("[puzzle] GPU seed_range failed — parking chunk");
+            term_line("[puzzle] GPU seed_range failed — parking chunk");
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
             gpu_finalize_chunk(&mut ctx, chunk.idx, false, chunk.start);
             continue;
@@ -1299,7 +1350,7 @@ fn gpu_puzzle_worker(
                     progress.increment(batch);
                 }
                 Err(e) => {
-                    eprintln!("[puzzle] GPU step failed ({e}) — parking chunk");
+                    term_line(&format!("[puzzle] GPU step failed ({e}) — parking chunk"));
                     parked = true;
                     break;
                 }
@@ -1382,6 +1433,13 @@ pub(crate) fn parse_hex_key(hex_str: &str) -> [u8; 32] {
 /// Hex-encode a 32-byte key (always 64 hex chars, no padding ambiguity).
 pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
     hex::encode(bytes)
+}
+
+/// Abbreviated hex of the high 8 bytes of a key (16 hex chars).  The low bytes
+/// are usually irrelevant for identifying a puzzle sub-range, so a truncated
+/// form keeps the claim log lines short.
+fn abbr_hex(k: &[u8; 32]) -> String {
+    hex::encode(&k[..8])
 }
 
 /// Parse a 40-character hex string as a 20-byte hash160.  Returns `None` if the
@@ -1606,14 +1664,15 @@ fn h160_eq(pubkey: &[u8], target: [u8; 20]) -> bool {
 }
 
 /// Persist the worklist chunk metadata (status + current_hex) to disk.
-/// Used after both claim and finalize so a Ctrl+C or hard-kill between
-/// heartbeat ticks cannot silently drop a ~10-minute window of scanning.
-/// Failures are logged but never panic — losing a pending write is preferable
-/// to tearing down a worker mid-scan.
+/// Used at claim boundaries (claim/split/rotation/finalize) — the only points
+/// where the worklist is written, so a Ctrl+C or hard-kill cannot lose more
+/// than the current claim's in-flight progress.  Failures are logged but never
+/// panic — losing a pending write is preferable to tearing down a worker
+/// mid-scan.
 #[inline]
 fn sync_flush_chunk(ctx: &mut PuzzleCtx) {
     if let Err(e) = ctx.save() {
-        eprintln!("[puzzle] chunk flush failed: {e}");
+        term_line(&format!("[puzzle] chunk flush failed: {e}"));
     }
 }
 
