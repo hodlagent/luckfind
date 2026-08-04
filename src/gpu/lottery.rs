@@ -14,6 +14,7 @@
 //! re-seeding every `RESEED_INTERVAL_KEYS` keys we collapse all rays and
 //! redistribute — giving uniform random coverage of [2^70, 2^160) over time.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,8 @@ pub fn worker(
     puzzle_set: &'static crate::puzzles::PuzzleSet,
     progress: Arc<Progress>,
     matches: Arc<Mutex<Vec<MatchEvent>>>,
+    stop_flag: Arc<AtomicBool>,
+    hit_flag: Arc<AtomicBool>,
     deadline: Option<Instant>,
     start: Instant,
 ) {
@@ -87,6 +90,10 @@ pub fn worker(
         if deadline.is_some_and(|dl| Instant::now() >= dl) {
             break;
         }
+        // 命中即停：某个 worker 命中了，尽快退出。
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Throttle: on non-macOS, sleep_ms leaves GPU headroom for display.
         // (Handled inside scanner.step().)
@@ -94,29 +101,53 @@ pub fn worker(
         match scanner.step() {
             Ok(batch_matches) => {
                 if !batch_matches.is_empty() {
-                    let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
-                    for m in &batch_matches {
-                        let mut ev = gpu_match_to_event(m, puzzle_set, start);
-                        // CPU verification — re-derive the pubkey, hash160 it, and
-                        // confirm it matches the puzzle set.  Defense in depth
-                        // against spurious GPU matches (impossible with a 160-bit
-                        // hash, but cheap insurance).
-                        let h = btc::hash160(&ev.compressed);
-                        if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h) {
-                            ev.puzzle_number = Some(pn);
-                            g.push(ev);
-                        }
-                        // Uncompressed variant: the GPU kernel hashes both the
-                        // compressed and uncompressed pubkeys.  We verified the
-                        // compressed one above; check the uncompressed too.
-                        else {
-                            let h_u = btc::hash160(&ev.uncompressed);
-                            if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h_u) {
+                    // Collect CPU-verified matches inside the lock, then drop the
+                    // lock before printing ([HIT] is never emitted under it).
+                    let verified: Vec<MatchEvent> = {
+                        let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut out = Vec::new();
+                        for m in &batch_matches {
+                            let mut ev = gpu_match_to_event(m, puzzle_set, start);
+                            // CPU verification — re-derive the pubkey, hash160 it, and
+                            // confirm it matches the puzzle set.  Defense in depth
+                            // against spurious GPU matches (impossible with a 160-bit
+                            // hash, but cheap insurance).
+                            let h = btc::hash160(&ev.compressed);
+                            if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h) {
                                 ev.puzzle_number = Some(pn);
-                                g.push(ev);
+                                g.push(ev.clone());
+                                out.push(ev);
                             }
-                            // else: spurious match — drop silently.
+                            // Uncompressed variant: the GPU kernel hashes both the
+                            // compressed and uncompressed pubkeys.  We verified the
+                            // compressed one above; check the uncompressed too.
+                            else {
+                                let h_u = btc::hash160(&ev.uncompressed);
+                                if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h_u) {
+                                    ev.puzzle_number = Some(pn);
+                                    g.push(ev.clone());
+                                    out.push(ev);
+                                }
+                                // else: spurious match — drop silently.
+                            }
                         }
+                        out
+                    };
+                    // 命中即停：首个命中的 worker 立即打印（含私钥）并通知所有 worker 停止。
+                    if let Some(first) = verified.first() {
+                        if hit_flag
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            println!(
+                                "[HIT] 🎯 puzzle=#{} worker=GPU sk_hex={}",
+                                first
+                                    .puzzle_number
+                                    .map_or_else(String::new, |n| n.to_string()),
+                                hex::encode(first.private_key),
+                            );
+                        }
+                        stop_flag.store(true, Ordering::SeqCst);
                     }
                 }
                 progress.increment(batch);

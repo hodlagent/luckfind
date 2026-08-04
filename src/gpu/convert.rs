@@ -124,11 +124,14 @@ pub fn be_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// chunk (remaining < N·steps_per_call ≈ 6.4·10⁶), which always fits.
 pub fn scalar_sub_be(a: &[u8; 32], b: &[u8; 32]) -> u64 {
     debug_assert!(!be_lt(a, b), "scalar_sub_be underflow");
+    // Borrow propagates LSB→MSB (correct).  The reconstruction must then walk
+    // the 8-byte BE window MSB-first — the old code accumulated
+    // `diff = diff*256 + d` while still walking LSB-first, which reversed the
+    // byte order and inflated small differences (e.g. 0xE0F2 → 0xF2E0…00),
+    // turning a chunk tail of ~59k keys into ~2.8·10⁹ steps and hanging the GPU.
+    let mut bytes = [0u8; 8];
     let mut borrow: i64 = 0;
-    let mut diff: u64 = 0;
-    // High bytes (0..24) are equal (diff < 2^64), so borrow stays within the low
-    // 8 bytes — propagate it through those and accumulate.
-    for i in (24..32).rev() {
+    for (k, i) in (24..32).rev().enumerate() {
         let mut d = a[i] as i64 - b[i] as i64 - borrow;
         if d < 0 {
             d += 256;
@@ -136,9 +139,13 @@ pub fn scalar_sub_be(a: &[u8; 32], b: &[u8; 32]) -> u64 {
         } else {
             borrow = 0;
         }
-        diff = diff * 256 + d as u64;
+        bytes[k] = d as u8; // bytes[0] = byte 31 (LSB) … bytes[7] = byte 24 (MSB)
     }
     debug_assert!(borrow == 0, "scalar_sub_be high-byte borrow");
+    let mut diff: u64 = 0;
+    for &byte in bytes.iter().rev() {
+        diff = diff * 256 + byte as u64;
+    }
     diff
 }
 
@@ -194,5 +201,38 @@ mod tests {
         bytes[31] = 0x42;
         let limbs = scalar_be_to_limbs(&bytes);
         assert_eq!(limbs[0] & 0xFF, 0x42);
+    }
+
+    /// Regression: scalar_sub_be previously accumulated `diff = diff*256 + d`
+    /// while walking the window LSB-first, reversing byte order and inflating
+    /// small differences (0xE0F2 → 0xF2E0…00), which turned a ~59k-key chunk
+    /// tail into ~2.8·10⁹ GPU steps and appeared to hang the worker.
+    fn be32(value: u64) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[24..32].copy_from_slice(&value.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn test_scalar_sub_be_small_difference() {
+        // end = 0x255ebf, start = 0x247dcd → 0xE0F2 = 57586.
+        assert_eq!(scalar_sub_be(&be32(0x255EBF), &be32(0x247DCD)), 0xE0F2);
+    }
+
+    #[test]
+    fn test_scalar_sub_be_zero() {
+        assert_eq!(scalar_sub_be(&be32(0x200000), &be32(0x200000)), 0);
+    }
+
+    #[test]
+    fn test_scalar_sub_be_multi_byte() {
+        // 0x0000ABCD12345678 - 0x0000000000000001 = 0xABCD12345677.
+        assert_eq!(scalar_sub_be(&be32(0xABCD12345678), &be32(1)), 0xABCD12345677);
+    }
+
+    #[test]
+    fn test_scalar_add_be_carry() {
+        // 0x255EBF + 0x186A0 (100000) = 0x26E55F.
+        assert_eq!(&scalar_add_be(&be32(0x255EBF), 100_000)[24..32], &0x26E55Fu64.to_be_bytes());
     }
 }

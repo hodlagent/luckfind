@@ -1,5 +1,6 @@
 //! Worker pool — spawns `n` OS threads, each running a tight check loop.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,17 +50,33 @@ pub fn run(
         .map(|s| Instant::now() + Duration::from_secs_f64(s));
     let start = Instant::now();
 
+    // 命中即停：`hit_flag` 标记首个命中者（赢家负责打印 [HIT]），`stop_flag`
+    // 让所有 worker 与 heartbeat 立即停止。没有命中时两者保持 false，行为不变。
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let hit_flag = Arc::new(AtomicBool::new(false));
+
     let handles: Vec<_> = (0..n_workers)
         .map(|wid| {
             let progress = progress.clone();
             let matches = matches.clone();
+            let stop_flag = stop_flag.clone();
+            let hit_flag = hit_flag.clone();
 
             // Clone the scan target for each worker.
             let ScanTarget::PuzzleSet(ps) = &target;
             let worker_target = WorkerMode::Puzzle(*ps);
 
             thread::spawn(move || {
-                worker_loop(wid as u32, &worker_target, &progress, &matches, deadline, start);
+                worker_loop(
+                    wid as u32,
+                    &worker_target,
+                    &progress,
+                    &matches,
+                    &stop_flag,
+                    &hit_flag,
+                    deadline,
+                    start,
+                );
             })
         })
         .collect();
@@ -72,11 +89,21 @@ pub fn run(
         let ScanTarget::PuzzleSet(ps) = &target;
         let gpu_progress = progress.clone();
         let gpu_matches = matches.clone();
+        let gpu_stop = stop_flag.clone();
+        let gpu_hit = hit_flag.clone();
         let gpu_deadline = deadline;
         let gpu_start = start;
         let ps = *ps; // &'static — copy the reference into the closure.
         Some(thread::spawn(move || {
-            crate::gpu::lottery::worker(ps, gpu_progress, gpu_matches, gpu_deadline, gpu_start);
+            crate::gpu::lottery::worker(
+                ps,
+                gpu_progress,
+                gpu_matches,
+                gpu_stop,
+                gpu_hit,
+                gpu_deadline,
+                gpu_start,
+            );
         }))
     } else {
         None
@@ -85,6 +112,7 @@ pub fn run(
     // ── heartbeat ticker (just print line, no channel) ───────────────
     let hb_progress = progress.clone();
     let hb_deadline = deadline;
+    let hb_stop = stop_flag.clone();
     let hb_interval = limits.heartbeat_secs;
     let hb_handle = thread::spawn(move || {
         let mut prev_total = 0u64;
@@ -92,6 +120,10 @@ pub fn run(
         loop {
             thread::sleep(Duration::from_secs_f64(hb_interval));
             if hb_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                break;
+            }
+            // 命中即停：命中的 worker 置 stop_flag 后 ticker 也尽快退出。
+            if hb_stop.load(Ordering::Relaxed) {
                 break;
             }
             let total = hb_progress.checked.load(std::sync::atomic::Ordering::Relaxed);
@@ -140,6 +172,8 @@ fn worker_loop(
     mode: &WorkerMode,
     progress: &Progress,
     matches: &std::sync::Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
     deadline: Option<Instant>,
     start: Instant,
 ) {
@@ -166,6 +200,11 @@ fn worker_loop(
         // Performance guard: check deadline every ~2048 iterations.
         if local_count.is_multiple_of(2048) {
             if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                break;
+            }
+
+            // 命中即停：别的 worker 命中了，尽快退出。
+            if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -204,9 +243,24 @@ fn worker_loop(
                 elapsed: start.elapsed().as_secs_f64(),
                 puzzle_number,
             };
-            if let Ok(mut g) = matches.lock() {
-                g.push(ev);
+            // 锁中毒也照样保存命中（命中是最珍贵的事件，绝不丢弃）。
+            let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+            g.push(ev.clone());
+            // 命中即停：首个命中的 worker 立即打印（含私钥）并通知所有 worker 停止。
+            if hit_flag
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                println!(
+                    "[HIT] 🎯 puzzle=#{} worker=#{} idx={} sk_hex={}",
+                    puzzle_number.map_or_else(String::new, |n| n.to_string()),
+                    wid,
+                    fmt_comma(local_count),
+                    hex::encode(ev.private_key),
+                );
             }
+            stop_flag.store(true, Ordering::SeqCst);
+            break;
         }
 
         // Advance: scalar +1 (private key, for reporting), point add +G (public key).

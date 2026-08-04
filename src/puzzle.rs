@@ -585,6 +585,7 @@ pub fn run(
     n_workers: usize,
     heartbeat_secs: f64,
     rotate_keys: Option<u64>,
+    output_dir: Option<&Path>,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
     //
@@ -729,14 +730,22 @@ pub fn run(
     let progress = Arc::new(Progress::new(n_workers as u64));
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    // 命中即停：`hit_flag` 标记首个命中者（赢家负责打印 [HIT]）。`stop_flag` 由
+    // 命中或首次 Ctrl+C 置位，只负责让 worker/heartbeat 停下。
+    let hit_flag = Arc::new(AtomicBool::new(false));
+    // `sigint_flag` 单独记录「是否已经按过一次 Ctrl+C」——与 `stop_flag` 解耦，
+    // 否则命中后按 Ctrl+C 会被误判为「第二次」而 exit(130)，跳过 aman 落盘/保存。
+    let sigint_flag = Arc::new(AtomicBool::new(false));
 
+    let sigint_handler = sigint_flag.clone();
     let stop_handler = stop_flag.clone();
     ctrlc::set_handler(move || {
-        // First Ctrl+C → start graceful shutdown.
-        if stop_handler
+        // First Ctrl+C → request graceful shutdown (hit 置位的 stop_flag 不影响此判断)。
+        if sigint_handler
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
+            stop_handler.store(true, Ordering::SeqCst);
             term_line("[puzzle] Ctrl+C — saving progress and stopping workers …");
         } else {
             // Second Ctrl+C hard-aborts (default behaviour).
@@ -755,6 +764,7 @@ pub fn run(
             let progress = progress.clone();
             let matches = matches.clone();
             let stop_flag = stop_flag.clone();
+            let hit_flag = hit_flag.clone();
             move || {
                 puzzle_worker(
                     wid as u32,
@@ -763,6 +773,7 @@ pub fn run(
                     &progress,
                     &matches,
                     &stop_flag,
+                    &hit_flag,
                     start,
                     rotate_keys,
                 )
@@ -780,6 +791,7 @@ pub fn run(
     let gpu_progress = progress.clone();
     let gpu_matches = matches.clone();
     let gpu_stop = stop_flag.clone();
+    let gpu_hit = hit_flag.clone();
     let gpu_handle = std::thread::spawn(move || {
         gpu_puzzle_worker(
             target_h160,
@@ -787,6 +799,7 @@ pub fn run(
             &gpu_progress,
             &gpu_matches,
             &gpu_stop,
+            &gpu_hit,
             start,
             rotate_keys,
         )
@@ -870,16 +883,22 @@ pub fn run(
     drop(hb_handle); // ticker sees stop flag on its next tick and exits
 
     let (final_file, final_matches) = {
-        let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = ctx.save() {
-            term_line(&format!("[puzzle] final save failed: {e}"));
-        }
+        let ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
         let fm = match Arc::try_unwrap(matches) {
             Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
             Err(a) => a.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
         (ctx.file.clone(), fm)
     };
+
+    // 命中即停收尾顺序：终端已打印 [HIT] → 这里先落盘 aman_<TS>.txt → SQLite 最后更新。
+    crate::report::flush_match_files(&final_matches, output_dir);
+    {
+        let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = ctx.save() {
+            term_line(&format!("[puzzle] final save failed: {e}"));
+        }
+    }
 
     // ── 6. final report ─────────────────────────────────────────────────────
     // `term_line("")` terminates any open in-place status line (if the last
@@ -907,9 +926,22 @@ pub fn run(
         eprintln!("  Match      : none");
     } else {
         eprintln!(
-            "  Match      : {} event(s) — see got.txt",
+            "  Match      : {} event(s) — see aman_<TS>.txt",
             final_matches.len()
         );
+        for m in &final_matches {
+            let chunk_label = match m.chunk_id {
+                Some(id) => format!(" chunk={id}"),
+                None => String::new(),
+            };
+            eprintln!(
+                "    worker={}{} idx={} sk_hex={}",
+                m.worker_id,
+                chunk_label,
+                fmt_comma(m.key_index),
+                hex::encode(m.private_key),
+            );
+        }
     }
     eprintln!();
 
@@ -926,6 +958,7 @@ fn puzzle_worker(
     progress: &Progress,
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
 ) {
@@ -1020,9 +1053,35 @@ fn puzzle_worker(
                     elapsed: start.elapsed().as_secs_f64(),
                     puzzle_number,
                 };
-                if let Ok(mut g) = matches.lock() {
-                    g.push(ev);
+                // 锁中毒也照样保存命中（命中是最珍贵的事件，绝不丢弃）。
+                let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+                g.push(ev.clone());
+                // 命中即停：首个命中的 worker 立即打印（含私钥）并通知所有 worker 停止。
+                if hit_flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    term_line(&format!(
+                        "[HIT] 🎯 puzzle=#{} worker=#{} chunk={} idx={} sk_hex={}",
+                        puzzle_number.map_or_else(String::new, |n| n.to_string()),
+                        wid,
+                        chunk_id,
+                        fmt_comma(local_count),
+                        hex::encode(ev.private_key),
+                    ));
                 }
+                stop_flag.store(true, Ordering::SeqCst);
+                // 命中 chunk 在内存标记 finished + dirty，但不 sync —— SQLite 由
+                // 最后一次 ctx.save()（aman 落盘之后）统一落库。
+                {
+                    let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
+                    let chunk = &mut ctx.file.chunks[idx];
+                    chunk.status = "finished".to_string();
+                    chunk.current_hex = chunk.end_hex.clone();
+                    ctx.file.completed_chunks += 1;
+                    ctx.mark_dirty(chunk_id);
+                }
+                return;
             }
 
             // ── mutate state ───────────────────────────────────────────────
@@ -1119,7 +1178,12 @@ fn puzzle_worker(
             // Mark dirty: the next save_dirty flushes just this chunk (plus
             // whatever else is dirty) in one transaction.
             ctx.mark_dirty(chunk_id);
-            sync_flush_chunk(&mut ctx);
+            // 命中即停时（hit_flag 已置位），所有 worker 的 chunk 落库推迟到
+            // 最后一次 ctx.save()，保证 aman 落盘先于任何 sqlite 写入。SIGINT
+            // 路径（hit_flag=false）保持原样立即 sync。
+            if !hit_flag.load(Ordering::Relaxed) {
+                sync_flush_chunk(&mut ctx);
+            }
         }
 
         if stop_flag.load(Ordering::Relaxed) {
@@ -1155,7 +1219,10 @@ fn gpu_claim_chunk(ctx: &mut PuzzleCtx) -> Option<GpuChunk> {
 
 /// Finalize a GPU-scanned chunk: either finished (whole range done) or parked
 /// (SIGINT) with the current scan position preserved for resume.
-fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8; 32]) {
+///
+/// `defer_sync = true`（命中即停时）只标记 dirty，把落库推迟到 run() 最后的
+/// `ctx.save()` —— 保证 aman 落盘先于任何 sqlite 写入。
+fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8; 32], defer_sync: bool) {
     let id = ctx.file.chunks[idx].id;
     let chunk = &mut ctx.file.chunks[idx];
     if done {
@@ -1167,7 +1234,9 @@ fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8;
         chunk.current_hex = hex_encode_key(&current);
     }
     ctx.mark_dirty(id);
-    sync_flush_chunk(ctx);
+    if !defer_sync {
+        sync_flush_chunk(ctx);
+    }
 }
 
 /// Convert a GPU match (`scalar` = winning private key as LE limbs) into the
@@ -1229,9 +1298,14 @@ fn gpu_puzzle_worker(
     progress: &Progress,
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
 ) {
+    // Puzzle number is constant for this worker's lifetime — capture once
+    // (mirrors the CPU worker) so the [HIT] line can label it.
+    let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
+
     // Set up GPU.  If no GPU device is available (CI, headless) we log and
     // fall back to CPU-only — never block the whole run on a missing GPU.
     let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
@@ -1291,13 +1365,20 @@ fn gpu_puzzle_worker(
         if scanner.seed_range(chunk.start).is_err() {
             term_line("[puzzle] GPU seed_range failed — parking chunk");
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-            gpu_finalize_chunk(&mut ctx, chunk.idx, false, chunk.start);
+            gpu_finalize_chunk(
+                &mut ctx,
+                chunk.idx,
+                false,
+                chunk.start,
+                hit_flag.load(Ordering::Relaxed),
+            );
             continue;
         }
 
         let mut current = chunk.start; // next key NOT yet covered
         let mut parked = false;
         let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
+        let mut hit = false; // CPU 验证通过的命中 —— 该 chunk 是赢家 chunk
 
         // ── scan the chunk in N·steps_per_call-key dispatches ───────────────
         loop {
@@ -1324,6 +1405,11 @@ fn gpu_puzzle_worker(
             if steps == 0 {
                 break; // reached the exclusive end
             }
+            // 命中即停：别的 worker 命中了，在 dispatch 间隙尽快退出（不再多跑一趟）。
+            if stop_flag.load(Ordering::Relaxed) {
+                parked = true;
+                break;
+            }
             // Temporarily set steps_per_call for this (possibly final, partial)
             // dispatch, restoring the default afterwards.
             let saved_steps = scanner.steps_per_call;
@@ -1332,19 +1418,43 @@ fn gpu_puzzle_worker(
             match scanner.step() {
                 Ok(batch_matches) => {
                     if !batch_matches.is_empty() {
-                        let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
-                        for m in &batch_matches {
-                            let mut ev = gpu_match_to_event(m, &chunk);
-                            // CPU verification — a real puzzle solver never trusts the
-                            // GPU candidate flag alone: re-derive the pubkey, hash160
-                            // it, and confirm it equals the target.  Spurious GPU
-                            // matches (impossible with a 160-bit hash, but defense in
-                            // depth) are dropped here silently.
-                            let h = btc::hash160(&ev.compressed);
-                            if h == target_h160 {
-                                ev.elapsed = start.elapsed().as_secs_f64();
-                                g.push(ev);
+                        // Collect CPU-verified matches inside the lock, then drop the
+                        // lock before printing ([HIT] is never emitted under it).
+                        let verified: Vec<MatchEvent> = {
+                            let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut out = Vec::new();
+                            for m in &batch_matches {
+                                let mut ev = gpu_match_to_event(m, &chunk);
+                                // CPU verification — a real puzzle solver never trusts the
+                                // GPU candidate flag alone: re-derive the pubkey, hash160
+                                // it, and confirm it equals the target.  Spurious GPU
+                                // matches (impossible with a 160-bit hash, but defense in
+                                // depth) are dropped here silently.
+                                let h = btc::hash160(&ev.compressed);
+                                if h == target_h160 {
+                                    ev.elapsed = start.elapsed().as_secs_f64();
+                                    g.push(ev.clone());
+                                    out.push(ev);
+                                }
                             }
+                            out
+                        };
+                        if let Some(first) = verified.first() {
+                            hit = true;
+                            // 命中即停：首个命中的 worker 立即打印（含私钥）并通知
+                            // 所有 worker 停止。
+                            if hit_flag
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                            {
+                                term_line(&format!(
+                                    "[HIT] 🎯 puzzle=#{} worker=GPU chunk={} sk_hex={}",
+                                    puzzle_number.map_or_else(String::new, |n| n.to_string()),
+                                    chunk.chunk_id,
+                                    hex::encode(first.private_key),
+                                ));
+                            }
+                            stop_flag.store(true, Ordering::SeqCst);
                         }
                     }
                     progress.increment(batch);
@@ -1391,9 +1501,16 @@ fn gpu_puzzle_worker(
         // ── finalize ────────────────────────────────────────────────────────
         {
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-            let done = !parked
-                && !crate::gpu::convert::be_lt(&current, &chunk.end);
-            gpu_finalize_chunk(&mut ctx, chunk.idx, done, current);
+            // 命中 chunk 标记 finished；命中即停时（hit_flag 已置位）推迟落库到
+            // 最后一次 ctx.save()（aman 落盘之后）。
+            let done = hit || (!parked && !crate::gpu::convert::be_lt(&current, &chunk.end));
+            gpu_finalize_chunk(
+                &mut ctx,
+                chunk.idx,
+                done,
+                current,
+                hit_flag.load(Ordering::Relaxed),
+            );
         }
 
         if stop_flag.load(Ordering::Relaxed) {

@@ -1,10 +1,9 @@
-//! Terminal report + got.txt append flush.
+//! Terminal report + per-match `aman_<UTC>.txt` flush.
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::btc;
 use crate::progress::Progress;
 use crate::workers::MatchEvent;
 
@@ -41,40 +40,68 @@ pub fn final_report(progress: &Progress, matches: &[MatchEvent], start: &Instant
     println!();
 }
 
-pub fn flush_got(matches: &[MatchEvent], output_dir: Option<&Path>) {
+/// Write one `aman_<UTC>.txt` per match (per-hit file, never overwrites).
+///
+/// Each file carries the private key (hex + decimal), compressed/uncompressed
+/// pubkeys, and all 5 derived address types.  Address derivation reuses the
+/// existing `btc` helpers — no duplicated hashing here.
+pub fn flush_match_files(matches: &[MatchEvent], output_dir: Option<&Path>) {
     let dir = output_dir.unwrap_or_else(|| Path::new("."));
-    if matches.is_empty() {
-        return;
-    }
-    let path = dir.join("got.txt");
-    let mut f = match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("  ⚠️  cannot open got.txt: {}", e);
-            return;
-        }
-    };
     for m in matches {
-        let chunk_label = match m.chunk_id {
-            Some(id) => format!(" chunk={id}"),
-            None      => String::new(),
-        };
-        let puzzle_label = match m.puzzle_number {
-            Some(n) => format!(" puzzle={n}"),
-            None    => String::new(),
-        };
-        let _ = writeln!(
-            f,
-            "ts={} worker={}{}{} idx={} sk_hex={} pk_c={} pk_u={} elapsed={:.2}s",
-            chrono::Utc::now().to_rfc3339(),
-            m.worker_id,
-            chunk_label,
-            puzzle_label,
-            m.key_index,
-            hex::encode(m.private_key),
-            hex::encode(&m.compressed),
-            hex::encode(&m.uncompressed),
-            m.elapsed,
-        );
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let path = dir.join(format!("aman_{ts}.txt"));
+        match std::fs::write(&path, match_block(m)) {
+            Ok(_) => eprintln!("  📄 Saved     : {}", path.display()),
+            Err(e) => eprintln!("  ⚠️  cannot write {}: {}", path.display(), e),
+        }
     }
+}
+
+/// Human-readable block for one match — mirrors the old Python orchestrator's
+/// `aman_<UTC>.txt`.  The 5 address types come straight from `btc.rs`.
+fn match_block(m: &MatchEvent) -> String {
+    let mut s = String::new();
+    s.push_str("================================================================\n");
+    s.push_str("  BITCOIN DORMANT ADDRESS LOTTERY — MATCH FOUND\n");
+    s.push_str("================================================================\n");
+    s.push_str(&format!("  Worker    : #{}\n", m.worker_id));
+    if let Some(id) = m.chunk_id {
+        s.push_str(&format!("  Chunk     : #{id}\n"));
+    }
+    if let Some(n) = m.puzzle_number {
+        s.push_str(&format!("  Puzzle    : #{n}\n"));
+    }
+    s.push_str(&format!(
+        "  Index     : {}\n",
+        crate::workers::fmt_comma(m.key_index)
+    ));
+    s.push_str(&format!("  Time      : {:.2}s\n", m.elapsed));
+    s.push('\n');
+    s.push_str("  ── PRIVATE KEY ──────────────────────────────────────\n");
+    s.push_str(&format!("  Hex     : {}\n", hex::encode(m.private_key)));
+    s.push_str(&format!(
+        "  Decimal : {}\n",
+        num_bigint::BigUint::from_bytes_be(&m.private_key)
+    ));
+    s.push('\n');
+    s.push_str("  ── PUBLIC KEY ────────────────────────────────────────\n");
+    s.push_str(&format!("  Compressed  : {}\n", hex::encode(&m.compressed)));
+    s.push_str(&format!("  Uncompressed: {}\n", hex::encode(&m.uncompressed)));
+    s.push('\n');
+    s.push_str("  ── ADDRESSES ─────────────────────────────────────────\n");
+    s.push_str(&format!(
+        "  P2PKH (compressed)   : {}\n",
+        btc::p2pkh_compressed(&m.compressed)
+    ));
+    s.push_str(&format!(
+        "  P2PKH (uncompressed) : {}\n",
+        btc::p2pkh_uncompressed(&m.uncompressed)
+    ));
+    s.push_str(&format!(
+        "  P2SH-P2WPKH          : {}\n",
+        btc::p2sh_p2wpkh(&m.compressed)
+    ));
+    s.push_str(&format!("  P2WPKH               : {}\n", btc::p2wpkh(&m.compressed)));
+    s.push_str(&format!("  P2TR                 : {}\n", btc::p2tr(&m.compressed)));
+    s
 }

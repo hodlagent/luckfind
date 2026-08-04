@@ -48,14 +48,15 @@ fn main() {
         // 子区间宽度 ≤ 2^31 时一次完成（scan_budget 精确终止），不触发旋转。
         // 2^31 keys per claim ≈ 2.15×10^9。
         let rotate_keys = Some(1u64 << 31);
-        let (stats, matches) = puzzle::run(
+        let (stats, _matches) = puzzle::run(
             Path::new(puzzle_path),
             cli.workers(),
             cli.heartbeat,
             rotate_keys,
+            Some(Path::new(&cli.output_dir)),
         );
-        let _ = stats; // progress already printed by puzzle::run
-        report::flush_got(&matches, Some(Path::new(&cli.output_dir)));
+        // progress 由 puzzle::run 打印；aman_<TS>.txt 已在 run() 内落盘（先于 sqlite）。
+        let _ = stats;
         return;
     }
 
@@ -83,7 +84,7 @@ fn main() {
 
     println!();
     report::final_report(&stats, &matches, &start);
-    report::flush_got(&matches, Some(Path::new(&cli.output_dir)));
+    report::flush_match_files(&matches, Some(Path::new(&cli.output_dir)));
 }
 
 #[inline(never)]
