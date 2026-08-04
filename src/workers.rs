@@ -16,7 +16,7 @@ pub struct RuntimeLimits {
 
 /// What the lottery workers scan against.
 pub enum ScanTarget {
-    /// Embedded 78 puzzles, range-constrained key generation in [2^70, 2^160).
+    /// Embedded 77 puzzles, range-constrained key generation in [2^70, 2^160).
     PuzzleSet(&'static PuzzleSet),
 }
 

@@ -86,7 +86,7 @@ fn hash160_be_to_le(h: Rmd160Hash) -> array<u32, 5> {
 }
 
 fn candidate_match(h: array<u32, 5>) -> u32 {
-    // Bound the scan by `num_candidates` (set to 78 for the full lottery set,
+    // Bound the scan by `num_candidates` (set to the lottery set size,
     // 1 for puzzle mode) so unused trailing slots — which read as zero and
     // would false-match an all-zero hash160 — are never examined.
     for (var i = 0u; i < config.num_candidates; i = i + 1u) {

@@ -1,8 +1,8 @@
-//! GPU lottery worker — random-walk scanner against the full 78-puzzle set.
+//! GPU lottery worker — random-walk scanner against the full 77-puzzle set.
 //!
 //! One GPU worker thread runs alongside the CPU workers in `workers::run`.  It
 //! seeds 100k independent walkers at random positions inside the puzzle key space
-//! and lets each walk `P += G` (stride 1), checking every key against all 78
+//! and lets each walk `P += G` (stride 1), checking every key against all 77
 //! candidate hash160s.  Unlike puzzle mode there is no worklist and no range to
 //! tile: the walkers run forever, and we periodically **re-seed** them at fresh
 //! random positions to keep sampling the key space uniformly.
@@ -34,7 +34,7 @@ pub const RESEED_INTERVAL_KEYS: u64 = 1 << 26;
 
 /// One GPU lottery worker thread.
 ///
-/// `puzzle_set` is the embedded 78-puzzle table (used for range-constrained
+/// `puzzle_set` is the embedded 77-puzzle table (used for range-constrained
 /// seeding AND for CPU-side match verification).  `progress` and `matches` are
 /// shared with the CPU workers.  `deadline` is the global runtime limit
 /// (None = run forever, until SIGINT).  `start` is the run start instant for
@@ -59,8 +59,8 @@ pub fn worker(
     };
     eprintln!("  [GPU] lottery worker up on {}", ctx.device_name());
 
-    // Candidate buffer: all 78 puzzle hash160s.  The shader's candidate array
-    // is fixed at 78 slots; `num_candidates = 78` checks them all.
+    // Candidate buffer: all 77 puzzle hash160s.  The shader's candidate array
+    // is fixed at 78 slots; `num_candidates = 77` checks them all.
     let candidates = convert::puzzle_set_to_candidates(puzzle_set);
     let candidate_count = puzzle_set.ranges().len() as u32;
 
@@ -71,7 +71,7 @@ pub fn worker(
             return;
         }
     };
-    // Lottery config: stride 1 (step = G), all 78 candidates.  These are already
+    // Lottery config: stride 1 (step = G), all 77 candidates.  These are already
     // the `new()` defaults, but set them explicitly for clarity.
     scanner.stride = 1;
     scanner.num_candidates = candidate_count;

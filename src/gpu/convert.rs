@@ -93,7 +93,7 @@ pub fn hash160_to_candidates(h160: &[u8; 20]) -> Vec<[u32; 5]> {
 
 /// Build a full 78-slot candidate buffer from a `PuzzleSet` — every puzzle's
 /// hash160 fills its slot (in range order).  The shader's candidate array is
-/// fixed at 78 slots; `num_candidates = 78` checks them all.  Used by the GPU
+/// fixed at 78 slots; `num_candidates` = set length checks them all.  Used by the GPU
 /// lottery worker, which scans against the full embedded puzzle set.
 pub fn puzzle_set_to_candidates(ps: &crate::puzzles::PuzzleSet) -> Vec<[u32; 5]> {
     let nranges = ps.ranges().len();

@@ -70,16 +70,16 @@ fn known_vector_bip_p2pkh_priv1() {
 }
 
 #[test]
-fn all_78_builtins_unique_and_valid() {
+fn all_77_builtins_unique_and_valid() {
     let ps = luckfind::puzzles::puzzle_set();
-    assert_eq!(ps.len(), 78, "embedded puzzle count = {}", ps.len());
+    assert_eq!(ps.len(), 77, "embedded puzzle count = {}", ps.len());
 
     // All hash160 values must be unique.
     let mut seen = std::collections::HashSet::<[u8; 20]>::new();
     for r in ps.ranges() {
         assert!(seen.insert(r.hash160), "duplicate hash160 for puzzle {}", r.puzzle_number);
     }
-    assert_eq!(seen.len(), 78, "expected 78 unique hash160s");
+    assert_eq!(seen.len(), 77, "expected 77 unique hash160s");
 }
 
 #[test]

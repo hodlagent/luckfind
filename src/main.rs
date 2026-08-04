@@ -60,7 +60,7 @@ fn main() {
         return;
     }
 
-    // Default mode: lottery against the embedded 78-puzzle set
+    // Default mode: lottery against the embedded 77-puzzle set
     // (range-constrained key generation in [2^70, 2^160)).
     let ps = puzzles::puzzle_set();
     eprintln!("  🧩 Loaded {} puzzles, key space [2^70, 2^160)", ps.len());

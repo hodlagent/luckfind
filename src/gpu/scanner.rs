@@ -17,7 +17,7 @@ pub struct GpuScanner {
     pub steps_per_call: u32,
     /// Stride (keys per shader step). 1 = lottery; N = puzzle dense-tiling.
     pub stride: u32,
-    /// Number of active candidate slots (1 = puzzle single target; 78 = lottery set).
+    /// Number of active candidate slots (1 = puzzle single target; 77 = lottery set).
     pub num_candidates: u32,
     /// Initial scalar per thread (LE limbs), for CPU-side match verification.
     initial_scalars: Vec<[u32; 8]>,
@@ -46,7 +46,7 @@ impl GpuScanner {
             bind_group,
             steps_per_call: 1,   // 1 step × 100k threads = 100k keys/dispatch (avoids TDR)
             stride: 1,           // lottery default; puzzle sets this to NUM_GPU_THREADS
-            num_candidates: 78,  // lottery default; puzzle sets this to 1
+            num_candidates: 77,  // lottery set size; puzzle mode overrides to 1
             initial_scalars: Vec::new(),
             total_ops: 0,
             #[cfg(target_os = "macos")]
