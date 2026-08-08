@@ -79,6 +79,29 @@ pub fn scalar_add_be(a: &[u8; 32], b: u64) -> [u8; 32] {
     out
 }
 
+/// Big-endian scalar subtract: `a - b` (plain subtract with borrow, no mod-n
+/// reduction — callers guarantee `a >= b`).  `b` is a small u64 (in practice 1),
+/// so only the low 8 bytes change unless a borrow chains upward.  Used to seed a
+/// reverse scan at `end - 1` without a full scalar multiplication.
+pub fn scalar_sub_be_u64(a: &[u8; 32], b: u64) -> [u8; 32] {
+    let mut out = *a;
+    // Subtract `b` from the low 8-byte (big-endian) window as one u64, then
+    // propagate the single-bit borrow (if any) through the upper 24 bytes.
+    let low = u64::from_be_bytes(out[24..32].try_into().expect("24..32 is 8 bytes"));
+    let (diff, borrowed) = low.overflowing_sub(b);
+    out[24..32].copy_from_slice(&diff.to_be_bytes());
+    if borrowed {
+        for i in (0..24).rev() {
+            if out[i] > 0 {
+                out[i] -= 1;
+                break;
+            }
+            out[i] = 0xFF;
+        }
+    }
+    out
+}
+
 /// Pack a 20-byte hash160 into the GPU candidate buffer format.  The shader's
 /// candidate binding is a fixed 78-slot array, so we return a 78-element vec
 /// with slot 0 set to `h160` (LE u32 words) and the rest zero.  The caller sets
@@ -234,5 +257,65 @@ mod tests {
     fn test_scalar_add_be_carry() {
         // 0x255EBF + 0x186A0 (100000) = 0x26E55F.
         assert_eq!(&scalar_add_be(&be32(0x255EBF), 100_000)[24..32], &0x26E55Fu64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_scalar_sub_be_u64_basic() {
+        // 0x255EBF - 1 = 0x255EBE (no borrow past the low window).
+        assert_eq!(
+            &scalar_sub_be_u64(&be32(0x255EBF), 1)[24..32],
+            &0x255EBEu64.to_be_bytes()
+        );
+        // subtract a larger-but-still-low value: 0x255EBF - 100000 = 0x23D81F.
+        assert_eq!(
+            &scalar_sub_be_u64(&be32(0x255EBF), 100_000)[24..32],
+            &0x23D81Fu64.to_be_bytes()
+        );
+        // b = 0 is a no-op.
+        assert_eq!(scalar_sub_be_u64(&be32(0x1234), 0), be32(0x1234));
+    }
+
+    #[test]
+    fn test_scalar_sub_be_u64_borrow_propagates() {
+        // 0x1000 - 1 = 0x0FFF: borrow crosses the byte boundary inside the low
+        // window; high bytes untouched.
+        assert_eq!(&scalar_sub_be_u64(&be32(0x1000), 1)[24..32], &0x0FFFu64.to_be_bytes());
+
+        // 2^64 - 1 in the low window (be32(0) with high=0xFFFFFFFF...) — feed a
+        // value whose low window is exactly 0, so subtracting 1 borrows into the
+        // upper 24 bytes: 0x01000000..0000 - 1 = 0x00FFFFFFFFFFFFFFFF.
+        let a = {
+            let mut b = [0u8; 32];
+            b[23] = 0x01; // 2^64, byte 23 is the top of the low window
+            b
+        };
+        let sub = scalar_sub_be_u64(&a, 1);
+        assert_eq!(sub[23], 0x00);
+        assert_eq!(&sub[24..32], &[0xFFu8; 8]);
+    }
+
+    #[test]
+    fn test_scalar_sub_be_u64_matches_biguint() {
+        // Property check against BigUint arithmetic for a few (a, b) with a >= b.
+        use num_bigint::BigUint;
+        for (hi, b) in [(0u8, 1u64), (0x40, 1), (0x80, 0x1234), (0xFF, 999_999)] {
+            let mut a = [0u8; 32];
+            a[23] = hi; // vary the high byte so subtraction crosses windows
+            a[24] = 0x11;
+            a[31] = 0x55;
+            let expect = BigUint::from_bytes_be(&a) - BigUint::from(b);
+            assert_eq!(
+                scalar_sub_be_u64(&a, b),
+                {
+                    let mut out = [0u8; 32];
+                    let be = expect.to_bytes_be();
+                    out[32 - be.len()..].copy_from_slice(&be);
+                    out
+                },
+                "a={a:?} b={b}"
+            );
+        }
+        // Degenerate: a == b → 0.
+        assert_eq!(scalar_sub_be_u64(&be32(0xABC), 0xABC), [0u8; 32]);
     }
 }

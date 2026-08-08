@@ -10,13 +10,21 @@
 //!                    (high bytes) to a full 32-byte secp256k1 key.  Scanning
 //!                    advances this; on resume the worker starts here.  Always
 //!                    set (never null).
-//! - `end_hex`:      exclusive upper bound; never changes for a given chunk.
+//! - `end_hex`:      exclusive upper bound of the *unscanned* region.  Scanned
+//!                    forward it stays fixed; scanned in reverse it retreats as
+//!                    keys are consumed from the top.  Either way `[current, end)`
+//!                    is always exactly the not-yet-scanned keys.
 //! - `status`:       `"pending"`, `"running"`, or `"finished"`.
 //!
 //! Per worker: pick a random *pending* chunk, claim it (status = "running"),
 //! then walk every key `current .. end` by scalar +1 (the same tight `+= 1`
-//! loop used in lottery mode for speed).  When the whole sub-range is done,
-//! the chunk is marked `finished`.  On SIGINT (Ctrl+C) every worker flushes
+//! loop used in lottery mode for speed).  Each claim randomly flips the scan
+//! direction: forward (from `current`, `+1`) or reverse (from `end - 1`, `-1`).
+//! Both cover the identical key set `[current, end)` — only the in-order
+//! traversal differs — so coverage, zero-dedup, and resume are unchanged; the
+//! direction is a per-claim coin flip, never persisted.  When the whole
+//! sub-range is done, the chunk is marked `finished`.  On SIGINT (Ctrl+C) every
+//! worker flushes
 //! its current scanning position into the SQLite worklist DB, reverts the
 //! chunk to `"pending"`, and exits — so a later invocation resumes cleanly.
 //!
@@ -950,6 +958,36 @@ pub fn run(
 
 // ── one worker loop ─────────────────────────────────────────────────────────
 
+/// Reverse-step constants for one worker: the scalar `-1 mod n` and the point
+/// `-G`, both derived from `n-1 = CURVE_ORDER - 1`.  Stepping `sk += (n-1)`
+/// (via `add_tweak`) and `pk += (-G)` (via `combine`) is the exact mirror of
+/// the forward `+1`/`+G` step, at identical cost — so scanning a claimed
+/// sub-range in reverse is free.  `pk + (-G) == (sk - 1)·G` keeps the
+/// `pk == sk·G` invariant intact while walking downward.
+fn reverse_step(
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+) -> (secp256k1::Scalar, secp256k1::PublicKey) {
+    let n_minus_1: [u8; 32] = {
+        let mut b = secp256k1::constants::CURVE_ORDER;
+        for i in (0..32).rev() {
+            if b[i] > 0 {
+                b[i] -= 1;
+                break;
+            }
+            b[i] = 0xFF;
+        }
+        b
+    };
+    let neg_one = secp256k1::Scalar::from_be_bytes(n_minus_1)
+        .expect("n-1 is a valid scalar (in [1, n-1])");
+    let neg_g = secp256k1::PublicKey::from_secret_key(
+        secp,
+        &secp256k1::SecretKey::from_byte_array(n_minus_1)
+            .expect("n-1 is a valid secret key"),
+    );
+    (neg_one, neg_g)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn puzzle_worker(
     wid: u32,
@@ -980,6 +1018,10 @@ fn puzzle_worker(
     // cheap (single affine decode) vs. pay-per-key if re-parsed in the loop.
     let point_g = crate::btc::generator_public_key();
 
+    // Reverse-step constants (−1 mod n, −G), computed once per worker so a
+    // claim that picks the reverse direction costs nothing extra to set up.
+    let (neg_one, neg_g) = reverse_step(&secp);
+
     loop {
         // ── pick + claim a pending chunk (with optional split) ──────────────
         // `claim_random_chunk` picks a random pending chunk, splits it in two
@@ -998,16 +1040,28 @@ fn puzzle_worker(
         };
         let (idx, chunk_id, start_bytes, end_bytes) = (claimed.idx, claimed.id, claimed.start, claimed.end);
 
+        // 随机扫描方向（每次 claim 掷一次硬币，不持久化）：正向从 start 向上
+        // （key += 1），反向从 end-1 向下（key -= 1）。两个方向扫过的 key 集合
+        // 完全相同（[start, end)），只改变遍历顺序 —— 覆盖/零重叠/断点续传不受影响。
+        let reverse = pick_random(&[true, false]).copied().unwrap_or(false);
+
         // Append a log line each time a fresh sub-range is claimed (the only
         // full-line output during steady scanning — heartbeat status rewrites
         // its own line in place).
         term_line(&format!(
-            "[claim] w={wid} chunk={chunk_id} range={}..{}",
+            "[claim] w={wid} chunk={chunk_id} range={}..{} dir={}",
             abbr_hex(&start_bytes),
             abbr_hex(&end_bytes),
+            if reverse { "REV" } else { "FWD" },
         ));
 
-        let mut sk = match secp256k1::SecretKey::from_byte_array(start_bytes) {
+        // 初始私钥：正向 = start；反向 = end - 1（区间的最后一个 key）。
+        let init_key = if reverse {
+            crate::gpu::convert::scalar_sub_be_u64(&end_bytes, 1)
+        } else {
+            start_bytes
+        };
+        let mut sk = match secp256k1::SecretKey::from_byte_array(init_key) {
             Ok(k) => k,
             Err(_) => {
                 // The start key is outside [1, n-1]; skip this chunk.  Revert
@@ -1022,6 +1076,11 @@ fn puzzle_worker(
             }
         };
         let mut local_count = 0u64;
+
+        // 每步推进量：正向 +1/+G，反向 -1/-G。方向在 claim 级固定，热路径只用
+        // 局部绑定（同一套加法的相反数，成本相同），无每-key 分支。
+        let (step_scalar, step_point): (&secp256k1::Scalar, &secp256k1::PublicKey) =
+            if reverse { (&neg_one, &neg_g) } else { (&one, &point_g) };
 
         // Scan budget: `Some(n)` when the sub-range width ≤ ROTATION_BUDGET
         // (scan exactly n keys to completion); `None` when wider (use rotation).
@@ -1088,13 +1147,14 @@ fn puzzle_worker(
             // 配对推进：sk +1（标量，mod n，用于断点续传和报告），
             // pk + G（点加，底层 gej_add_ge，零次 doubling）。
             // 两者保持 pk == sk * G 不变式。
-            sk = match sk.add_tweak(&one) {
+            sk = match sk.add_tweak(step_scalar) {
                 Ok(next) => next,
                 Err(_) => break 'scan false, // scalar overflow → stop
             };
-            pk = match pk.combine(&point_g) {
+            pk = match pk.combine(step_point) {
                 Ok(next) => next,
-                // pk == -G (无穷远点) ⟺ sk == n-1 ⟺ 等价于 scalar overflow.
+                // 正向：pk == -G (无穷远点) ⟺ sk == n-1；反向：pk == G ⟺ sk == 1。
+                // 两种都等价于 scalar overflow → stop。
                 Err(_) => break 'scan false,
             };
             local_count += 1;
@@ -1133,7 +1193,13 @@ fn puzzle_worker(
                 // skipped to keep rotation from firing on a chunk that fits
                 // in one go.
                 if budget.is_none() {
-                    if sk.secret_bytes() >= end_bytes {
+                    // 越界判定方向相关：正向在 sk 达到 end 时完成（[start, end) 扫完）；
+                    // 反向在 sk 回落到 start 之下时完成（已从 end-1 一路扫到 start）。
+                    if reverse {
+                        if sk.secret_bytes() < start_bytes {
+                            break 'scan true;
+                        }
+                    } else if sk.secret_bytes() >= end_bytes {
                         break 'scan true;
                     }
                     // ── rotation (random-subrange mode) ───────────────────────
@@ -1144,15 +1210,25 @@ fn puzzle_worker(
                     // the same chunk.
                     if let Some(rot) = rotate_keys {
                         if local_count >= rot {
-                            break 'scan false; // finalize saves current_hex + pending
+                            break 'scan false; // finalize saves the resume position + pending
                         }
                     }
                 }
 
                 // Refresh in-memory resume position (persisted at finalize).
-                let cur = sk.secret_bytes();
+                // 正向记录 current = sk（下一个待扫 key）；反向记录 end = sk + 1
+                // （未扫描区间 [start, sk+1) 的独占上界），current 保持 start 不动。
+                let frontier = if reverse {
+                    hex_encode_key(&crate::gpu::convert::scalar_add_be(&sk.secret_bytes(), 1))
+                } else {
+                    hex_encode_key(&sk.secret_bytes())
+                };
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-                ctx.file.chunks[idx].current_hex = hex_encode_key(&cur);
+                if reverse {
+                    ctx.file.chunks[idx].end_hex = frontier;
+                } else {
+                    ctx.file.chunks[idx].current_hex = frontier;
+                }
                 // Mark dirty so the chunk's position is flushed whenever a save
                 // happens (rotation/finalize, claim, or the final save).
                 ctx.mark_dirty(chunk_id);
@@ -1173,7 +1249,17 @@ fn puzzle_worker(
             } else {
                 // either SIGINT or scalar overflow — preserve progress & re-enable
                 chunk.status = "pending".to_string();
-                chunk.current_hex = hex_encode_key(&sk.secret_bytes());
+                if reverse {
+                    // 反向停车：current 保持 start（区间左端）不动，end 收缩到下一个
+                    // 待扫 key 之后 —— [start, sk+1) 即剩余未扫描部分。`sk` 在 advance
+                    // 后已是下一个待扫 key，故 +1 即独占上界。
+                    chunk.end_hex = hex_encode_key(&crate::gpu::convert::scalar_add_be(
+                        &sk.secret_bytes(),
+                        1,
+                    ));
+                } else {
+                    chunk.current_hex = hex_encode_key(&sk.secret_bytes());
+                }
             }
             // Mark dirty: the next save_dirty flushes just this chunk (plus
             // whatever else is dirty) in one transaction.
@@ -2246,5 +2332,67 @@ mod tests {
 
         // All-zero key degrades to "0" rather than an empty string.
         assert_eq!(abbr_hex(&[0u8; 32]), "0");
+    }
+
+    // ── reverse-step constants ─────────────────────────────────────────────────
+
+    #[test]
+    fn reverse_step_matches_scalar_subtraction() {
+        // The reverse hot step must satisfy the same invariant as the forward
+        // one, mirrored: `sk·G + (-G) == (sk - 1)·G`, stepping via
+        // `add_tweak(n-1)` and `combine(-G)`.
+        let secp = secp256k1::Secp256k1::new();
+        let (neg_one, neg_g) = reverse_step(&secp);
+
+        // A key in the puzzle key space [2^70, 2^160): 2^70 + 0x13.
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes[23] = 0x40; // 2^70 = bit 70 → byte 23, bit 6
+        sk_bytes[31] = 0x13;
+        let sk = secp256k1::SecretKey::from_byte_array(sk_bytes).expect("valid key");
+
+        // Path (a): the reverse hot step — sk·G then combine(-G), tweak (n-1).
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let pk_minus = pk.combine(&neg_g).expect("sk > 1, so pk - G != infinity");
+        let sk_minus = sk.add_tweak(&neg_one).expect("sk > 1, so sk-1 != 0");
+
+        // Path (b): direct scalar multiplication of sk - 1.
+        let ref_pk = secp256k1::PublicKey::from_secret_key(&secp, &sk_minus);
+
+        assert_eq!(pk_minus.serialize(), ref_pk.serialize());
+        assert_eq!(
+            pk_minus.serialize_uncompressed(),
+            ref_pk.serialize_uncompressed()
+        );
+
+        // Sanity: sk - 1 really is 2^70 + 0x12.
+        let mut expect = [0u8; 32];
+        expect[23] = 0x40;
+        expect[31] = 0x12;
+        assert_eq!(sk_minus.secret_bytes(), expect);
+    }
+
+    #[test]
+    fn reverse_step_neg_one_is_curve_order_minus_one() {
+        // n-1 is a valid scalar (in [1, n-1]) and its bytes equal CURVE_ORDER - 1.
+        let secp = secp256k1::Secp256k1::new();
+        let (neg_one, neg_g) = reverse_step(&secp);
+        assert!(neg_one > secp256k1::Scalar::ZERO);
+
+        let n_minus_1: [u8; 32] = {
+            let mut b = secp256k1::constants::CURVE_ORDER;
+            for i in (0..32).rev() {
+                if b[i] > 0 {
+                    b[i] -= 1;
+                    break;
+                }
+                b[i] = 0xFF;
+            }
+            b
+        };
+        assert_eq!(neg_one.to_be_bytes(), n_minus_1);
+
+        // (n-1)·G == -G: must serialize identically to PublicKey::negate(G).
+        let expected = crate::btc::generator_public_key().negate(&secp);
+        assert_eq!(neg_g.serialize(), expected.serialize());
     }
 }
