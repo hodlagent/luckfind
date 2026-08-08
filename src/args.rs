@@ -9,7 +9,7 @@ use clap::Parser;
                   and checks them against a built-in list of dormant addresses."
 )]
 pub struct Cli {
-    /// Runtime duration in minutes (single value or `min~max` range).  Forever if unset.
+    /// Runtime duration in minutes.  Forever if unset.
     #[arg(short = 'd', long)]
     pub duration: Option<f64>,
 

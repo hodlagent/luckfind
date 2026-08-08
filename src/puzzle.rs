@@ -17,8 +17,8 @@
 //! then walk every key `current .. end` by scalar +1 (the same tight `+= 1`
 //! loop used in lottery mode for speed).  When the whole sub-range is done,
 //! the chunk is marked `finished`.  On SIGINT (Ctrl+C) every worker flushes
-//! its current scanning position into the worklist JSON, reverts the chunk
-//! to `"pending"`, and exits — so a later invocation resumes cleanly.
+//! its current scanning position into the SQLite worklist DB, reverts the
+//! chunk to `"pending"`, and exits — so a later invocation resumes cleanly.
 //!
 //! **Random-split strategy.**  The worklist starts with one chunk per
 //! puzzle-range subdivision and grows dynamically: when a worker claims a

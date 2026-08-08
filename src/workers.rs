@@ -30,7 +30,8 @@ pub struct MatchEvent {
     pub chunk_id: Option<u32>,    // puzzle-mode: which worklist chunk this came from (None = lottery)
     pub key_index: u64,
     pub elapsed: f64,
-    /// Which embedded puzzle matched (lottery mode).  None in Full256 mode.
+    /// Which embedded puzzle matched, when the match is tied to a specific
+    /// puzzle number.  None for GPU-mode matches before CPU-side verification.
     pub puzzle_number: Option<u32>,
 }
 
