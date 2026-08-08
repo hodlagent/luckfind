@@ -39,20 +39,26 @@ fn main() {
     // Supports `.db` (SQLite, the runtime format) and `.json` (one-time import;
     // a `.db` sibling is created on first run and used for all future saves).
     if let Some(ref puzzle_path) = cli.puzzle {
-        // 每处理 2^31 个 keys 就停放当前子区间并重新选择（旋转策略）。
-        // `local_count` 每次 claim 重置，所以这是 per-claim 的旋转预算，不是累计的。
+        // 每处理一定数量的 keys 就停放当前子区间并重新选择（旋转策略）。
+        // CPU worker 每 2^26 个 keys 旋转一次（更频繁地跳回工作列表），
+        // GPU worker 保持 2^31 不变 —— 两个预算分别传入，互不影响。
+        // `local_count`/`scanned_keys` 每次 claim 重置，所以这是 per-claim 的
+        // 旋转预算，不是累计的。
         // 旋转后 worker 回到 claim_random_chunk，按随机性策略重新选子区间：
         //   - 子区间数 < 1024×1024：随机选一个 pending 区间，拆分为 [x,d] 和 [d,y]，
         //     保存到数据库，选择 [d,y] 开始计算。
         //   - 子区间数 ≥ 1024×1024：从 pending 中随机选择一个直接计算。
-        // 子区间宽度 ≤ 2^31 时一次完成（scan_budget 精确终止），不触发旋转。
-        // 2^31 keys per claim ≈ 2.15×10^9。
-        let rotate_keys = Some(1u64 << 31);
+        // 子区间宽度 ≤ CPU 的 ROTATION_BUDGET(2^26) 时一次完成（scan_budget
+        // 精确终止），不触发旋转；更宽的区间在每 claim 满 rotate_keys 后停车。
+        // CPU: 2^26 ≈ 6.7×10^7 keys per claim；GPU: 2^31 ≈ 2.15×10^9。
+        let rotate_keys = Some(1u64 << 26); // CPU
+        let gpu_rotate_keys = Some(1u64 << 31); // GPU 保持不变
         let (stats, _matches) = puzzle::run(
             Path::new(puzzle_path),
             cli.workers(),
             cli.heartbeat,
             rotate_keys,
+            gpu_rotate_keys,
             Some(Path::new(&cli.output_dir)),
         );
         // progress 由 puzzle::run 打印；aman_<TS>.txt 已在 run() 内落盘（先于 sqlite）。

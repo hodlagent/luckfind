@@ -35,9 +35,10 @@
 //! `d ∈ (x, y)`, scans the upper half `[d, y)`, and parks the lower half
 //! `[x, d)` as a fresh pending chunk with a new id.  Once the cap is reached
 //! workers simply scan the picked chunk directly.  Sub-ranges narrower than
-//! `ROTATION_BUDGET = 2^31` keys are scanned to completion in one claim;
-//! wider ones use the rotation mechanism (park after `2^31` keys, resume
-//! later).  This gives a "jump around the key space" scan with the same
+//! `ROTATION_BUDGET = 2^26` keys are scanned to completion in one claim;
+//! wider ones use the rotation mechanism (park after the per-claim
+//! `rotate_keys` budget — `2^26` on CPU, `2^31` on GPU — and resume later).
+//! This gives a "jump around the key space" scan with the same
 //! zero-dedup guarantee as a sequential sweep.
 //!
 //! Bytes saved per chunk:
@@ -71,10 +72,14 @@ use crate::workers::{fmt_comma, MatchEvent};
 /// scan the picked sub-range (with rotation if it exceeds the per-claim budget).
 const MAX_CHUNKS: usize = 1024 * 1024;
 
-/// Per-claim scan budget.  Sub-ranges narrower than this are scanned to
-/// completion in one claim; wider ones are parked after this many keys and
-/// resumed later (the existing "rotation" mechanism).
-const ROTATION_BUDGET: u64 = 1u64 << 31;
+/// Per-claim scan budget (CPU workers).  Sub-ranges narrower than this are
+/// scanned to completion in one claim; wider ones are parked after the CPU
+/// `rotate_keys` budget and resumed later (the "rotation" mechanism).
+///
+/// This is the CPU-side boundary only.  The GPU worker scans with its own
+/// rotation budget (see `gpu_rotate_keys` in `run`) and never calls
+/// `scan_budget`, so this can be tuned independently of the GPU cadence.
+const ROTATION_BUDGET: u64 = 1u64 << 26;
 
 // ── terminal output coordination ─────────────────────────────────────────────
 // The heartbeat rewrites a single status line in place with `\r` (no trailing
@@ -582,17 +587,20 @@ fn save_dirty(ctx: &mut PuzzleCtx) -> Result<(), String> {
 
 /// Run the puzzle loop.  Returns total keys checked and any match events.
 ///
-/// `rotate_keys` enables *random-rotation* mode: each claim scans at most this
-/// many keys before the chunk is parked (status ← "pending", `current_hex`
-/// saved) and the worker moves on to a fresh random pending chunk.  `None`
-/// preserves classic behaviour — a chunk is scanned to completion per claim.
-/// When set, `n_workers` slots each churn through random chunks, giving a
-/// "jump around the worklist" effect instead of sweeping it in order.
+/// `rotate_keys` enables *random-rotation* mode for the CPU workers: each claim
+/// scans at most this many keys before the chunk is parked (status ←
+/// "pending", `current_hex` saved) and the worker moves on to a fresh random
+/// pending chunk.  `gpu_rotate_keys` is the same per-claim budget for the
+/// (single) GPU worker, so the two backends can rotate at different cadences.
+/// `None` preserves classic behaviour — a chunk is scanned to completion per
+/// claim.  When set, `n_workers` slots each churn through random chunks, giving
+/// a "jump around the worklist" effect instead of sweeping it in order.
 pub fn run(
     path: &Path,
     n_workers: usize,
     heartbeat_secs: f64,
     rotate_keys: Option<u64>,
+    gpu_rotate_keys: Option<u64>,
     output_dir: Option<&Path>,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
@@ -809,7 +817,7 @@ pub fn run(
             &gpu_stop,
             &gpu_hit,
             start,
-            rotate_keys,
+            gpu_rotate_keys,
         )
     });
 
@@ -1163,7 +1171,8 @@ fn puzzle_worker(
             }
 
             // ── NEW: exact-termination for small chunks (every iteration) ─
-            // For budgeted chunks (width ≤ 2^31) this is the *only* termination
+            // For budgeted chunks (width ≤ ROTATION_BUDGET) this is the *only*
+            // termination
             // that matters and it prevents overshoot past end_bytes between the
             // 2048-cadence checks (a sub-2048-key chunk would otherwise run the
             // hot path 2048 times before the first boundary check).
@@ -1979,17 +1988,19 @@ mod tests {
 
     #[test]
     fn test_scan_budget_small() {
-        // [0, 2^31) → Some(2^31)
+        // [0, 2^26) → Some(2^26)
         let start = [0u8; 32];
-        let end = parse_hex_key("80000000"); // 2^31
-        assert_eq!(scan_budget(&start, &end), Some(1u64 << 31));
+        let end = parse_hex_key("4000000"); // 2^26
+        assert_eq!(scan_budget(&start, &end), Some(1u64 << 26));
     }
 
     #[test]
     fn test_scan_budget_at_boundary() {
-        // [0, 2^31 + 1) → None (exceeds budget)
+        // [0, 2^26) → Some(2^26); [0, 2^26 + 1) → None (exceeds budget)
         let start = [0u8; 32];
-        let end = parse_hex_key("80000001"); // 2^31 + 1
+        let end = parse_hex_key("4000000"); // 2^26
+        assert_eq!(scan_budget(&start, &end), Some(1u64 << 26));
+        let end = parse_hex_key("4000001"); // 2^26 + 1
         assert_eq!(scan_budget(&start, &end), None);
     }
 
@@ -2003,9 +2014,9 @@ mod tests {
 
     #[test]
     fn test_scan_budget_wide_high_bytes_differ() {
-        // High bytes differ → width ≥ 2^64 > 2^31 → None
+        // High bytes differ → width ≥ 2^64 > ROTATION_BUDGET → None
         let start = [0u8; 32];
-        // 2^248: byte[0] = 0x01, rest zero → far exceeds 2^31
+        // 2^248: byte[0] = 0x01, rest zero → far exceeds ROTATION_BUDGET
         let end = parse_hex_key("0100000000000000000000000000000000000000000000000000000000000000");
         assert_eq!(scan_budget(&start, &end), None);
     }
