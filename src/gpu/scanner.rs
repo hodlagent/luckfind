@@ -367,6 +367,7 @@ impl GpuScanner {
 /// Output of a GPU-reported match.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[cfg_attr(feature = "cuda", derive(cust_derive::DeviceCopy))]
 pub struct GpuMatchOutput {
     pub scalar: [u32; 8],
     pub pubkey_x: [u32; 8],

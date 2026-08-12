@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::framework::GpuFramework;
 use crate::puzzles::PuzzleSet;
 use crate::progress::Progress;
 
@@ -40,6 +41,7 @@ pub fn run(
     target: ScanTarget,
     limits: RuntimeLimits,
     gpu: bool,
+    framework: GpuFramework,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // GPU worker counts as an extra "worker" for the heartbeat's alive counter
     // when enabled.
@@ -95,17 +97,46 @@ pub fn run(
         let gpu_deadline = deadline;
         let gpu_start = start;
         let ps = *ps; // &'static — copy the reference into the closure.
-        Some(thread::spawn(move || {
-            crate::gpu::lottery::worker(
-                ps,
-                gpu_progress,
-                gpu_matches,
-                gpu_stop,
-                gpu_hit,
-                gpu_deadline,
-                gpu_start,
-            );
-        }))
+        match framework {
+            GpuFramework::WebGpu => {
+                Some(thread::spawn(move || {
+                    crate::gpu::lottery::worker(
+                        ps,
+                        gpu_progress,
+                        gpu_matches,
+                        gpu_stop,
+                        gpu_hit,
+                        gpu_deadline,
+                        gpu_start,
+                    );
+                }))
+            }
+            GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    Some(thread::spawn(move || {
+                        crate::cuda::lottery::worker(
+                            ps,
+                            gpu_progress,
+                            gpu_matches,
+                            gpu_stop,
+                            gpu_hit,
+                            gpu_deadline,
+                            gpu_start,
+                        );
+                    }))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    eprintln!("  [GPU] CUDA feature not compiled -- falling back to CPU-only.");
+                    None
+                }
+            }
+            GpuFramework::Auto => {
+                // Resolved to a concrete backend in main() before we get here.
+                unreachable!("framework Auto must be resolved before workers::run")
+            }
+        }
     } else {
         None
     };

@@ -13,6 +13,9 @@ mod report;
 mod workers;
 mod puzzle;
 mod gpu;
+mod framework;
+#[cfg(feature = "cuda")]
+mod cuda;
 // heartbeat logic lives in workers.rs::run (a separate ticker thread).
 
 use std::path::Path;
@@ -33,6 +36,57 @@ fn main() {
     if cli.profile {
         profile();
         return;
+    }
+
+    // ── GPU backend resolution (before the puzzle/--bench branch: puzzle mode
+    //    needs the resolved framework too).  `auto` probes CUDA first — CUDA
+    //    exists because WebGPU's NVIDIA support is limited — then WebGPU.
+    let mut framework = cli.gpu_framework;
+    let gpu_available = match framework {
+        crate::framework::GpuFramework::WebGpu => probe_webgpu(),
+        crate::framework::GpuFramework::Cuda => probe_cuda(),
+        crate::framework::GpuFramework::Auto => {
+            // Platform policy: Windows/Linux prefer CUDA (NVIDIA); macOS goes
+            // straight to WebGPU (Metal) — CUDA does not apply there.
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            {
+                eprintln!("  [GPU] auto: probing backends (CUDA preferred)…");
+                if probe_cuda() {
+                    framework = crate::framework::GpuFramework::Cuda;
+                    true
+                } else if probe_webgpu() {
+                    framework = crate::framework::GpuFramework::WebGpu;
+                    true
+                } else {
+                    // No accelerator found; keep a displayable value, worker
+                    // runs CPU-only (gpu_available = false below).
+                    framework = crate::framework::GpuFramework::WebGpu;
+                    false
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                eprintln!("  [GPU] auto: macOS — selecting WebGPU (Metal)…");
+                if probe_webgpu() {
+                    framework = crate::framework::GpuFramework::WebGpu;
+                    true
+                } else {
+                    framework = crate::framework::GpuFramework::WebGpu;
+                    false
+                }
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+            {
+                framework = crate::framework::GpuFramework::WebGpu;
+                probe_webgpu()
+            }
+        }
+    };
+    if !gpu_available {
+        eprintln!(
+            "  [GPU] No {} device available — running CPU-only.",
+            framework
+        );
     }
 
     // ── puzzle mode: deterministic sub-range scan from a worklist file ────────
@@ -60,6 +114,7 @@ fn main() {
             rotate_keys,
             gpu_rotate_keys,
             Some(Path::new(&cli.output_dir)),
+            framework,
         );
         // progress 由 puzzle::run 打印；aman_<TS>.txt 已在 run() 内落盘（先于 sqlite）。
         let _ = stats;
@@ -78,19 +133,38 @@ fn main() {
         heartbeat_secs: cli.heartbeat,
     };
 
-    // Enable the GPU lottery worker when a GPU device is available.  The worker
-    // falls back to CPU-only internally if device initialization fails, so this
-    // is a best-effort gate — cheap to try, harmless if it fails.
-    let gpu = crate::gpu::GpuContext::new_blocking(0).is_ok();
-    if gpu {
-        eprintln!("  [GPU] device detected — enabling GPU lottery worker.");
-    }
-
-    let (stats, matches) = workers::run(cli.workers(), target, limits, gpu);
+    let (stats, matches) = workers::run(cli.workers(), target, limits, gpu_available, framework);
 
     println!();
     report::final_report(&stats, &matches, &start);
     report::flush_match_files(&matches, Some(Path::new(&cli.output_dir)));
+}
+
+/// Probe CUDA availability (feature-gated: without the `cuda` feature the
+/// backend cannot be used at all).
+fn probe_cuda() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        let ok = crate::cuda::CudaScanner::probe();
+        if ok {
+            eprintln!("  [GPU] CUDA device detected -- enabling GPU lottery worker.");
+        }
+        ok
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        eprintln!("  [GPU] CUDA support not compiled in -- rebuild with --features cuda.");
+        false
+    }
+}
+
+/// Probe WebGPU availability.
+fn probe_webgpu() -> bool {
+    let ok = crate::gpu::GpuContext::new_blocking(0).is_ok();
+    if ok {
+        eprintln!("  [GPU] WebGPU device detected -- enabling GPU lottery worker.");
+    }
+    ok
 }
 
 #[inline(never)]

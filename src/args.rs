@@ -1,5 +1,7 @@
 use clap::Parser;
 
+pub use crate::framework::GpuFramework;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "luckfind",
@@ -64,6 +66,13 @@ pub struct Cli {
     /// 32-byte key (high bytes zero-filled).
     #[arg(long)]
     pub puzzle: Option<String>,
+
+    /// GPU framework to use for acceleration.
+    /// "auto" (default): probe CUDA first (NVIDIA-preferred), then WebGPU,
+    /// then CPU-only.  "webgpu": cross-platform via wgpu (Metal/Vulkan/DX12).
+    /// "cuda": NVIDIA-only, uses CUDA kernels for better utilization.
+    #[arg(long = "gpu_framework", default_value = "auto")]
+    pub gpu_framework: GpuFramework,
 }
 
 impl Cli {

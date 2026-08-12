@@ -602,6 +602,7 @@ pub fn run(
     rotate_keys: Option<u64>,
     gpu_rotate_keys: Option<u64>,
     output_dir: Option<&Path>,
+    framework: crate::framework::GpuFramework,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
     //
@@ -801,24 +802,50 @@ pub fn run(
     // One additional worker that claims whatever pending chunks the CPU workers
     // haven't taken and scans them with the GPU (100k strided walkers, dense
     // zero-overlap tiling, per-dispatch checkpoint).  Falls back to CPU-only if
-    // no Metal device is present.  Rotation is passed through so the GPU worker
-    // participates in the same per-claim park-and-rotate strategy as the CPUs.
+    // the selected backend is unavailable.  Rotation is passed through so the
+    // GPU worker participates in the same per-claim park-and-rotate strategy as
+    // the CPUs.
     let gpu_ctx = ctx.clone();
     let gpu_progress = progress.clone();
     let gpu_matches = matches.clone();
     let gpu_stop = stop_flag.clone();
     let gpu_hit = hit_flag.clone();
     let gpu_handle = std::thread::spawn(move || {
-        gpu_puzzle_worker(
-            target_h160,
-            gpu_ctx,
-            &gpu_progress,
-            &gpu_matches,
-            &gpu_stop,
-            &gpu_hit,
-            start,
-            gpu_rotate_keys,
-        )
+        match framework {
+            crate::framework::GpuFramework::WebGpu => gpu_puzzle_worker(
+                target_h160,
+                gpu_ctx,
+                &gpu_progress,
+                &gpu_matches,
+                &gpu_stop,
+                &gpu_hit,
+                start,
+                gpu_rotate_keys,
+            ),
+            crate::framework::GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    cuda_puzzle_worker(
+                        target_h160,
+                        gpu_ctx,
+                        &gpu_progress,
+                        &gpu_matches,
+                        &gpu_stop,
+                        &gpu_hit,
+                        start,
+                        gpu_rotate_keys,
+                    );
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    term_line("[puzzle] CUDA feature not compiled — running CPU-only.");
+                }
+            }
+            crate::framework::GpuFramework::Auto => {
+                // Resolved to a concrete backend in main() before we get here.
+                unreachable!("framework Auto must be resolved before puzzle::run")
+            }
+        }
     });
 
     // ── 4. heartbeat ticker: status line only (no periodic DB save) ──────────
@@ -1377,15 +1404,44 @@ fn gpu_match_to_event(
     }
 }
 
-/// One GPU worker thread.  Claims pending chunks from the shared worklist and
-/// dense-tiles each `[start, end)` with 100k strided walkers.  Per dispatch it
-/// covers `N × steps_per_call` keys with no overlap, advancing the checkpoint.
+/// Minimal backend interface the puzzle GPU scan loop needs.  Implemented by
+/// both `GpuScanner` (WebGPU) and `CudaScanner` so the chunk-claim / dispatch /
+/// finalize loop is shared instead of duplicated per backend.
+trait PuzzleScannerBackend {
+    fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()>;
+    fn step(&mut self) -> anyhow::Result<Vec<crate::gpu::GpuMatchOutput>>;
+    fn steps_per_call(&mut self) -> &mut u32;
+}
+
+impl PuzzleScannerBackend for crate::gpu::GpuScanner {
+    fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()> {
+        crate::gpu::GpuScanner::seed_range(self, start_be)
+    }
+    fn step(&mut self) -> anyhow::Result<Vec<crate::gpu::GpuMatchOutput>> {
+        crate::gpu::GpuScanner::step(self)
+    }
+    fn steps_per_call(&mut self) -> &mut u32 {
+        &mut self.steps_per_call
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PuzzleScannerBackend for crate::cuda::CudaScanner {
+    fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()> {
+        crate::cuda::CudaScanner::seed_range(self, start_be)
+    }
+    fn step(&mut self) -> anyhow::Result<Vec<crate::gpu::GpuMatchOutput>> {
+        crate::cuda::CudaScanner::step(self)
+    }
+    fn steps_per_call(&mut self) -> &mut u32 {
+        &mut self.steps_per_call
+    }
+}
+
+/// One WebGPU puzzle worker thread.  Claims pending chunks from the shared
+/// worklist and dense-tiles each `[start, end)` with 100k strided walkers.
 /// Runs alongside the CPU workers — all of them pull from the same pending
 /// queue, so CPU and GPU share the load without double-scanning.
-///
-/// When `rotate_keys` is `Some(n)`, the chunk is parked after `n` keys scanned
-/// this claim and a fresh random pending chunk is claimed, mirroring the CPU
-/// worker's per-claim rotation budget.
 #[allow(clippy::too_many_arguments)]
 fn gpu_puzzle_worker(
     target_h160: [u8; 20],
@@ -1397,10 +1453,6 @@ fn gpu_puzzle_worker(
     start: Instant,
     rotate_keys: Option<u64>,
 ) {
-    // Puzzle number is constant for this worker's lifetime — capture once
-    // (mirrors the CPU worker) so the [HIT] line can label it.
-    let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
-
     // Set up GPU.  If no GPU device is available (CI, headless) we log and
     // fall back to CPU-only — never block the whole run on a missing GPU.
     let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
@@ -1426,6 +1478,93 @@ fn gpu_puzzle_worker(
     scanner.stride = crate::gpu::NUM_GPU_THREADS;
     scanner.num_candidates = 1;
 
+    puzzle_gpu_scan_loop(
+        target_h160,
+        scanner,
+        &ctx,
+        progress,
+        matches,
+        stop_flag,
+        hit_flag,
+        start,
+        rotate_keys,
+        "GPU",
+    );
+}
+
+/// One CUDA puzzle worker thread — same dense-tiling scan as `gpu_puzzle_worker`
+/// but on the CUDA backend.  Falls back to CPU-only when CUDA is unavailable
+/// (no device, or the kernel was not compiled — see `CudaScanner::probe`).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+fn cuda_puzzle_worker(
+    target_h160: [u8; 20],
+    ctx: Arc<Mutex<PuzzleCtx>>,
+    progress: &Progress,
+    matches: &Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
+    start: Instant,
+    rotate_keys: Option<u64>,
+) {
+    if !crate::cuda::CudaScanner::probe() {
+        term_line("[puzzle] CUDA unavailable — running CPU-only.");
+        return;
+    }
+    let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
+    let mut scanner = match crate::cuda::CudaScanner::new(&candidates) {
+        Ok(s) => s,
+        Err(e) => {
+            term_line(&format!("[puzzle] CudaScanner::new failed ({e}) — running CPU-only."));
+            return;
+        }
+    };
+    term_line(&format!(
+        "[puzzle] CUDA worker up on {}",
+        scanner.device_name()
+    ));
+    // Dense-tiling config: stride = N threads, single target candidate.
+    scanner.stride = crate::gpu::NUM_GPU_THREADS;
+    scanner.num_candidates = 1;
+
+    puzzle_gpu_scan_loop(
+        target_h160,
+        scanner,
+        &ctx,
+        progress,
+        matches,
+        stop_flag,
+        hit_flag,
+        start,
+        rotate_keys,
+        "CUDA",
+    );
+}
+
+/// Shared GPU scan loop (backend-agnostic): claim a pending chunk, dense-tile
+/// it with 100k strided walkers, checkpoint per dispatch, park-and-rotate on
+/// `rotate_keys`.  `backend_label` names the worker in log/[HIT] lines.
+///
+/// When `rotate_keys` is `Some(n)`, the chunk is parked after `n` keys scanned
+/// this claim and a fresh random pending chunk is claimed, mirroring the CPU
+/// worker's per-claim rotation budget.
+#[allow(clippy::too_many_arguments)]
+fn puzzle_gpu_scan_loop<S: PuzzleScannerBackend>(
+    target_h160: [u8; 20],
+    mut scanner: S,
+    ctx: &Arc<Mutex<PuzzleCtx>>,
+    progress: &Progress,
+    matches: &Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
+    start: Instant,
+    rotate_keys: Option<u64>,
+    backend_label: &str,
+) {
+    // Puzzle number is constant for this worker's lifetime — capture once
+    // (mirrors the CPU worker) so the [HIT] line can label it.
+    let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
+
     // Rotation budget for this worker.  `Some(n)` parks the current chunk after
     // `n` keys scanned *this claim* (mirrors the CPU worker's `local_count`) and
     // moves on to a fresh random pending chunk; `None` scans to completion.
@@ -1434,7 +1573,7 @@ fn gpu_puzzle_worker(
 
     // Per-dispatch coverage (keys).  Constant once calibrated.
     let dispatch_keys = crate::gpu::NUM_GPU_THREADS as u64
-        * scanner.steps_per_call as u64;
+        * *scanner.steps_per_call() as u64;
 
     loop {
         // ── claim a pending chunk ────────────────────────────────────────────
@@ -1450,7 +1589,7 @@ fn gpu_puzzle_worker(
         // Append a log line each time a fresh sub-range is claimed, mirroring
         // the CPU workers (heartbeat status keeps rewriting its own line).
         term_line(&format!(
-            "[claim] w=GPU chunk={} range={}..{}",
+            "[claim] w={backend_label} chunk={} range={}..{}",
             chunk.chunk_id,
             abbr_hex(&chunk.start),
             abbr_hex(&chunk.end),
@@ -1458,7 +1597,9 @@ fn gpu_puzzle_worker(
 
         // Seed walkers at `start + i` so they tile [start, start+N) with stride N.
         if scanner.seed_range(chunk.start).is_err() {
-            term_line("[puzzle] GPU seed_range failed — parking chunk");
+            term_line(&format!(
+                "[puzzle] {backend_label} seed_range failed — parking chunk"
+            ));
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
             gpu_finalize_chunk(
                 &mut ctx,
@@ -1492,7 +1633,7 @@ fn gpu_puzzle_worker(
                     let n = crate::gpu::NUM_GPU_THREADS as u64;
                     std::cmp::max(1, (remaining + n - 1) / n) as u32
                 } else {
-                    scanner.steps_per_call
+                    *scanner.steps_per_call()
                 }
             } else {
                 0
@@ -1507,8 +1648,8 @@ fn gpu_puzzle_worker(
             }
             // Temporarily set steps_per_call for this (possibly final, partial)
             // dispatch, restoring the default afterwards.
-            let saved_steps = scanner.steps_per_call;
-            scanner.steps_per_call = steps;
+            let saved_steps = *scanner.steps_per_call();
+            *scanner.steps_per_call() = steps;
             let batch = crate::gpu::NUM_GPU_THREADS as u64 * steps as u64;
             match scanner.step() {
                 Ok(batch_matches) => {
@@ -1543,7 +1684,7 @@ fn gpu_puzzle_worker(
                                 .is_ok()
                             {
                                 term_line(&format!(
-                                    "[HIT] 🎯 puzzle=#{} worker=GPU chunk={} sk_hex={}",
+                                    "[HIT] 🎯 puzzle=#{} worker={backend_label} chunk={} sk_hex={}",
                                     puzzle_number.map_or_else(String::new, |n| n.to_string()),
                                     chunk.chunk_id,
                                     hex::encode(first.private_key),
@@ -1555,12 +1696,14 @@ fn gpu_puzzle_worker(
                     progress.increment(batch);
                 }
                 Err(e) => {
-                    term_line(&format!("[puzzle] GPU step failed ({e}) — parking chunk"));
+                    term_line(&format!(
+                        "[puzzle] {backend_label} step failed ({e}) — parking chunk"
+                    ));
                     parked = true;
                     break;
                 }
             }
-            scanner.steps_per_call = saved_steps;
+            *scanner.steps_per_call() = saved_steps;
 
             // Advance checkpoint by exactly the keys this dispatch covered.
             current = crate::gpu::convert::scalar_add_be(&current, batch);

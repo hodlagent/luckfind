@@ -29,6 +29,7 @@ pub const NUM_GPU_THREADS: u32 = 100_000;
 /// Matches the WGSL `Config` layout exactly. 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[cfg_attr(feature = "cuda", derive(cust_derive::DeviceCopy))]
 pub struct GpuConfig {
     pub num_threads: u32,
     pub steps_per_call: u32,
@@ -42,6 +43,7 @@ pub struct GpuConfig {
 /// Uploaded from Rust to avoid hand-transcribing secp256k1 constants into WGSL.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[cfg_attr(feature = "cuda", derive(cust_derive::DeviceCopy))]
 pub struct GeneratorPoint {
     pub gx: [u32; 8],
     pub gy: [u32; 8],
@@ -50,6 +52,7 @@ pub struct GeneratorPoint {
 /// 192 bytes — matches WGSL `GpuState` (3× Jacobian + scalar + step point).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[cfg_attr(feature = "cuda", derive(cust_derive::DeviceCopy))]
 pub struct GpuState {
     pub x: [u32; 8],
     pub y: [u32; 8],
