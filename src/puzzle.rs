@@ -31,13 +31,13 @@
 //! **Random-split strategy.**  The worklist starts with one chunk per
 //! puzzle-range subdivision and grows dynamically: when a worker claims a
 //! pending chunk `[x, y)` and the worklist is below the cap
-//! (`MAX_CHUNKS = 1024 × 1024`), it splits the chunk at a random point
+//! (`MAX_CHUNKS = 2^24 = 4096 × 4096`), it splits the chunk at a random point
 //! `d ∈ (x, y)`, scans the upper half `[d, y)`, and parks the lower half
 //! `[x, d)` as a fresh pending chunk with a new id.  Once the cap is reached
 //! workers simply scan the picked chunk directly.  Sub-ranges narrower than
-//! `ROTATION_BUDGET = 2^26` keys are scanned to completion in one claim;
+//! `ROTATION_BUDGET = 2^27` keys are scanned to completion in one claim;
 //! wider ones use the rotation mechanism (park after the per-claim
-//! `rotate_keys` budget — `2^26` on CPU, `2^31` on GPU — and resume later).
+//! `rotate_keys` budget — `2^27` on CPU, `2^31` on GPU — and resume later).
 //! This gives a "jump around the key space" scan with the same
 //! zero-dedup guarantee as a sequential sweep.
 //!
@@ -68,9 +68,10 @@ use crate::progress::Progress;
 use crate::workers::{fmt_comma, MatchEvent};
 
 /// Maximum number of sub-ranges the worklist may grow to via splitting.
-/// 1024 × 1024 = 1_048_576.  Once reached, workers stop splitting and just
-/// scan the picked sub-range (with rotation if it exceeds the per-claim budget).
-const MAX_CHUNKS: usize = 1024 * 1024;
+/// 2^24 = 16_777_216 = 4096 × 4096.  Once reached, workers stop splitting and
+/// just scan the picked sub-range (with rotation if it exceeds the per-claim
+/// budget).
+const MAX_CHUNKS: usize = 1 << 24;
 
 /// Per-claim scan budget (CPU workers).  Sub-ranges narrower than this are
 /// scanned to completion in one claim; wider ones are parked after the CPU
@@ -79,7 +80,7 @@ const MAX_CHUNKS: usize = 1024 * 1024;
 /// This is the CPU-side boundary only.  The GPU worker scans with its own
 /// rotation budget (see `gpu_rotate_keys` in `run`) and never calls
 /// `scan_budget`, so this can be tuned independently of the GPU cadence.
-const ROTATION_BUDGET: u64 = 1u64 << 26;
+const ROTATION_BUDGET: u64 = 1u64 << 27;
 
 // ── terminal output coordination ─────────────────────────────────────────────
 // The heartbeat rewrites a single status line in place with `\r` (no trailing
@@ -182,7 +183,7 @@ fn u32_is_zero(v: &u32) -> bool {
 /// `dirty` tracks chunk IDs whose in-memory state has changed since the last
 /// save and need to be flushed to the DB.  This lets us UPDATE/INSERT only the
 /// handful of chunks that actually changed (on claim, split, park, finalize)
-/// instead of rewriting the entire 1M-row table on every save.
+/// instead of rewriting the entire worklist table on every save.
 #[derive(Debug)]
 struct PuzzleCtx {
     file: PuzzleFile,
@@ -522,7 +523,7 @@ fn save_to_db(path: &Path, file: &PuzzleFile) -> Result<(), String> {
 /// so a crash mid-write cannot corrupt the DB.  Clears `dirty` on success.
 ///
 /// This is the hot-path save: a claim touches 1-2 chunks, a rotation touches 1,
-/// a Ctrl+C finalizes ≤ n_workers.  Even at the 1M-chunk cap we write O(1)
+/// a Ctrl+C finalizes ≤ n_workers.  Even at the 16M-chunk cap we write O(1)
 /// rows instead of O(N).
 fn save_dirty(ctx: &mut PuzzleCtx) -> Result<(), String> {
     if ctx.dirty.is_empty() {
@@ -2131,19 +2132,19 @@ mod tests {
 
     #[test]
     fn test_scan_budget_small() {
-        // [0, 2^26) → Some(2^26)
+        // [0, 2^27) → Some(2^27)
         let start = [0u8; 32];
-        let end = parse_hex_key("4000000"); // 2^26
-        assert_eq!(scan_budget(&start, &end), Some(1u64 << 26));
+        let end = parse_hex_key("8000000"); // 2^27
+        assert_eq!(scan_budget(&start, &end), Some(1u64 << 27));
     }
 
     #[test]
     fn test_scan_budget_at_boundary() {
-        // [0, 2^26) → Some(2^26); [0, 2^26 + 1) → None (exceeds budget)
+        // [0, 2^27) → Some(2^27); [0, 2^27 + 1) → None (exceeds budget)
         let start = [0u8; 32];
-        let end = parse_hex_key("4000000"); // 2^26
-        assert_eq!(scan_budget(&start, &end), Some(1u64 << 26));
-        let end = parse_hex_key("4000001"); // 2^26 + 1
+        let end = parse_hex_key("8000000"); // 2^27
+        assert_eq!(scan_budget(&start, &end), Some(1u64 << 27));
+        let end = parse_hex_key("8000001"); // 2^27 + 1
         assert_eq!(scan_budget(&start, &end), None);
     }
 
