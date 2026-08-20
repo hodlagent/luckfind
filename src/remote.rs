@@ -154,11 +154,15 @@ impl HubClient {
         worker_id: &str,
         current_hex: Option<String>,
         end_hex: Option<String>,
+        keys: Option<u64>,
+        rate: Option<f64>,
     ) -> Result<(), ureq::Error> {
         let body = ChunkUpdateBody {
             worker_id: worker_id.to_string(),
             current_hex,
             end_hex,
+            keys,
+            rate,
         };
         let _ = self
             .agent
@@ -186,6 +190,8 @@ impl HubClient {
             worker_id: worker_id.to_string(),
             current_hex,
             end_hex,
+            keys: None,
+            rate: None,
         };
         let _ = self
             .agent
@@ -195,9 +201,10 @@ impl HubClient {
     }
 }
 
-/// `{worker_id, current_hex?, end_hex?}` — only present fields are sent (the
-/// hub's Pydantic model accepts either, `end_hex` being the new reverse-park
-/// field; older hubs simply ignore the unknown key).
+/// `{worker_id, current_hex?, end_hex?, keys?, rate?}` — only present fields are
+/// sent (the hub's Pydantic model accepts either, `end_hex` being the new
+/// reverse-park field; `keys`/`rate` are transient metrics the hub caches in
+/// memory, and older hubs simply ignore the unknown keys).
 #[derive(serde::Serialize)]
 struct ChunkUpdateBody {
     worker_id: String,
@@ -205,6 +212,10 @@ struct ChunkUpdateBody {
     current_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     end_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate: Option<f64>,
 }
 
 // ── entry point ──────────────────────────────────────────────────────────────
@@ -574,6 +585,10 @@ fn remote_worker(
         // chunk to pending at the last successful heartbeat.
         let mut lease_lost = false;
         let mut last_hb = Instant::now();
+        // Worker-wide cumulative keys at the last heartbeat — the delta over
+        // the heartbeat window is the rate broadcast to the hub (same source
+        // as the status line's `rate=/s`).
+        let mut last_keys = progress.checked.load(Ordering::Relaxed);
         // Set by the heartbeat closure when the hub reports the lease lost
         // (404/409); scan_chunk checks it on its next 2048-cadence stop and
         // abandons the rest of this claim instead of scanning to the rotation
@@ -602,8 +617,20 @@ fn remote_worker(
                     ScanDir::Forward => (Some(hex_encode_key(&pos.current)), None),
                     ScanDir::Reverse => (None, Some(hex_encode_key(&pos.end))),
                 };
-                match client.heartbeat(chunk_id, worker_id, cur, end) {
-                    Ok(()) => last_hb = Instant::now(),
+                // Broadcast the worker-wide cumulative keys and the rate over
+                // this heartbeat window; the hub keeps them in memory only.
+                let keys = progress.checked.load(Ordering::Relaxed);
+                let dt = last_hb.elapsed().as_secs_f64();
+                let rate = if dt > 0.1 {
+                    (keys - last_keys) as f64 / dt
+                } else {
+                    0.0
+                };
+                match client.heartbeat(chunk_id, worker_id, cur, end, Some(keys), Some(rate)) {
+                    Ok(()) => {
+                        last_hb = Instant::now();
+                        last_keys = keys;
+                    }
                     Err(e) => {
                         if is_lease_lost(&e) {
                             lease_lost = true;
