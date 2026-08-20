@@ -39,26 +39,10 @@ fn main() {
         return;
     }
 
-    // ── remote mode: claim chunks over HTTP from a LAN hub (lan-hub) ────────
-    // CPU-only in this iteration (the shared scan core is reused; GPU remote
-    // claiming is future work), so no GPU probe is needed.  `--puzzle` and
-    // `--remote` are mutually exclusive (clap conflicts_with).
-    if let Some(ref remote_url) = cli.remote {
-        let (stats, _matches) = remote::run(
-            remote_url,
-            cli.worker_id(),
-            cli.workers(),
-            cli.heartbeat,
-            Some(Path::new(&cli.output_dir)),
-        );
-        // progress 由 remote::run 打印；aman_<TS>.txt 已在 run() 内落盘。
-        let _ = stats;
-        return;
-    }
-
-    // ── GPU backend resolution (before the puzzle/--bench branch: puzzle mode
-    //    needs the resolved framework too).  `auto` probes CUDA first — CUDA
-    //    exists because WebGPU's NVIDIA support is limited — then WebGPU.
+    // ── GPU backend resolution (before the remote/puzzle/--bench branches:
+    //    remote and puzzle mode both need the resolved framework too).  `auto`
+    //    probes CUDA first — CUDA exists because WebGPU's NVIDIA support is
+    //    limited — then WebGPU.
     let mut framework = cli.gpu_framework;
     let gpu_available = match framework {
         crate::framework::GpuFramework::WebGpu => probe_webgpu(),
@@ -105,6 +89,26 @@ fn main() {
             "  [GPU] No {} device available — running CPU-only.",
             framework
         );
+    }
+
+    // ── remote mode: claim chunks over HTTP from a LAN hub (lan-hub) ────────
+    // `--puzzle` and `--remote` are mutually exclusive (clap conflicts_with).
+    // The hub holds the SQLite worklist and is the single writer; workers claim
+    // chunks over HTTP.  When a GPU device was resolved above, a dedicated GPU
+    // worker thread claims + dense-tiles chunks alongside the CPU workers.
+    if let Some(ref remote_url) = cli.remote {
+        let (stats, _matches) = remote::run(
+            remote_url,
+            cli.worker_id(),
+            cli.workers(),
+            cli.heartbeat,
+            Some(Path::new(&cli.output_dir)),
+            framework,
+            gpu_available,
+        );
+        // progress 由 remote::run 打印；aman_<TS>.txt 已在 run() 内落盘。
+        let _ = stats;
+        return;
     }
 
     // ── puzzle mode: deterministic sub-range scan from a worklist file ────────

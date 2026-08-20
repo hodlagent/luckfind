@@ -491,6 +491,44 @@ __device__ void sha256_33bytes(const u32 data[9], u32 out[8]) {
     for (int i = 0; i < 8; i++) out[i] = state[i];
 }
 
+// One 64-byte SHA-256 message block, updating `state` in place.  Used by
+// sha256_65bytes (which processes two blocks); sha256_33bytes above keeps its
+// own inlined copy so the proven single-block path is untouched.
+__device__ void sha256_block(u32 state[8], const u32 block[16]) {
+    u32 w[64];
+    for (int i = 0; i < 16; i++) w[i] = block[i];
+    for (int i = 16; i < 64; i++) {
+        w[i] = gamma1(w[i - 2]) + w[i - 7] + gamma0(w[i - 15]) + w[i - 16];
+    }
+    u32 a = state[0], b = state[1], c = state[2], d = state[3];
+    u32 e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 64; i++) {
+        u32 t1 = h + sigma1(e) + ch(e, f, g) + K[i] + w[i];
+        u32 t2 = sigma0(a) + maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+// SHA-256 of a 65-byte uncompressed pubkey (0x04||X||Y).  Mirrors the WGSL
+// sha256_65bytes: block 1 = the first 64 bytes, block 2 = the final byte +
+// padding + length (65 * 8 = 520 bits).
+__device__ void sha256_65bytes(const u32 data[17], u32 out[8]) {
+    u32 state[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                    0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    u32 block1[16];
+    for (int i = 0; i < 16; i++) block1[i] = data[i];
+    sha256_block(state, block1);
+    u32 block2[16];
+    block2[0] = (data[16] & 0xFF000000u) | 0x00800000u;
+    for (int i = 1; i < 15; i++) block2[i] = 0;
+    block2[15] = 520u;  // 65 * 8 bits
+    sha256_block(state, block2);
+    for (int i = 0; i < 8; i++) out[i] = state[i];
+}
+
 // =============================================================================
 // RIPEMD-160 (for 32-byte SHA-256 output -> hash160)
 // =============================================================================
@@ -610,6 +648,22 @@ __device__ void compressed_pubkey_to_words(u32 prefix, const u32 x_be[8], u32 ou
         out[i] = ((x_be[i - 1] & 0xFFu) << 24) | (x_be[i] >> 8);
     }
     out[8] = (x_be[7] & 0xFFu) << 24;
+}
+
+// Pack an uncompressed pubkey (0x04||X||Y, 65 bytes) into the 17 big-endian
+// u32 words sha256_65bytes expects — same MSB-first packing as the compressed
+// form: 0x04 in the top byte of out[0], the X/Y seam splits out[8], and the
+// last byte (Y31) sits in the top byte of out[16].
+__device__ void uncompressed_pubkey_to_words(const u32 x_be[8], const u32 y_be[8], u32 out[17]) {
+    out[0] = (0x04u << 24) | (x_be[0] >> 8);
+    for (int i = 1; i < 8; i++) {
+        out[i] = ((x_be[i - 1] & 0xFFu) << 24) | (x_be[i] >> 8);
+    }
+    out[8] = ((x_be[7] & 0xFFu) << 24) | (y_be[0] >> 8);
+    for (int i = 9; i < 16; i++) {
+        out[i] = ((y_be[i - 9] & 0xFFu) << 24) | (y_be[i - 8] >> 8);
+    }
+    out[16] = (y_be[7] & 0xFFu) << 24;
 }
 
 // =============================================================================
@@ -758,8 +812,9 @@ extern "C" __global__ void luckfind_kernel(
         // Actually use y_affine parity
         prefix = (y_affine.v[0] & 1u) == 0 ? 0x02u : 0x03u;
 
-        u32 x_be[8];
+        u32 x_be[8], y_be[8];
         limbs_to_be_words(&x_affine, x_be);
+        limbs_to_be_words(&y_affine, y_be);
         u32 cpk[9];
         compressed_pubkey_to_words(prefix, x_be, cpk);
 
@@ -779,8 +834,13 @@ extern "C" __global__ void luckfind_kernel(
                          ((w >> 8) & 0xFF00u) | ((w >> 24) & 0xFFu);
         }
 
-        // Candidate match
+        // Candidate match — compressed first; if that misses, hash the
+        // uncompressed form (0x04||X||Y, 65B) and try again.  A puzzle address
+        // may have been derived from either serialisation (mirrors the CPU
+        // workers' c-or-u comparison).  matched_uncomp keeps the emitted
+        // hash160 true to whichever serialisation actually hit.
         u32 m = 0xFFFFFFFFu;
+        bool matched_uncomp = false;
         for (u32 i = 0; i < config.num_candidates; i++) {
             if (h160_le[0] == candidates[i * 5 + 0] &&
                 h160_le[1] == candidates[i * 5 + 1] &&
@@ -792,6 +852,33 @@ extern "C" __global__ void luckfind_kernel(
             }
         }
 
+        u32 h160_u_be[5];
+        if (m == 0xFFFFFFFFu) {
+            u32 upk[17];
+            uncompressed_pubkey_to_words(x_be, y_be, upk);
+            u32 sha_u[8];
+            sha256_65bytes(upk, sha_u);
+            ripemd160_32bytes(sha_u, h160_u_be);
+
+            u32 h160_u_le[5];
+            for (int i = 0; i < 5; i++) {
+                u32 w = h160_u_be[i];
+                h160_u_le[i] = ((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) |
+                               ((w >> 8) & 0xFF00u) | ((w >> 24) & 0xFFu);
+            }
+            for (u32 i = 0; i < config.num_candidates; i++) {
+                if (h160_u_le[0] == candidates[i * 5 + 0] &&
+                    h160_u_le[1] == candidates[i * 5 + 1] &&
+                    h160_u_le[2] == candidates[i * 5 + 2] &&
+                    h160_u_le[3] == candidates[i * 5 + 3] &&
+                    h160_u_le[4] == candidates[i * 5 + 4]) {
+                    m = i;
+                    matched_uncomp = true;
+                    break;
+                }
+            }
+        }
+
         if (m != 0xFFFFFFFFu) {
             u32 idx = lucky_atomic_inc(match_count);
             if (idx < MAX_MATCHES) {
@@ -799,7 +886,8 @@ extern "C" __global__ void luckfind_kernel(
                 mo.scalar = s.scalar;
                 mo.pubkey_x = x_affine;
                 mo.pubkey_y = y_affine;
-                for (int i = 0; i < 5; i++) mo.hash160[i] = h160_be[i];
+                const u32* hit = matched_uncomp ? h160_u_be : h160_be;
+                for (int i = 0; i < 5; i++) mo.hash160[i] = hit[i];
                 mo.candidate_index = m;
                 mo.thread_id = tid;
                 mo._padding = 0;

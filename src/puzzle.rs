@@ -1522,10 +1522,14 @@ fn gpu_finalize_chunk(ctx: &mut PuzzleCtx, idx: usize, done: bool, current: [u8;
 
 /// Convert a GPU match (`scalar` = winning private key as LE limbs) into the
 /// shared `MatchEvent`.  Re-derives the compressed pubkey on the CPU so the
-/// output mirrors CPU-worker matches.
-fn gpu_match_to_event(
+/// output mirrors CPU-worker matches.  `chunk_id`/`start` identify the claimed
+/// sub-range (local worklist or remote hub chunk); `puzzle_number` is optional
+/// (the hub exposes it via `/api/status`, the local worklist via `meta`).
+pub(crate) fn gpu_match_to_event(
     m: &crate::gpu::GpuMatchOutput,
-    chunk: &GpuChunk,
+    chunk_id: u32,
+    start: [u8; 32],
+    puzzle_number: Option<u32>,
 ) -> MatchEvent {
     let priv_be = crate::gpu::convert::limbs_to_be_bytes(&m.scalar);
     let secp = secp256k1::Secp256k1::new();
@@ -1541,10 +1545,10 @@ fn gpu_match_to_event(
     // defensively — the GPU scalar is reconstructed from LE limbs and may be
     // off by a hair, so a naive subtraction can underflow (panic).  Saturate
     // to 0 rather than crash on what is purely a report field.
-    let key_index = if crate::gpu::convert::be_lt(&priv_be, &chunk.start) {
+    let key_index = if crate::gpu::convert::be_lt(&priv_be, &start) {
         0
     } else {
-        let diff = crate::gpu::convert::scalar_sub_be(&priv_be, &chunk.start);
+        let diff = crate::gpu::convert::scalar_sub_be(&priv_be, &start);
         if diff > i64::MAX as u64 {
             0
         } else {
@@ -1556,17 +1560,19 @@ fn gpu_match_to_event(
         compressed,
         uncompressed,
         worker_id: 0, // GPU worker id — report distinguishes via key origin; kept 0
-        chunk_id: Some(chunk.chunk_id),
+        chunk_id: Some(chunk_id),
         key_index,
         elapsed: 0.0, // filled in by the caller after CPU verification
-        puzzle_number: None,
+        puzzle_number,
     }
 }
 
 /// Minimal backend interface the puzzle GPU scan loop needs.  Implemented by
 /// both `GpuScanner` (WebGPU) and `CudaScanner` so the chunk-claim / dispatch /
-/// finalize loop is shared instead of duplicated per backend.
-trait PuzzleScannerBackend {
+/// finalize loop is shared instead of duplicated per backend.  `pub(crate)`
+/// because the remote worker (`crate::remote`) runs the same dense-tiling loop
+/// against hub chunks.
+pub(crate) trait PuzzleScannerBackend {
     fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()>;
     fn step(&mut self) -> anyhow::Result<Vec<crate::gpu::GpuMatchOutput>>;
     fn steps_per_call(&mut self) -> &mut u32;
@@ -1819,14 +1825,21 @@ fn puzzle_gpu_scan_loop<S: PuzzleScannerBackend>(
                             let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
                             let mut out = Vec::new();
                             for m in &batch_matches {
-                                let mut ev = gpu_match_to_event(m, &chunk);
+                                let mut ev = gpu_match_to_event(
+                                    m,
+                                    chunk.chunk_id,
+                                    chunk.start,
+                                    puzzle_number,
+                                );
                                 // CPU verification — a real puzzle solver never trusts the
                                 // GPU candidate flag alone: re-derive the pubkey, hash160
-                                // it, and confirm it equals the target.  Spurious GPU
-                                // matches (impossible with a 160-bit hash, but defense in
-                                // depth) are dropped here silently.
+                                // it (both serialisations — the GPU shader checks c-or-u,
+                                // matching the CPU worker), and confirm it equals the
+                                // target.  Spurious GPU matches (impossible with a 160-bit
+                                // hash, but defense in depth) are dropped here silently.
                                 let h = btc::hash160(&ev.compressed);
-                                if h == target_h160 {
+                                let h_u = btc::hash160(&ev.uncompressed);
+                                if h == target_h160 || h_u == target_h160 {
                                     ev.elapsed = start.elapsed().as_secs_f64();
                                     g.push(ev.clone());
                                     out.push(ev);

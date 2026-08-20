@@ -72,6 +72,27 @@ fn compressed_pubkey_to_words(prefix: u32, x_be: array<u32, 8>) -> array<u32, 9>
     return out;
 }
 
+// Pack an uncompressed pubkey (1 prefix byte 0x04 + 32 x + 32 y bytes) into
+// the 17 big-endian u32 words that sha256_65bytes expects.  Same MSB-first
+// bitstream packing as the compressed form: 0x04 lands in the top byte of
+// word[0], the X/Y seam splits word[8], and the last data byte (Y31) sits in
+// the top byte of word[16] (sha256_65bytes reads that word for its final byte,
+// then pads).  Needed because a puzzle address may have been derived from
+// either serialisation.
+fn uncompressed_pubkey_to_words(x_be: array<u32, 8>, y_be: array<u32, 8>) -> array<u32, 17> {
+    var out: array<u32, 17>;
+    out[0] = (0x04u << 24u) | (x_be[0] >> 8u);
+    for (var i = 1u; i < 8u; i++) {
+        out[i] = ((x_be[i - 1u] & 0xFFu) << 24u) | (x_be[i] >> 8u);
+    }
+    out[8] = ((x_be[7] & 0xFFu) << 24u) | (y_be[0] >> 8u);
+    for (var i = 9u; i < 16u; i++) {
+        out[i] = ((y_be[i - 9u] & 0xFFu) << 24u) | (y_be[i - 8u] >> 8u);
+    }
+    out[16] = (y_be[7] & 0xFFu) << 24u;
+    return out;
+}
+
 // kangaroo's ripemd160_32bytes returns hash160 packed as big-endian u32 words.
 // The candidate buffer is filled on the CPU with little-endian u32 words
 // (see tests/gpu_batch_inv.rs), so byte-swap each word before comparing.
@@ -229,24 +250,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x_affine = fe_mul(s.x, z2_inv);
         let y_affine = fe_mul(s.y, z3_inv);
 
-        // 4. Serialize compressed pubkey as 9 big-endian u32 words.
+        // 4. Serialize the compressed pubkey as 9 big-endian u32 words.
         var prefix: u32;
         if ((y_affine[0] & 1u) == 0u) { prefix = 0x02u; } else { prefix = 0x03u; }
         let x_be = limbs_to_be_words(x_affine);
+        let y_be = limbs_to_be_words(y_affine);
         let cpk = compressed_pubkey_to_words(prefix, x_be);
 
         // 5-6. SHA256 + RIPEMD160 (hash160) via kangaroo's verified compressors.
+        // Hash BOTH serialisations: the compressed form (33B) and the
+        // uncompressed form (65B, 0x04||X||Y) — a puzzle address may have been
+        // derived from either, mirroring the CPU workers' c-or-u comparison.
         let sha = sha256_33bytes(cpk);
         let h160 = hash160_from_sha256(sha.h);
         // Candidate buffer is little-endian; flip kangaroo's big-endian output.
         let h160_le = hash160_be_to_le(h160);
+        let upk = uncompressed_pubkey_to_words(x_be, y_be);
+        let sha_u = sha256_65bytes(upk);
+        let h160_u = hash160_from_sha256(sha_u.h);
+        let h160_u_le = hash160_be_to_le(h160_u);
 
-        // 7. Candidate match
+        // 7. Candidate match — compressed first; if that misses, try the
+        //    uncompressed hash.  The match record stores whichever hash hit so
+        //    GpuMatchOutput.hash160 reflects the matched serialisation.
         let m = candidate_match(h160_le);
-        if (m != 0xFFFFFFFFu) {
+        var matched = m;
+        var matched_h = h160.h;
+        if (m == 0xFFFFFFFFu) {
+            let m_u = candidate_match(h160_u_le);
+            if (m_u != 0xFFFFFFFFu) {
+                matched = m_u;
+                matched_h = h160_u.h;
+            }
+        }
+        if (matched != 0xFFFFFFFFu) {
             let idx = atomicAdd(&match_count, 1u);
             if (idx < 256u) {
-                matches[idx] = MatchOutput(s.scalar, x_affine, y_affine, h160.h, m, tid, 0u);
+                matches[idx] = MatchOutput(s.scalar, x_affine, y_affine, matched_h, matched, tid, 0u);
             }
         }
 

@@ -30,13 +30,19 @@ use crate::btc;
 use crate::progress::Progress;
 use crate::puzzle::{
     self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, scan_chunk,
-    term_line, term_status, ResumePosition, ScanChunkOptions, ScanDir,
+    term_line, term_status, PuzzleScannerBackend, ResumePosition, ScanChunkOptions, ScanDir,
 };
 use crate::workers::{fmt_comma, MatchEvent};
 
 /// Per-claim rotation budget: park the chunk and re-claim after this many keys,
 /// exactly matching local puzzle mode (`puzzle::ROTATION_BUDGET`).
 const ROTATION_BUDGET: u64 = puzzle::ROTATION_BUDGET;
+
+/// Per-claim rotation budget for the GPU remote worker.  Mirrors the local
+/// puzzle mode's GPU cadence (`gpu_rotate_keys = 2^31` in `main.rs`).  At
+/// ~100 Mkeys/s a claim lasts ~20s, so the release-at-rotation also keeps the
+/// hub's resume position fresher than the 30s heartbeat alone.
+const GPU_ROTATION_BUDGET: u64 = 1u64 << 31;
 
 /// Lease-refresh cadence.  The hub reclaims leases after 120s, so 30s gives a
 /// comfortable margin while keeping LAN traffic negligible.
@@ -226,6 +232,8 @@ pub fn run(
     n_workers: usize,
     heartbeat_secs: f64,
     output_dir: Option<&Path>,
+    framework: crate::framework::GpuFramework,
+    gpu_available: bool,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     let client = Arc::new(HubClient::new(remote_url));
 
@@ -302,7 +310,45 @@ pub fn run(
         )
     });
 
+    // ── 3b. GPU worker thread ────────────────────────────────────────────────
+    // One additional worker that claims pending chunks from the hub and scans
+    // them with the GPU (100k strided walkers, dense zero-overlap tiling,
+    // heartbeats + release-at-rotation for resume).  Runs alongside the CPU
+    // workers, all pulling from the same hub claim pool.  Skipped when main()
+    // resolved no usable GPU device (framework stays as resolved, never Auto).
+    let gpu_handle = if gpu_available {
+        let client = client.clone();
+        let worker_id = worker_id.clone();
+        let progress = progress.clone();
+        let matches = matches.clone();
+        let stop_flag = stop_flag.clone();
+        let hit_flag = hit_flag.clone();
+        Some(std::thread::spawn(move || {
+            remote_gpu_worker_entry(
+                &client,
+                &worker_id,
+                target_h160,
+                puzzle_number,
+                &progress,
+                &matches,
+                &stop_flag,
+                &hit_flag,
+                start,
+                framework,
+            )
+        }))
+    } else {
+        None
+    };
+
     for h in handles {
+        drop(h.join());
+    }
+    // The GPU worker finishes its current claim on its own (or stops promptly
+    // once the hub runs out of chunks / a hit fires), so join it before the
+    // stop_flag below — otherwise the flag would cut it off mid-chunk and leak
+    // the lease.
+    if let Some(h) = gpu_handle {
         drop(h.join());
     }
     // Every worker has returned.  Stop the ticker and wait for it to exit so
@@ -702,6 +748,430 @@ fn remote_worker(
                 ),
             };
             if let Err(e) = client.release(chunk_id, worker_id, cur, end) {
+                if !is_lease_lost(&e) {
+                    term_line(&format!(
+                        "[remote] release failed ({e}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+        }
+
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+// ── GPU remote worker ────────────────────────────────────────────────────────
+
+/// Entry point for the remote GPU worker: resolve the backend, set up the
+/// scanner, and hand off to the shared `remote_gpu_worker` loop.  Returns
+/// (CPU-only) when the selected backend has no usable device — the run simply
+/// continues with the CPU workers, exactly like local puzzle mode's GPU worker.
+#[allow(clippy::too_many_arguments)]
+fn remote_gpu_worker_entry(
+    client: &HubClient,
+    worker_id: &str,
+    target_h160: [u8; 20],
+    puzzle_number: Option<u32>,
+    progress: &Progress,
+    matches: &Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
+    start: Instant,
+    framework: crate::framework::GpuFramework,
+) {
+    match framework {
+        crate::framework::GpuFramework::WebGpu => {
+            let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
+                Ok(c) => c,
+                Err(e) => {
+                    term_line(&format!(
+                        "[remote] GPU unavailable ({e}) — running CPU-only."
+                    ));
+                    return;
+                }
+            };
+            term_line(&format!(
+                "[remote] GPU worker up on {}",
+                gpu_ctx.device_name()
+            ));
+            let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
+            let mut scanner = match crate::gpu::GpuScanner::new(gpu_ctx, &candidates) {
+                Ok(s) => s,
+                Err(e) => {
+                    term_line(&format!(
+                        "[remote] GpuScanner::new failed ({e}) — running CPU-only."
+                    ));
+                    return;
+                }
+            };
+            // Dense-tiling config: stride = N threads, single target candidate.
+            scanner.stride = crate::gpu::NUM_GPU_THREADS;
+            scanner.num_candidates = 1;
+            remote_gpu_worker(
+                client,
+                worker_id,
+                target_h160,
+                puzzle_number,
+                scanner,
+                progress,
+                matches,
+                stop_flag,
+                hit_flag,
+                start,
+                "GPU",
+            );
+        }
+        crate::framework::GpuFramework::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                if !crate::cuda::CudaScanner::probe() {
+                    term_line("[remote] CUDA unavailable — running CPU-only.");
+                    return;
+                }
+                let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
+                let mut scanner = match crate::cuda::CudaScanner::new(&candidates) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        term_line(&format!(
+                            "[remote] CudaScanner::new failed ({e}) — running CPU-only."
+                        ));
+                        return;
+                    }
+                };
+                term_line(&format!(
+                    "[remote] CUDA worker up on {}",
+                    scanner.device_name()
+                ));
+                scanner.stride = crate::gpu::NUM_GPU_THREADS;
+                scanner.num_candidates = 1;
+                remote_gpu_worker(
+                    client,
+                    worker_id,
+                    target_h160,
+                    puzzle_number,
+                    scanner,
+                    progress,
+                    matches,
+                    stop_flag,
+                    hit_flag,
+                    start,
+                    "CUDA",
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                term_line("[remote] CUDA feature not compiled — running CPU-only.");
+            }
+        }
+        crate::framework::GpuFramework::Auto => {
+            // Resolved to a concrete backend in main() before we get here.
+            unreachable!("framework Auto must be resolved before remote::run")
+        }
+    }
+}
+
+/// Claim → GPU dense-tile scan → report loop for one remote GPU worker thread.
+/// Mirrors the local puzzle GPU loop (`puzzle_gpu_scan_loop`) but pulls chunks
+/// from the hub over HTTP and persists progress via throttled heartbeats +
+/// release-at-rotation instead of a local SQLite worklist.
+///
+/// The GPU scans *forward only* (dense tiling seeds walker `i` at `start + i`
+/// with stride N) — unlike the CPU workers' per-claim direction coin-flip.  That
+/// is fine: the hub hands out exclusive chunks, so any traversal order covers
+/// the same key set with no overlap; only the in-order walk differs.
+///
+/// Lease handling mirrors the CPU worker: a 404/409 heartbeat/release means the
+/// hub already reverted the chunk to pending at the last reported position, so
+/// we abandon the claim and re-claim rather than fight over it.
+#[allow(clippy::too_many_arguments)]
+fn remote_gpu_worker<S: PuzzleScannerBackend>(
+    client: &HubClient,
+    worker_id: &str,
+    target_h160: [u8; 20],
+    puzzle_number: Option<u32>,
+    mut scanner: S,
+    progress: &Progress,
+    matches: &Mutex<Vec<MatchEvent>>,
+    stop_flag: &AtomicBool,
+    hit_flag: &AtomicBool,
+    start: Instant,
+    backend_label: &str,
+) {
+    // Per-dispatch coverage (keys) once the scanner is configured.  Constant
+    // once calibrated: `steps_per_call` defaults to 1 at construction.
+    let dispatch_keys = crate::gpu::NUM_GPU_THREADS as u64
+        * *scanner.steps_per_call() as u64;
+
+    // Throttle for claim-failure logging so a hub outage prints once / 30s.
+    let mut last_fail_log = Instant::now();
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // ── claim one chunk ───────────────────────────────────────────────
+        let claimed = match client.claim(worker_id, 1) {
+            Ok(c) => c,
+            Err(e) => {
+                if last_fail_log.elapsed() >= Duration::from_secs(30) {
+                    term_line(&format!("[remote] claim failed ({e}) — retrying …"));
+                    last_fail_log = Instant::now();
+                }
+                std::thread::sleep(CLAIM_IDLE);
+                continue;
+            }
+        };
+        if claimed.granted == 0 || claimed.chunks.is_empty() {
+            // Nothing pending: every chunk is running elsewhere, or the puzzle
+            // is complete.  Check the hub before spinning.
+            if stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            match client.status() {
+                Ok(s) if s.summary.pending + s.summary.running == 0 => return, // all done
+                _ => {}
+            }
+            std::thread::sleep(CLAIM_IDLE);
+            continue;
+        }
+
+        let chunk = &claimed.chunks[0];
+        let chunk_id = chunk.id;
+        let start_bytes = parse_hex_key(&chunk.current_hex);
+        let end_bytes = parse_hex_key(&chunk.end_hex);
+
+        term_line(&format!(
+            "[claim] w={backend_label} chunk={chunk_id} range={}..{}",
+            abbr_hex(&start_bytes),
+            abbr_hex(&end_bytes),
+        ));
+
+        // ── seed the 100k strided walkers at start + i ─────────────────────
+        if scanner.seed_range(start_bytes).is_err() {
+            term_line(&format!(
+                "[remote] {backend_label} seed_range failed — releasing chunk"
+            ));
+            // Park back at the original start so a future claim re-picks it.
+            if let Err(e) = client.release(
+                chunk_id,
+                worker_id,
+                Some(hex_encode_key(&start_bytes)),
+                None,
+            ) {
+                if !is_lease_lost(&e) {
+                    term_line(&format!(
+                        "[remote] release failed ({e}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let mut current = start_bytes; // next key NOT yet covered
+        let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
+        let mut hit = false; // CPU-verified match → this chunk is the winner
+        let mut lease_lost = false;
+        let mut last_hb = Instant::now();
+        // Worker-wide cumulative keys at the last heartbeat — the delta over
+        // the heartbeat window is the rate broadcast to the hub.
+        let mut last_keys = progress.checked.load(Ordering::Relaxed);
+
+        // ── scan the chunk in N·steps_per_call-key dispatches ──────────────
+        loop {
+            // Decide this dispatch's step count.  A full dispatch covers
+            // `dispatch_keys` keys; the final (partial) dispatch is trimmed so
+            // the walkers land on or just past `end`.  The chunk width can
+            // exceed 2^64, so never compute `end - current` directly — compare
+            // `end` against `current + dispatch_keys` (the small add never
+            // overflows) and only subtract once the remainder is known to fit.
+            let steps = if crate::gpu::convert::be_lt(&current, &end_bytes) {
+                let reach = crate::gpu::convert::scalar_add_be(&current, dispatch_keys);
+                // `reach >= end`  ⟺  `end - current <= dispatch_keys` (no overflow).
+                if !crate::gpu::convert::be_lt(&reach, &end_bytes) {
+                    let remaining = crate::gpu::convert::scalar_sub_be(&end_bytes, &current);
+                    let n = crate::gpu::NUM_GPU_THREADS as u64;
+                    std::cmp::max(1, (remaining + n - 1) / n) as u32
+                } else {
+                    *scanner.steps_per_call()
+                }
+            } else {
+                0
+            };
+            if steps == 0 {
+                break; // reached the exclusive end
+            }
+            // 命中即停：别的 worker 命中了，在 dispatch 间隙尽快退出（不再多跑一趟）。
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // ── heartbeat (throttled to HEARTBEAT_INTERVAL) ────────────────
+            // Broadcast the scan position so the hub can resume the chunk if
+            // this worker dies, plus the worker-wide keys + rate.  Forward
+            // scanning always reports `current` (the next key to scan).
+            if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
+                let keys = progress.checked.load(Ordering::Relaxed);
+                let dt = last_hb.elapsed().as_secs_f64();
+                let rate = if dt > 0.1 {
+                    (keys - last_keys) as f64 / dt
+                } else {
+                    0.0
+                };
+                match client.heartbeat(
+                    chunk_id,
+                    worker_id,
+                    Some(hex_encode_key(&current)),
+                    None,
+                    Some(keys),
+                    Some(rate),
+                ) {
+                    Ok(()) => {
+                        last_hb = Instant::now();
+                        last_keys = keys;
+                    }
+                    Err(e) => {
+                        if is_lease_lost(&e) {
+                            // Hub reverted the chunk — abandon this claim.
+                            lease_lost = true;
+                            break;
+                        }
+                        // Transport error: re-arm the throttle so we retry in
+                        // HEARTBEAT_INTERVAL instead of every dispatch.
+                        last_hb = Instant::now();
+                    }
+                }
+            }
+
+            // ── one dispatch ──────────────────────────────────────────────
+            // Temporarily set steps_per_call for this (possibly final, partial)
+            // dispatch, restoring the default afterwards.
+            let saved_steps = *scanner.steps_per_call();
+            *scanner.steps_per_call() = steps;
+            let batch = crate::gpu::NUM_GPU_THREADS as u64 * steps as u64;
+            match scanner.step() {
+                Ok(batch_matches) => {
+                    if !batch_matches.is_empty() {
+                        // Collect CPU-verified matches inside the lock, then
+                        // drop the lock before printing ([HIT] is never emitted
+                        // under it).
+                        let verified: Vec<MatchEvent> = {
+                            let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut out = Vec::new();
+                            for m in &batch_matches {
+                                let mut ev = crate::puzzle::gpu_match_to_event(
+                                    m,
+                                    chunk_id,
+                                    start_bytes,
+                                    puzzle_number,
+                                );
+                                // CPU verification — never trust the GPU
+                                // candidate flag alone; spurious matches are
+                                // dropped silently.  The shader checks both
+                                // serialisations (c-or-u, like the CPU worker),
+                                // so re-verify both here too.
+                                let h = btc::hash160(&ev.compressed);
+                                let h_u = btc::hash160(&ev.uncompressed);
+                                if h == target_h160 || h_u == target_h160 {
+                                    ev.elapsed = start.elapsed().as_secs_f64();
+                                    g.push(ev.clone());
+                                    out.push(ev);
+                                }
+                            }
+                            out
+                        };
+                        if let Some(first) = verified.first() {
+                            hit = true;
+                            // 命中即停：首个命中的 worker 立即打印（含私钥）并通知
+                            // 所有 worker 停止。
+                            if hit_flag
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                            {
+                                term_line(&format!(
+                                    "[HIT] 🎯 puzzle=#{} worker={backend_label} chunk={} sk_hex={}",
+                                    puzzle_number.map_or_else(String::new, |n| n.to_string()),
+                                    chunk_id,
+                                    hex::encode(first.private_key),
+                                ));
+                            }
+                            stop_flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    progress.increment(batch);
+                }
+                Err(e) => {
+                    term_line(&format!(
+                        "[remote] {backend_label} step failed ({e}) — releasing chunk"
+                    ));
+                    break;
+                }
+            }
+            *scanner.steps_per_call() = saved_steps;
+
+            // Advance checkpoint by exactly the keys this dispatch covered.
+            current = crate::gpu::convert::scalar_add_be(&current, batch);
+            scanned_keys += batch;
+
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // ── rotation ──────────────────────────────────────────────────
+            // Park after GPU_ROTATION_BUDGET keys scanned *this claim* and let
+            // the loop claim a fresh pending chunk.  `scanned_keys` resets
+            // every claim, so this is a per-claim budget exactly like the CPU
+            // worker's.  Releasing also keeps the hub's resume position fresher
+            // than the 30s heartbeat would on its own.
+            if scanned_keys >= GPU_ROTATION_BUDGET {
+                break;
+            }
+        }
+
+        // ── report the outcome ────────────────────────────────────────────
+        if lease_lost {
+            continue; // hub already parked our chunk; nothing to finalize
+        }
+
+        if hit {
+            // Win: mark the chunk finished on the hub, then stop (the scan
+            // already set stop_flag + hit_flag for every worker).
+            if let Err(e) = client.done(chunk_id, worker_id) {
+                if !is_lease_lost(&e) {
+                    term_line(&format!(
+                        "[remote] done failed ({e}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+            return;
+        }
+
+        // Fully scanned (current >= end) is `done` regardless of why the loop
+        // stopped (stop flag / GPU error / rotation): parking an empty
+        // `[end, end)` chunk back at the hub would leave it pending forever
+        // instead of finishing it.  A chunk that ends exactly on the rotation
+        // budget boundary lands here via this path.
+        let done = !crate::gpu::convert::be_lt(&current, &end_bytes);
+        if done {
+            // Whole range scanned — finished.
+            if let Err(e) = client.done(chunk_id, worker_id) {
+                if !is_lease_lost(&e) {
+                    term_line(&format!(
+                        "[remote] done failed ({e}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+        } else {
+            // Parked (rotation budget, SIGINT, or GPU error): send the resume
+            // position.  Forward scanning → `current` = next key to scan.
+            if let Err(e) = client.release(
+                chunk_id,
+                worker_id,
+                Some(hex_encode_key(&current)),
+                None,
+            ) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
                         "[remote] release failed ({e}) — hub will reclaim the chunk"
