@@ -27,7 +27,9 @@ pub struct Cli {
     #[arg(short = 'o', long, default_value = ".")]
     pub output_dir: String,
 
-    /// Seconds between heartbeat lines (default 10.0).
+    /// Seconds between remote status lines (default 10.0).  Note this only
+    /// controls the in-place status line; the hub lease-refresh heartbeat is
+    /// fixed at 30s (well under the hub's 120s reclaim timeout).
     #[arg(short = 'H', long, default_value = "10.0")]
     pub heartbeat: f64,
 
@@ -67,6 +69,24 @@ pub struct Cli {
     #[arg(long)]
     pub puzzle: Option<String>,
 
+    /// Hub URL for remote (multi-device) mode, e.g. http://192.168.1.10:42069.
+    ///
+    /// In remote mode the binary does NOT open a local .db worklist: worker
+    /// threads claim chunk tasks over HTTP from the hub (lan-hub) instead,
+    /// and report progress via heartbeat / done / release.  The hub owns the
+    /// SQLite worklist and is the single writer.  Mutually exclusive with
+    /// `--puzzle`.
+    #[arg(long, conflicts_with = "puzzle")]
+    pub remote: Option<String>,
+
+    /// Worker identity reported to the hub (grouped by worker_id in the hub's
+    /// /api/status).  Defaults to the host name (nice dashboard labels), else
+    /// "luckfind-<pid>".  The host name is NOT unique across processes on the
+    /// same machine — pass distinct --worker-id when running more than one
+    /// luckfind against the same hub on one host.
+    #[arg(long)]
+    pub worker_id: Option<String>,
+
     /// GPU framework to use for acceleration.
     /// "auto" (default): probe CUDA first (NVIDIA-preferred), then WebGPU,
     /// then CPU-only.  "webgpu": cross-platform via wgpu (Metal/Vulkan/DX12).
@@ -83,5 +103,22 @@ impl Cli {
     pub fn workers(&self) -> usize {
         self.workers
             .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() / 2))
+    }
+
+    /// Resolve the worker identity for remote mode: explicit `--worker-id`
+    /// wins, then the host name (HOSTNAME / COMPUTERNAME), else "luckfind-<pid>".
+    /// The host name is only unique per machine, not per process — two
+    /// processes on one host must pass distinct `--worker-id` to avoid being
+    /// merged in the hub dashboard.
+    pub fn worker_id(&self) -> String {
+        if let Some(id) = &self.worker_id {
+            return id.clone();
+        }
+        if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
+            if !host.trim().is_empty() {
+                return host.trim().to_string();
+            }
+        }
+        format!("luckfind-{}", std::process::id())
     }
 }

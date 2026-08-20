@@ -80,7 +80,7 @@ const MAX_CHUNKS: usize = 1 << 24;
 /// This is the CPU-side boundary only.  The GPU worker scans with its own
 /// rotation budget (see `gpu_rotate_keys` in `run`) and never calls
 /// `scan_budget`, so this can be tuned independently of the GPU cadence.
-const ROTATION_BUDGET: u64 = 1u64 << 27;
+pub(crate) const ROTATION_BUDGET: u64 = 1u64 << 27;
 
 // ── terminal output coordination ─────────────────────────────────────────────
 // The heartbeat rewrites a single status line in place with `\r` (no trailing
@@ -96,14 +96,14 @@ struct TermLine {
 static TERM_LINE: Mutex<TermLine> = Mutex::new(TermLine { open: false });
 
 /// Rewrite the in-place status line (carriage return + ANSI clear-to-EOL).
-fn term_status(s: &str) {
+pub(crate) fn term_status(s: &str) {
     let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
     eprint!("\r{s}\x1b[K");
     g.open = true;
 }
 
 /// Emit a full log line, terminating any open status line first.
-fn term_line(s: &str) {
+pub(crate) fn term_line(s: &str) {
     let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
     if g.open {
         eprint!("\r\n"); // drop the cursor to column 0 of the next line
@@ -911,7 +911,7 @@ pub fn run(
                     done_pct,
                     idxs_label,
                     fmt_comma(total),
-                    fmt_comma(rate as u64),
+                    fmt_comma(rate.round() as u64),
                 )
             };
             // In-place status update — rewrites the same line; no newline.
@@ -1024,6 +1024,309 @@ fn reverse_step(
     (neg_one, neg_g)
 }
 
+// ── shared chunk-scanning core (local puzzle_worker + remote worker) ─────────
+
+/// Scan direction for a claimed sub-range.  Forward walks `start` upward
+/// (`key += 1`); reverse walks `end - 1` downward (`key -= 1`).  Both cover the
+/// identical key set `[start, end)` — only the in-order traversal differs, so
+/// coverage, zero-dedup, and resume are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanDir {
+    Forward,
+    Reverse,
+}
+
+/// Resume position for a chunk at a scan checkpoint.  Matches the on-disk
+/// semantics: `[current, end)` is always exactly the not-yet-scanned keys.
+/// Forward: `current` = next key to scan, `end` unchanged.  Reverse: `end`
+/// retreats to `sk + 1`, `current` stays at `start`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResumePosition {
+    pub current: [u8; 32],
+    pub end: [u8; 32],
+}
+
+/// Options for `scan_chunk`: a claimed sub-range plus the shared run state.
+pub(crate) struct ScanChunkOptions<'a> {
+    pub target_h160: [u8; 20],
+    pub puzzle_number: Option<u32>,
+    pub worker_id: u32,
+    pub chunk_id: Option<u32>,
+    /// Inclusive first key of the claimed sub-range.
+    pub start: [u8; 32],
+    /// Exclusive upper bound of the claimed sub-range.
+    pub end: [u8; 32],
+    pub dir: ScanDir,
+    /// Per-claim rotation budget for wide chunks (`None` = scan to completion).
+    pub rotate_keys: Option<u64>,
+    pub progress: &'a Progress,
+    pub matches: &'a Mutex<Vec<MatchEvent>>,
+    pub stop_flag: &'a AtomicBool,
+    pub hit_flag: &'a AtomicBool,
+    /// Optional early-abort signal, checked on the 2048-key cadence right
+    /// after `on_position`.  The remote worker sets it when a heartbeat comes
+    /// back 404/409 (lease lost) so the rest of the claim is abandoned within
+    /// one cadence instead of being scanned to the rotation budget.  Local
+    /// mode passes `None`.
+    pub abort_flag: Option<&'a AtomicBool>,
+    pub start_elapsed: Instant,
+    /// Persistence sink invoked on the 2048-key housekeeping cadence.  The
+    /// caller stores the resume position (local: in-memory `PuzzleCtx` +
+    /// dirty flag; remote: throttled heartbeat).  Never called on the per-key
+    /// hot path.
+    pub on_position: &'a mut dyn FnMut(&ResumePosition),
+}
+
+/// Result of scanning a claimed sub-range.
+pub(crate) struct ScanOutcome {
+    /// `true` when the whole `[start, end)` was scanned (or a match ended it).
+    pub done: bool,
+    /// `true` when a match was recorded during this claim (hit flag is set and
+    /// every worker must stop).
+    pub matched: bool,
+    /// `true` when the start key is outside `[1, n-1]` — the caller should park
+    /// the chunk back as pending at its original start.
+    pub invalid_start: bool,
+    /// Boundary key: forward = the next key to scan (resume `current`);
+    /// reverse = the key the scan last advanced past (resume `end` = sk + 1).
+    pub sk: [u8; 32],
+}
+
+/// Scan one claimed sub-range `[start, end)` with the shared hot path: pubkey
+/// derive → hash160 compare → point-add advance.  This is the exact loop the
+/// local `puzzle_worker` and the remote worker both run; only the persistence
+/// (via `on_position`) and the post-scan finalize differ by caller.
+pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
+    let ScanChunkOptions {
+        target_h160,
+        puzzle_number,
+        worker_id,
+        chunk_id,
+        start,
+        end,
+        dir,
+        rotate_keys,
+        progress,
+        matches,
+        stop_flag,
+        hit_flag,
+        abort_flag,
+        start_elapsed,
+        on_position,
+    } = opts;
+
+    let reverse = dir == ScanDir::Reverse;
+
+    let secp = secp256k1::Secp256k1::new();
+    // Scalar(1) so `sk += 1` per iteration.  Also kept to preserve the SK ↔ PK
+    // pairing: sk.add_tweak advances the private key, pk.combine(&G) advances
+    // the public key, and they stay in sync because (sk+1)*G == sk*G + G.
+    let one = secp256k1::Scalar::from_be_bytes({
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        b
+    })
+    .expect("scalar 1 is always valid");
+
+    // Generator point G as a compressed PublicKey.  Parsed once per claim —
+    // cheap (single affine decode) vs. pay-per-key if re-parsed in the loop.
+    let point_g = crate::btc::generator_public_key();
+
+    // Reverse-step constants (−1 mod n, −G) — the exact mirror of the forward
+    // `+1`/`+G` step at identical cost, so scanning downward is free.
+    let (neg_one, neg_g) = reverse_step(&secp);
+
+    // 初始私钥：正向 = start；反向 = end - 1（区间的最后一个 key）。
+    let init_key = if reverse {
+        crate::gpu::convert::scalar_sub_be_u64(&end, 1)
+    } else {
+        start
+    };
+    let mut sk = match secp256k1::SecretKey::from_byte_array(init_key) {
+        Ok(k) => k,
+        Err(_) => {
+            // The start key is outside [1, n-1]; the caller parks the chunk back.
+            return ScanOutcome {
+                done: false,
+                matched: false,
+                invalid_start: true,
+                sk: start,
+            };
+        }
+    };
+    let mut local_count = 0u64;
+
+    // 每步推进量：正向 +1/+G，反向 -1/-G。方向在 claim 级固定，热路径只用
+    // 局部绑定（同一套加法的相反数，成本相同），无每-key 分支。
+    let (step_scalar, step_point): (&secp256k1::Scalar, &secp256k1::PublicKey) =
+        if reverse { (&neg_one, &neg_g) } else { (&one, &point_g) };
+
+    // Scan budget: `Some(n)` when the sub-range width ≤ ROTATION_BUDGET
+    // (scan exactly n keys to completion); `None` when wider (use rotation).
+    let budget: Option<u64> = scan_budget(&start, &end);
+
+    // 初始一次完整标量乘 `pk = sk * G`。之后循环不再做标量乘，只用点加
+    // `pk = pk + G` 推进 —— 比每步 from_secret_key 便宜 10-20×。
+    let mut pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+
+    let done = 'scan: loop {
+        // ── hot path (exactly mirrors lottery worker_loop) ─────────────
+        // Pubkey derive + dhash160 compare.  No branches, no IO, no lock
+        // on the per-key critical path — this is what keeps the rate at
+        // ~500 kkeys/s.  We only fall through to the boundary check on
+        // every 2048th iteration.
+        //
+        // Note: `pk` is already derived — no per-key scalar mult here.
+        let pk_c = pk.serialize();
+        let pk_u = pk.serialize_uncompressed();
+
+        if h160_eq(&pk_c, target_h160) || h160_eq(&pk_u, target_h160) {
+            let ev = MatchEvent {
+                private_key: sk.secret_bytes(),
+                compressed: pk_c.to_vec(),
+                uncompressed: pk_u.to_vec(),
+                worker_id,
+                chunk_id,
+                key_index: local_count,
+                elapsed: start_elapsed.elapsed().as_secs_f64(),
+                puzzle_number,
+            };
+            // 锁中毒也照样保存命中（命中是最珍贵的事件，绝不丢弃）。
+            let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
+            g.push(ev.clone());
+            // 命中即停：首个命中的 worker 立即打印（含私钥）并通知所有 worker 停止。
+            if hit_flag
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                term_line(&format!(
+                    "[HIT] 🎯 puzzle=#{} worker=#{} chunk={} idx={} sk_hex={}",
+                    puzzle_number.map_or_else(String::new, |n| n.to_string()),
+                    worker_id,
+                    chunk_id.map_or_else(String::new, |c| c.to_string()),
+                    fmt_comma(local_count),
+                    hex::encode(ev.private_key),
+                ));
+            }
+            stop_flag.store(true, Ordering::SeqCst);
+            // 命中即结束本次 claim：调用方负责把该 chunk 标记 finished（本地延迟到
+            // 最后一次 save；remote 走 done）。
+            return ScanOutcome {
+                done: true,
+                matched: true,
+                invalid_start: false,
+                sk: sk.secret_bytes(),
+            };
+        }
+
+        // ── mutate state ───────────────────────────────────────────────
+        // 配对推进：sk +1（标量，mod n，用于断点续传和报告），
+        // pk + G（点加，底层 gej_add_ge，零次 doubling）。
+        // 两者保持 pk == sk * G 不变式。
+        sk = match sk.add_tweak(step_scalar) {
+            Ok(next) => next,
+            Err(_) => break 'scan false, // scalar overflow → stop
+        };
+        pk = match pk.combine(step_point) {
+            Ok(next) => next,
+            // 正向：pk == -G (无穷远点) ⟺ sk == n-1；反向：pk == G ⟺ sk == 1。
+            // 两种都等价于 scalar overflow → stop。
+            Err(_) => break 'scan false,
+        };
+        local_count += 1;
+        if local_count.is_multiple_of(1000) {
+            progress.increment(1000);
+        }
+
+        // ── NEW: exact-termination for small chunks (every iteration) ─
+        // For budgeted chunks (width ≤ ROTATION_BUDGET) this is the *only*
+        // termination that matters and it prevents overshoot past end_bytes
+        // between the 2048-cadence checks (a sub-2048-key chunk would otherwise
+        // run the hot path 2048 times before the first boundary check).
+        if let Some(b) = budget {
+            if local_count >= b {
+                break 'scan true;
+            }
+        }
+
+        // ── 2048-cadence housekeeping ─────────────────────────────────
+        // Every 2048 iterations we do three cheap things:
+        //   1. SIGINT flag — break out if the user pressed Ctrl+C.
+        //   2. End-of-range — break out if we've scanned the whole chunk.
+        //   3. Refresh in-memory resume position, flushed to the DB at
+        //      rotation/finalize (claim end).
+        // The release backend compiles the `is_multiple_of` modulo to a
+        // single `test` instruction; the predictor lock-stamps the
+        // not-taken path so the hot loop stays tight.
+        if local_count.is_multiple_of(2048) {
+            if stop_flag.load(Ordering::Relaxed) {
+                break 'scan false;
+            }
+
+            // End-of-range and rotation only apply to *unbudgeted* (wide)
+            // chunks.  For budgeted chunks the per-iteration check above
+            // already guarantees we stop exactly at the end, so these are
+            // skipped to keep rotation from firing on a chunk that fits
+            // in one go.
+            if budget.is_none() {
+                // 越界判定方向相关：正向在 sk 达到 end 时完成（[start, end) 扫完）；
+                // 反向在 sk 回落到 start 之下时完成（已从 end-1 一路扫到 start）。
+                if reverse {
+                    if sk.secret_bytes() < start {
+                        break 'scan true;
+                    }
+                } else if sk.secret_bytes() >= end {
+                    break 'scan true;
+                }
+                // ── rotation (random-subrange mode) ───────────────────────
+                // Park the chunk after `rotate_keys` scanned *this claim*
+                // and let the worker move on to a fresh random pending
+                // chunk.  `local_count` resets every claim, so this is
+                // "per-claim budget", not cumulative across re-claims of
+                // the same chunk.
+                if let Some(rot) = rotate_keys {
+                    if local_count >= rot {
+                        break 'scan false; // caller parks (release) + re-claims
+                    }
+                }
+            }
+
+            // Refresh resume position + persist via the caller's sink.
+            // 正向记录 current = sk（下一个待扫 key）；反向记录 end = sk + 1
+            // （未扫描区间 [start, sk+1) 的独占上界），current 保持 start 不动。
+            let resume = if reverse {
+                ResumePosition {
+                    current: start,
+                    end: crate::gpu::convert::scalar_add_be(&sk.secret_bytes(), 1),
+                }
+            } else {
+                ResumePosition {
+                    current: sk.secret_bytes(),
+                    end,
+                }
+            };
+            on_position(&resume);
+
+            // Early abort: the persistence sink (remote heartbeat) may have
+            // signalled "give up this claim" (lease lost).  Stop within one
+            // cadence instead of scanning to the rotation budget — the hub
+            // already reverted the chunk and may have re-issued it.
+            if let Some(abort) = abort_flag {
+                if abort.load(Ordering::Relaxed) {
+                    break 'scan false;
+                }
+            }
+        }
+    };
+
+    ScanOutcome {
+        done,
+        matched: false,
+        invalid_start: false,
+        sk: sk.secret_bytes(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn puzzle_worker(
     wid: u32,
@@ -1038,25 +1341,6 @@ fn puzzle_worker(
 ) {
     // Puzzle number is constant for this worker's lifetime — capture once.
     let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
-
-    let secp = secp256k1::Secp256k1::new();
-    // Scalar(1) so `sk += 1` per iteration.  Also kept to preserve the SK ↔ PK
-    // pairing: sk.add_tweak advances the private key, pk.combine(&G) advances
-    // the public key, and they stay in sync because (sk+1)*G == sk*G + G.
-    let one = secp256k1::Scalar::from_be_bytes({
-        let mut b = [0u8; 32];
-        b[31] = 1;
-        b
-    })
-    .expect("scalar 1 is always valid");
-
-    // Generator point G as a compressed PublicKey.  Parsed once per worker —
-    // cheap (single affine decode) vs. pay-per-key if re-parsed in the loop.
-    let point_g = crate::btc::generator_public_key();
-
-    // Reverse-step constants (−1 mod n, −G), computed once per worker so a
-    // claim that picks the reverse direction costs nothing extra to set up.
-    let (neg_one, neg_g) = reverse_step(&secp);
 
     loop {
         // ── pick + claim a pending chunk (with optional split) ──────────────
@@ -1091,186 +1375,39 @@ fn puzzle_worker(
             if reverse { "REV" } else { "FWD" },
         ));
 
-        // 初始私钥：正向 = start；反向 = end - 1（区间的最后一个 key）。
-        let init_key = if reverse {
-            crate::gpu::convert::scalar_sub_be_u64(&end_bytes, 1)
-        } else {
-            start_bytes
-        };
-        let mut sk = match secp256k1::SecretKey::from_byte_array(init_key) {
-            Ok(k) => k,
-            Err(_) => {
-                // The start key is outside [1, n-1]; skip this chunk.  Revert
-                // the chunk from "running" (set during claim) back to "pending"
-                // and persist the change so a future run doesn't re-claim it.
-                let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-                ctx.file.chunks[idx].status = "pending".to_string();
-                ctx.file.chunks[idx].current_hex = hex_encode_key(&start_bytes);
-                ctx.mark_dirty(chunk_id);
-                sync_flush_chunk(&mut ctx);
-                continue;
-            }
-        };
-        let mut local_count = 0u64;
+        let dir = if reverse { ScanDir::Reverse } else { ScanDir::Forward };
 
-        // 每步推进量：正向 +1/+G，反向 -1/-G。方向在 claim 级固定，热路径只用
-        // 局部绑定（同一套加法的相反数，成本相同），无每-key 分支。
-        let (step_scalar, step_point): (&secp256k1::Scalar, &secp256k1::PublicKey) =
-            if reverse { (&neg_one, &neg_g) } else { (&one, &point_g) };
-
-        // Scan budget: `Some(n)` when the sub-range width ≤ ROTATION_BUDGET
-        // (scan exactly n keys to completion); `None` when wider (use rotation).
-        let budget: Option<u64> = scan_budget(&start_bytes, &end_bytes);
-
-        // 初始一次完整标量乘 `pk = sk * G`。之后循环不再做标量乘，只用点加
-        // `pk = pk + G` 推进 —— 比每步 from_secret_key 便宜 10-20×。
-        let mut pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
-
-        let done = 'scan: loop {
-            // ── hot path (exactly mirrors lottery worker_loop) ─────────────
-            // Pubkey derive + dhash160 compare.  No branches, no IO, no lock
-            // on the per-key critical path — this is what keeps the rate at
-            // ~500 kkeys/s.  We only fall through to the boundary check on
-            // every 2048th iteration.
-            //
-            // Note: `pk` is already derived — no per-key scalar mult here.
-            let pk_c = pk.serialize();
-            let pk_u = pk.serialize_uncompressed();
-
-            if h160_eq(&pk_c, target_h160) || h160_eq(&pk_u, target_h160) {
-                let ev = MatchEvent {
-                    private_key: sk.secret_bytes(),
-                    compressed: pk_c.to_vec(),
-                    uncompressed: pk_u.to_vec(),
-                    worker_id: wid,
-                    chunk_id: Some(chunk_id),
-                    key_index: local_count,
-                    elapsed: start.elapsed().as_secs_f64(),
-                    puzzle_number,
-                };
-                // 锁中毒也照样保存命中（命中是最珍贵的事件，绝不丢弃）。
-                let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
-                g.push(ev.clone());
-                // 命中即停：首个命中的 worker 立即打印（含私钥）并通知所有 worker 停止。
-                if hit_flag
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    term_line(&format!(
-                        "[HIT] 🎯 puzzle=#{} worker=#{} chunk={} idx={} sk_hex={}",
-                        puzzle_number.map_or_else(String::new, |n| n.to_string()),
-                        wid,
-                        chunk_id,
-                        fmt_comma(local_count),
-                        hex::encode(ev.private_key),
-                    ));
-                }
-                stop_flag.store(true, Ordering::SeqCst);
-                // 命中 chunk 在内存标记 finished + dirty，但不 sync —— SQLite 由
-                // 最后一次 ctx.save()（aman 落盘之后）统一落库。
-                {
-                    let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
-                    let chunk = &mut ctx.file.chunks[idx];
-                    chunk.status = "finished".to_string();
-                    chunk.current_hex = chunk.end_hex.clone();
-                    ctx.file.completed_chunks += 1;
-                    ctx.mark_dirty(chunk_id);
-                }
-                return;
-            }
-
-            // ── mutate state ───────────────────────────────────────────────
-            // 配对推进：sk +1（标量，mod n，用于断点续传和报告），
-            // pk + G（点加，底层 gej_add_ge，零次 doubling）。
-            // 两者保持 pk == sk * G 不变式。
-            sk = match sk.add_tweak(step_scalar) {
-                Ok(next) => next,
-                Err(_) => break 'scan false, // scalar overflow → stop
-            };
-            pk = match pk.combine(step_point) {
-                Ok(next) => next,
-                // 正向：pk == -G (无穷远点) ⟺ sk == n-1；反向：pk == G ⟺ sk == 1。
-                // 两种都等价于 scalar overflow → stop。
-                Err(_) => break 'scan false,
-            };
-            local_count += 1;
-            if local_count.is_multiple_of(1000) {
-                progress.increment(1000);
-            }
-
-            // ── NEW: exact-termination for small chunks (every iteration) ─
-            // For budgeted chunks (width ≤ ROTATION_BUDGET) this is the *only*
-            // termination
-            // that matters and it prevents overshoot past end_bytes between the
-            // 2048-cadence checks (a sub-2048-key chunk would otherwise run the
-            // hot path 2048 times before the first boundary check).
-            if let Some(b) = budget {
-                if local_count >= b {
-                    break 'scan true;
-                }
-            }
-
-            // ── 2048-cadence housekeeping ─────────────────────────────────
-            // Every 2048 iterations we do three cheap things:
-            //   1. SIGINT flag — break out if the user pressed Ctrl+C.
-            //   2. End-of-range — break out if we've scanned the whole chunk.
-            //   3. Refresh in-memory current_hex — the resume position, flushed
-            //      to the DB at rotation/finalize (claim end).
-            // The release backend compiles the `is_multiple_of` modulo to a
-            // single `test` instruction; the predictor lock-stamps the
-            // not-taken path so the hot loop stays tight.
-            if local_count.is_multiple_of(2048) {
-                if stop_flag.load(Ordering::Relaxed) {
-                    break 'scan false;
-                }
-
-                // End-of-range and rotation only apply to *unbudgeted* (wide)
-                // chunks.  For budgeted chunks the per-iteration check above
-                // already guarantees we stop exactly at the end, so these are
-                // skipped to keep rotation from firing on a chunk that fits
-                // in one go.
-                if budget.is_none() {
-                    // 越界判定方向相关：正向在 sk 达到 end 时完成（[start, end) 扫完）；
-                    // 反向在 sk 回落到 start 之下时完成（已从 end-1 一路扫到 start）。
-                    if reverse {
-                        if sk.secret_bytes() < start_bytes {
-                            break 'scan true;
-                        }
-                    } else if sk.secret_bytes() >= end_bytes {
-                        break 'scan true;
-                    }
-                    // ── rotation (random-subrange mode) ───────────────────────
-                    // Park the chunk after `rotate_keys` scanned *this claim*
-                    // and let the worker move on to a fresh random pending
-                    // chunk.  `local_count` resets every claim, so this is
-                    // "per-claim budget", not cumulative across re-claims of
-                    // the same chunk.
-                    if let Some(rot) = rotate_keys {
-                        if local_count >= rot {
-                            break 'scan false; // finalize saves the resume position + pending
-                        }
-                    }
-                }
-
-                // Refresh in-memory resume position (persisted at finalize).
-                // 正向记录 current = sk（下一个待扫 key）；反向记录 end = sk + 1
-                // （未扫描区间 [start, sk+1) 的独占上界），current 保持 start 不动。
-                let frontier = if reverse {
-                    hex_encode_key(&crate::gpu::convert::scalar_add_be(&sk.secret_bytes(), 1))
-                } else {
-                    hex_encode_key(&sk.secret_bytes())
-                };
+        // ── scan the claimed sub-range with the shared core ────────────────
+        // The hot path (pubkey derive → hash160 → point-add advance) lives in
+        // `scan_chunk`; the 2048-cadence resume-position refresh is routed back
+        // into this worker's in-memory chunk + dirty flag, exactly as before.
+        let outcome = scan_chunk(ScanChunkOptions {
+            target_h160,
+            puzzle_number,
+            worker_id: wid,
+            chunk_id: Some(chunk_id),
+            start: start_bytes,
+            end: end_bytes,
+            dir,
+            rotate_keys,
+            progress,
+            matches,
+            stop_flag,
+            hit_flag,
+            // Local mode has no lease to lose — scan always runs to completion
+            // or rotation budget; nothing to abort early.
+            abort_flag: None,
+            start_elapsed: start,
+            on_position: &mut |pos: &ResumePosition| {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
                 if reverse {
-                    ctx.file.chunks[idx].end_hex = frontier;
+                    ctx.file.chunks[idx].end_hex = hex_encode_key(&pos.end);
                 } else {
-                    ctx.file.chunks[idx].current_hex = frontier;
+                    ctx.file.chunks[idx].current_hex = hex_encode_key(&pos.current);
                 }
-                // Mark dirty so the chunk's position is flushed whenever a save
-                // happens (rotation/finalize, claim, or the final save).
                 ctx.mark_dirty(chunk_id);
-            }
-        };
+            },
+        });
 
         // ── finalize the chunk ──────────────────────────────────────────────
         // On disk right away — the chunk's new status + current_hex must be
@@ -1279,7 +1416,28 @@ fn puzzle_worker(
         {
             let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
             let chunk = &mut ctx.file.chunks[idx];
-            if done {
+
+            // 命中即停：chunk 在内存标记 finished + dirty，但不 sync —— SQLite 由
+            // 最后一次 ctx.save()（aman 落盘之后）统一落库。
+            if outcome.matched {
+                chunk.status = "finished".to_string();
+                chunk.current_hex = chunk.end_hex.clone();
+                ctx.file.completed_chunks += 1;
+                ctx.mark_dirty(chunk_id);
+                return;
+            }
+
+            // Start key outside [1, n-1]: park the chunk back as pending at its
+            // original start so a future run can re-claim it.
+            if outcome.invalid_start {
+                chunk.status = "pending".to_string();
+                chunk.current_hex = hex_encode_key(&start_bytes);
+                ctx.mark_dirty(chunk_id);
+                sync_flush_chunk(&mut ctx);
+                continue;
+            }
+
+            if outcome.done {
                 chunk.status = "finished".to_string();
                 chunk.current_hex = chunk.end_hex.clone(); // fully consumed
                 ctx.file.completed_chunks += 1;
@@ -1291,11 +1449,11 @@ fn puzzle_worker(
                     // 待扫 key 之后 —— [start, sk+1) 即剩余未扫描部分。`sk` 在 advance
                     // 后已是下一个待扫 key，故 +1 即独占上界。
                     chunk.end_hex = hex_encode_key(&crate::gpu::convert::scalar_add_be(
-                        &sk.secret_bytes(),
+                        &outcome.sk,
                         1,
                     ));
                 } else {
-                    chunk.current_hex = hex_encode_key(&sk.secret_bytes());
+                    chunk.current_hex = hex_encode_key(&outcome.sk);
                 }
             }
             // Mark dirty: the next save_dirty flushes just this chunk (plus
@@ -1763,6 +1921,11 @@ fn puzzle_gpu_scan_loop<S: PuzzleScannerBackend>(
 /// Parse a hex string as a 32-byte big-endian key.  Odd-length inputs get a
 /// leading "0" to make them even; the result is left-padded (high bytes) to a
 /// full 64 hex-char / 32-byte key.
+///
+/// Panics on malformed input (>64 chars, non-hex).  Callers feed it either
+/// locally-controlled worklist data or the LAN hub's API responses, both of
+/// which are trusted — a malformed key is a programming/hub error we surface
+/// loudly rather than silently mis-scan.
 pub(crate) fn parse_hex_key(hex_str: &str) -> [u8; 32] {
     let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let s = if s.len() % 2 == 1 {
@@ -1794,7 +1957,7 @@ pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
 /// Hex of a key with leading zero bytes stripped.  Puzzle sub-ranges sit at
 /// 2^(N-1)..2^N, so the high bytes are all zero — showing them (0000…0000) is
 /// noise.  This prints the significant part, e.g. 2^70 → "4000000000000000".
-fn abbr_hex(k: &[u8; 32]) -> String {
+pub(crate) fn abbr_hex(k: &[u8; 32]) -> String {
     let s = hex::encode(k);
     let t = s.trim_start_matches('0');
     if t.is_empty() {
@@ -1806,7 +1969,7 @@ fn abbr_hex(k: &[u8; 32]) -> String {
 
 /// Parse a 40-character hex string as a 20-byte hash160.  Returns `None` if the
 /// string isn't exactly 40 hex chars (the canonical RIPEMD-160 length).
-fn hash160_from_hex(s: &str) -> Option<[u8; 20]> {
+pub(crate) fn hash160_from_hex(s: &str) -> Option<[u8; 20]> {
     if s.len() != 40 {
         return None;
     }
@@ -2040,7 +2203,7 @@ fn sync_flush_chunk(ctx: &mut PuzzleCtx) {
 
 /// Pick a random element of a non-empty slice using the OS RNG.  Falls back to
 /// the first element of the slice if entropy is unavailable.
-fn pick_random<T>(slice: &[T]) -> Option<&T> {
+pub(crate) fn pick_random<T>(slice: &[T]) -> Option<&T> {
     if slice.is_empty() {
         return None;
     }

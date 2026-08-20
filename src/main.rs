@@ -12,6 +12,7 @@ mod progress;
 mod report;
 mod workers;
 mod puzzle;
+mod remote;
 mod gpu;
 mod framework;
 #[cfg(feature = "cuda")]
@@ -35,6 +36,23 @@ fn main() {
 
     if cli.profile {
         profile();
+        return;
+    }
+
+    // ── remote mode: claim chunks over HTTP from a LAN hub (lan-hub) ────────
+    // CPU-only in this iteration (the shared scan core is reused; GPU remote
+    // claiming is future work), so no GPU probe is needed.  `--puzzle` and
+    // `--remote` are mutually exclusive (clap conflicts_with).
+    if let Some(ref remote_url) = cli.remote {
+        let (stats, _matches) = remote::run(
+            remote_url,
+            cli.worker_id(),
+            cli.workers(),
+            cli.heartbeat,
+            Some(Path::new(&cli.output_dir)),
+        );
+        // progress 由 remote::run 打印；aman_<TS>.txt 已在 run() 内落盘。
+        let _ = stats;
         return;
     }
 

@@ -65,6 +65,11 @@ ctrlc = "3.4"
 # SQLite for puzzle worklist persistence (.db format)
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# blocking HTTP client for `--remote` mode (claim/heartbeat over the LAN hub API).
+# `default-features = false` drops the rustls/ring TLS stack — the LAN hub is
+# plain http:// only, so TLS would be pure compile + binary weight.
+ureq = { version = "3", default-features = false, features = ["json"] }
+
 # hashing
 # `asm` enables hand-tuned assembly backends: on aarch64 (Apple Silicon) this
 # activates the ARMv8-Crypto SHA256/SHA256H2 instructions, giving ~3-5x SHA256
