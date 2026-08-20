@@ -1,0 +1,40 @@
+# luckfind configuration — example.
+#
+# Auto-discovered in the current working directory when `--config` is not
+# given: `luckfind.toml` first, then `config.toml`.  So just dropping a file
+# named `config.toml` next to the binary and running `./luckfind` picks it up:
+#
+#   cp config.example.toml bin/config.toml && cd bin && ./luckfind
+#
+# Or point at a specific file with `bin/luckfind --config config.example.toml`.
+#
+# Precedence: command-line flags override values in this file, which override
+# built-in defaults.  Every key is optional; only set what you need.
+
+# ── mode ────────────────────────────────────────────────────────────────────
+# Which scan mode to run:
+#   "random" (default) — lottery scan against the embedded 77-puzzle set
+#   "puzzle"           — deterministic sub-range scan; requires [puzzle]
+#   "remote"           — claim chunks from a LAN hub; requires [remote]
+mode = "random"
+
+# ── rotation (reclaim) budgets ──────────────────────────────────────────────
+# Puzzle-mode per-claim rotation budgets: how many keys a worker scans before
+# parking its chunk (saving position) and claiming a fresh random one.  These
+# are the reclaim counts — smaller = more frequent jumps back to the worklist.
+#   cpu_rotate_keys = 134217728    # 2^27  (default)
+#   gpu_rotate_keys = 2147483648   # 2^31  (default)
+# A value of 0 disables rotation (scan each chunk to completion).
+# cpu_rotate_keys = 134217728
+# gpu_rotate_keys = 2147483648
+
+# ── mode = "puzzle" ─────────────────────────────────────────────────────────
+# Required when mode = "puzzle".  Path to the worklist (.db runtime format,
+# or .json one-time import).
+# [puzzle]
+# database = "bin/71.db"
+
+# ── mode = "remote" ─────────────────────────────────────────────────────────
+# Required when mode = "remote".  Hub base URL.
+# [remote]
+# uri = "http://192.168.1.10:42069"

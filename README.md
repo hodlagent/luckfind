@@ -9,7 +9,9 @@ printed, persisted, and stops the whole run.
 - Pure Rust, single binary.  ~1.4M keys/s CPU (5 workers, Apple M4, release).
 - Optional GPU accelerator (WebGPU/Metal or CUDA); auto-detected with CPU-only
   fallback.
-- Two scan modes: **lottery** (default) and **puzzle mode** (`--puzzle <worklist>`).
+- Three scan modes: **lottery** (default), **puzzle mode** (`--puzzle <worklist>`),
+  and **remote mode** (`--remote <hub-url>`), selectable via CLI flags or a
+  TOML config file.
 - The 77 puzzle targets are compiled in as a static literal — no network access.
 
 ## Collision logic
@@ -123,6 +125,8 @@ bin/luckfind --workers 8 --heartbeat 5         # 8 threads, 5s heartbeat
 bin/luckfind --gpu_framework auto|webgpu|cuda  # GPU backend (default auto)
 bin/luckfind --puzzle bin/71.db                # puzzle mode: resume worklist 71
 bin/luckfind --puzzle bin/71.json              # puzzle mode: first run (imports → .db)
+bin/luckfind --remote http://192.168.1.10:42069  # remote mode: claim chunks from a LAN hub
+bin/luckfind --config luckfind.toml            # run from a TOML config file
 bin/luckfind --bench                           # 5s speed benchmark, then exit
 ```
 
@@ -134,9 +138,42 @@ bin/luckfind --bench                           # 5s speed benchmark, then exit
 | `--output-dir`, `-o` | `.` | Directory for `aman_<UTC>.txt` |
 | `--heartbeat`, `-H` | 10.0 | Seconds between progress lines |
 | `--gpu_framework` | auto | `auto` / `webgpu` / `cuda` |
+| `--config` | auto | TOML config file; else `luckfind.toml`/`config.toml` in cwd |
 | `--puzzle` | — | Puzzle mode worklist (`.json` → `.db`) |
+| `--remote` | — | Remote mode hub URL (`http://host:port`) |
+| `--cpu-rotate-keys` | 2^27 | Puzzle per-claim CPU rotation budget; `0` = off |
+| `--gpu-rotate-keys` | 2^31 | Puzzle per-claim GPU rotation budget; `0` = off |
 | `--bench` | off | 5s burn-in, then exit |
 | `--profile` | off | Per-stage pipeline profile, then exit |
+
+### Configuration file
+
+Drive the run from a TOML file — no flags needed.  The file is auto-discovered
+in the current working directory (`luckfind.toml` first, then `config.toml`),
+or given explicitly with `--config <path>`.  Explicit CLI flags always win; the
+file fills in whatever the flags omit.  See
+[`config.example.toml`](config.example.toml) for a fully-commented copy.
+
+```sh
+cd bin && ./luckfind          # auto-loads ./config.toml if present
+./luckfind --config conf.toml # or point at a specific file
+```
+
+```toml
+# Select the scan mode.  "random" is the default.
+mode = "puzzle"
+
+# Puzzle-mode rotation (reclaim) budgets — how many keys a worker scans before
+# parking its chunk and claiming a fresh random one.  0 disables rotation.
+cpu_rotate_keys = 134217728      # 2^27, CPU per-claim budget
+gpu_rotate_keys = 2147483648     # 2^31, GPU per-claim budget
+
+[puzzle]                         # required when mode = "puzzle"
+database = "bin/71.db"           #   → run: bin/luckfind --config luckfind.toml
+
+# [remote]                       # required when mode = "remote"
+# uri = "http://192.168.1.10:42069"
+```
 
 ## Performance
 

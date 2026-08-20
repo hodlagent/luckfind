@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 
 pub use crate::framework::GpuFramework;
@@ -43,6 +45,20 @@ pub struct Cli {
     #[arg(long)]
     pub profile: bool,
 
+    /// Path to a TOML configuration file (`--config <path>.toml`).
+    ///
+    /// When omitted, `luckfind.toml` then `config.toml` in the current
+    /// working directory are auto-discovered.  The file supplies defaults
+    /// for settings not passed on the command line; explicit CLI flags always
+    /// take precedence.  Supported keys:
+    ///   mode = "random" | "puzzle" | "remote"   (default "random")
+    ///   cpu_rotate_keys = <u64>                 (puzzle rotation budget)
+    ///   gpu_rotate_keys = <u64>                 (puzzle rotation budget)
+    ///   [puzzle] database = "<path>"            (required when mode = "puzzle")
+    ///   [remote] uri = "<url>"                  (required when mode = "remote")
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// Path to puzzle worklist file (`.json` or `.db`).
     ///
     /// In puzzle mode the binary:
@@ -78,6 +94,20 @@ pub struct Cli {
     /// `--puzzle`.
     #[arg(long, conflicts_with = "puzzle")]
     pub remote: Option<String>,
+
+    /// Per-claim CPU rotation (reclaim) budget in puzzle mode, overriding the
+    /// config file / default (2^27).  Each CPU worker parks its chunk after
+    /// this many keys and claims a fresh random one.  0 disables rotation
+    /// (scan chunks to completion).
+    #[arg(long)]
+    pub cpu_rotate_keys: Option<u64>,
+
+    /// Per-claim GPU rotation (reclaim) budget in puzzle mode, overriding the
+    /// config file / default (2^31).  The single GPU worker parks its chunk
+    /// after this many keys and claims a fresh random one.  0 disables
+    /// rotation (scan chunks to completion).
+    #[arg(long)]
+    pub gpu_rotate_keys: Option<u64>,
 
     /// Worker identity reported to the hub (grouped by worker_id in the hub's
     /// /api/status).  Defaults to the host name (nice dashboard labels), else

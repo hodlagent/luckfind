@@ -7,6 +7,7 @@
 
 mod puzzles;
 mod args;
+mod config;
 mod btc;
 mod progress;
 mod report;
@@ -28,6 +29,86 @@ use args::Cli;
 
 fn main() {
     let cli = Cli::parse();
+
+    // ── config file ─────────────────────────────────────────────────────────
+    // Explicit `--config <path>` wins; otherwise a file is auto-discovered in
+    // the current working directory (`luckfind.toml`, then `config.toml`).
+    // Precedence: CLI flags > config file > built-in defaults.
+    let mut cfg = crate::config::Config::default();
+    if let Some(ref cfg_path) = cli.config {
+        match crate::config::Config::load(cfg_path) {
+            Ok(c) => {
+                eprintln!("  [config] loaded {}", cfg_path.display());
+                cfg = c;
+            }
+            Err(e) => {
+                eprintln!("[config] {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        match crate::config::Config::discover() {
+            crate::config::Discovery::Loaded(path, c) => {
+                eprintln!("  [config] loaded {}", path.display());
+                cfg = c;
+            }
+            crate::config::Discovery::Failed(path, e) => {
+                eprintln!("[config] {}: {e}", path.display());
+                std::process::exit(2);
+            }
+            crate::config::Discovery::None => {}
+        }
+    }
+
+    // Resolve the scan mode.  An explicit `--puzzle` / `--remote` flag always
+    // wins over the config file; otherwise the file's `mode` selects the mode
+    // (absent → random, the default).
+    let mode = match cfg.mode.as_deref() {
+        Some(s) => match crate::config::Mode::parse(s) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[config] {e}");
+                std::process::exit(2);
+            }
+        },
+        None => crate::config::Mode::Random,
+    };
+
+    // Puzzle worklist path and remote hub URL, each resolved CLI-over-config.
+    // The required config fields are validated only when the file actually
+    // selects that mode.
+    let puzzle_path: Option<String> = if cli.puzzle.is_some() {
+        cli.puzzle.clone()
+    } else if cli.remote.is_none() && mode == crate::config::Mode::Puzzle {
+        match &cfg.puzzle.database {
+            Some(db) => Some(db.clone()),
+            None => {
+                eprintln!("[config] mode = \"puzzle\" requires `[puzzle] database = \"<path>\"`");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    let remote_url: Option<String> = if cli.remote.is_some() {
+        cli.remote.clone()
+    } else if cli.puzzle.is_none() && mode == crate::config::Mode::Remote {
+        match &cfg.remote.uri {
+            Some(uri) => Some(uri.clone()),
+            None => {
+                eprintln!("[config] mode = \"remote\" requires `[remote] uri = \"<url>\"`");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Rotation (reclaim) budgets for puzzle mode, resolved CLI-over-config.
+    // A value of 0 disables rotation (`None` = scan chunks to completion).
+    let rotate_keys = resolve_rotate(cli.cpu_rotate_keys, cfg.cpu_rotate_keys, 1u64 << 27);
+    let gpu_rotate_keys = resolve_rotate(cli.gpu_rotate_keys, cfg.gpu_rotate_keys, 1u64 << 31);
 
     if cli.bench {
         bench(cli.workers(), cli.duration.unwrap_or(5.0));
@@ -96,7 +177,7 @@ fn main() {
     // The hub holds the SQLite worklist and is the single writer; workers claim
     // chunks over HTTP.  When a GPU device was resolved above, a dedicated GPU
     // worker thread claims + dense-tiles chunks alongside the CPU workers.
-    if let Some(ref remote_url) = cli.remote {
+    if let Some(ref remote_url) = remote_url {
         let (stats, _matches) = remote::run(
             remote_url,
             cli.worker_id(),
@@ -114,21 +195,10 @@ fn main() {
     // ── puzzle mode: deterministic sub-range scan from a worklist file ────────
     // Supports `.db` (SQLite, the runtime format) and `.json` (one-time import;
     // a `.db` sibling is created on first run and used for all future saves).
-    if let Some(ref puzzle_path) = cli.puzzle {
-        // 每处理一定数量的 keys 就停放当前子区间并重新选择（旋转策略）。
-        // CPU worker 每 2^27 个 keys 旋转一次（更频繁地跳回工作列表），
-        // GPU worker 保持 2^31 不变 —— 两个预算分别传入，互不影响。
-        // `local_count`/`scanned_keys` 每次 claim 重置，所以这是 per-claim 的
-        // 旋转预算，不是累计的。
-        // 旋转后 worker 回到 claim_random_chunk，按随机性策略重新选子区间：
-        //   - 子区间数 < 2^24(4096×4096)：随机选一个 pending 区间，拆分为 [x,d] 和 [d,y]，
-        //     保存到数据库，选择 [d,y] 开始计算。
-        //   - 子区间数 ≥ 2^24(4096×4096)：从 pending 中随机选择一个直接计算。
-        // 子区间宽度 ≤ CPU 的 ROTATION_BUDGET(2^27) 时一次完成（scan_budget
-        // 精确终止），不触发旋转；更宽的区间在每 claim 满 rotate_keys 后停车。
-        // CPU: 2^27 ≈ 1.34×10^8 keys per claim；GPU: 2^31 ≈ 2.15×10^9。
-        let rotate_keys = Some(1u64 << 27); // CPU
-        let gpu_rotate_keys = Some(1u64 << 31); // GPU 保持不变
+    if let Some(ref puzzle_path) = puzzle_path {
+        // 旋转预算（reclaim count）来自 CLI/配置文件解析后的 rotate_keys 与
+        // gpu_rotate_keys（见上方解析），分别控制 CPU / GPU worker 每个 claim
+        // 扫描多少 keys 后停放当前子区间并随机重新选择。
         let (stats, _matches) = puzzle::run(
             Path::new(puzzle_path),
             cli.workers(),
@@ -187,6 +257,18 @@ fn probe_webgpu() -> bool {
         eprintln!("  [GPU] WebGPU device detected -- enabling GPU lottery worker.");
     }
     ok
+}
+
+/// Resolve a puzzle-mode rotation (reclaim) budget with CLI-over-config
+/// precedence.  A value of 0 disables rotation — returned as `None`, which
+/// tells the worker to scan chunks to completion per claim.
+fn resolve_rotate(cli: Option<u64>, cfg: Option<u64>, default: u64) -> Option<u64> {
+    let v = cli.or(cfg).unwrap_or(default);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 #[inline(never)]
