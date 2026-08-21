@@ -117,6 +117,42 @@ cargo build --release --features cuda          # + CUDA backend (NVIDIA only)
 The binary is `target/release/luckfind`; `bin/luckfind` in the skill root is
 the deployed copy.
 
+### Windows: building the CUDA backend
+
+Requirements: the NVIDIA CUDA toolkit and a Visual Studio installation with
+the **"Desktop development with C++"** workload.  nvcc on Windows shells out
+to `cl.exe`, which needs the full MSVC environment (`PATH` + `INCLUDE` +
+`LIB`) that `vcvars64.bat` sets up — adding `cl.exe` to your PATH alone is
+*not* enough.
+
+Simplest: run [`build-cuda.bat`](build-cuda.bat) from the project root.  It
+locates the Visual Studio toolchain via `vswhere`, initializes the MSVC
+environment, and builds with `--features cuda`:
+
+```bat
+build-cuda.bat            :: incremental release build
+build-cuda.bat clean      :: full clean rebuild
+```
+
+Or do it manually in a terminal:
+
+```bat
+call "F:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+cargo build --release --features cuda
+```
+
+Notes:
+
+- `--features cuda` is **required** — the CUDA runtime is off by default
+  (`default = []` in `Cargo.toml`); without it the binary silently falls back
+  to the WebGPU backend.
+- If the binary still logs `CUDA kernel was not compiled at build time` after
+  enabling the toolchain, use `build-cuda.bat clean` (or `cargo clean`):
+  cargo's build-script cache can keep a stale stub PTX embedded across
+  rebuilds, and `cargo clean -p <pkg>` does not always invalidate it.
+- Verify the backend: `target\release\luckfind.exe --gpu_framework cuda`
+  should log `[CUDA] lottery worker up on NVIDIA ...` at startup.
+
 ## Usage
 
 ```sh

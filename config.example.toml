@@ -16,7 +16,7 @@
 #   "random" (default) — lottery scan against the embedded 77-puzzle set
 #   "puzzle"           — deterministic sub-range scan; requires [puzzle]
 #   "remote"           — claim chunks from a LAN hub; requires [remote]
-mode = "random"
+mode = "remote"
 
 # ── rotation (reclaim) budgets ──────────────────────────────────────────────
 # Puzzle-mode per-claim rotation budgets: how many keys a worker scans before
@@ -26,7 +26,7 @@ mode = "random"
 #   gpu_rotate_keys = 2147483648   # 2^31  (default)
 # A value of 0 disables rotation (scan each chunk to completion).
 # cpu_rotate_keys = 134217728
-# gpu_rotate_keys = 2147483648
+# gpu_rotate_keys = 4294967296
 
 # ── mode = "puzzle" ─────────────────────────────────────────────────────────
 # Required when mode = "puzzle".  Path to the worklist (.db runtime format,
@@ -36,5 +36,5 @@ mode = "random"
 
 # ── mode = "remote" ─────────────────────────────────────────────────────────
 # Required when mode = "remote".  Hub base URL.
-# [remote]
-# uri = "http://192.168.1.10:42069"
+[remote]
+uri = "http://192.168.18.69:42069"

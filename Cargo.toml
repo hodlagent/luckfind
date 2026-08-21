@@ -83,6 +83,11 @@ ripemd = "0.1"
 default = []
 cuda = ["dep:cust", "dep:cust_derive"]
 
+[lints.rust]
+# `cuda_compiled` is emitted dynamically by build.rs via cargo:rustc-cfg
+# when nvcc successfully produces a real PTX.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cuda_compiled)'] }
+
 [build-dependencies]
 # No external build deps -- build.rs uses std::process::Command to invoke nvcc
 

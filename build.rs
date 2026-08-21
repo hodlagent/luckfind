@@ -55,6 +55,12 @@ fn main() {
             println!("cargo:rerun-if-env-changed=CUDA_PATH");
             println!("cargo:rerun-if-env-changed=CUDA_HOME");
             println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+            // PATH too: on Windows nvcc needs cl.exe (MSVC) in PATH, and cargo
+            // only reruns the build script when a *declared* env var changes.
+            // Without this, fixing the environment (adding cl.exe / running
+            // under vcvars64.bat) would NOT retrigger the nvcc compile, leaving
+            // a stale stub PTX embedded in the binary.
+            println!("cargo:rerun-if-env-changed=PATH");
 
             // Stub cuda_runtime.h shadows the toolkit header (see module docs).
             std::fs::write(out_dir.join("cuda_runtime.h"), STUB_CUDA_RUNTIME_H)
@@ -163,6 +169,7 @@ fn find_nvcc() -> Option<PathBuf> {
 
     // Check common installation paths
     let common_paths = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\nvcc.exe",
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe",
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\nvcc.exe",
         r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe",
