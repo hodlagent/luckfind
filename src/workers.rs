@@ -43,9 +43,32 @@ pub fn run(
     gpu: bool,
     framework: GpuFramework,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
-    // GPU worker counts as an extra "worker" for the heartbeat's alive counter
-    // when enabled.
-    let n_total = n_workers + gpu as usize;
+    // Number of GPU worker threads the framework will spawn, counted into the
+    // heartbeat's "alive" counter so the status line reflects all backends:
+    // WebGPU runs a single worker; CUDA spawns one worker per physical device
+    // (mainboard + discrete cards each get their own thread).
+    let gpu_worker_count = if gpu {
+        match framework {
+            GpuFramework::WebGpu => 1,
+            GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::CudaScanner::device_count() as usize
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    0
+                }
+            }
+            GpuFramework::Auto => {
+                // Resolved to a concrete backend in main() before we get here.
+                unreachable!("framework Auto must be resolved before workers::run")
+            }
+        }
+    } else {
+        0
+    };
+    let n_total = n_workers + gpu_worker_count;
     let progress = Arc::new(Progress::new(n_total as u64));
     let matches = Arc::new(std::sync::Mutex::new(Vec::<MatchEvent>::new()));
     let deadline = limits
@@ -84,52 +107,63 @@ pub fn run(
         })
         .collect();
 
-    // ── GPU lottery worker (optional) ────────────────────────────────────────
-    // One additional worker that scans with the GPU (100k independent random
-    // walkers, re-seeded every RESEED_INTERVAL_KEYS).  Shares the same progress
-    // and matches as the CPU workers.  Falls back to CPU-only if no GPU device.
-    let gpu_handle = if gpu {
+    // ── GPU lottery worker(s) (optional) ─────────────────────────────────────
+    // One thread per physical CUDA device (or a single WebGPU worker) that
+    // scans with the GPU (100k independent random walkers per device, re-seeded
+    // every RESEED_INTERVAL_KEYS).  Shares the same progress and matches as the
+    // CPU workers.  A device that fails to initialise (e.g. a too-old GPU that
+    // cannot JIT the PTX) skips itself; the other devices and CPUs continue.
+    let gpu_handles: Vec<_> = if gpu {
         let ScanTarget::PuzzleSet(ps) = &target;
-        let gpu_progress = progress.clone();
-        let gpu_matches = matches.clone();
-        let gpu_stop = stop_flag.clone();
-        let gpu_hit = hit_flag.clone();
-        let gpu_deadline = deadline;
-        let gpu_start = start;
         let ps = *ps; // &'static — copy the reference into the closure.
+        let mut handles = Vec::new();
         match framework {
             GpuFramework::WebGpu => {
-                Some(thread::spawn(move || {
+                // Clone the shared Arcs before the closure so the outer bindings
+                // stay owned by `run` (the heartbeat below still needs them).
+                let progress = progress.clone();
+                let matches = matches.clone();
+                let stop_flag = stop_flag.clone();
+                let hit_flag = hit_flag.clone();
+                handles.push(thread::spawn(move || {
                     crate::gpu::lottery::worker(
                         ps,
-                        gpu_progress,
-                        gpu_matches,
-                        gpu_stop,
-                        gpu_hit,
-                        gpu_deadline,
-                        gpu_start,
+                        progress,
+                        matches,
+                        stop_flag,
+                        hit_flag,
+                        deadline,
+                        start,
                     );
-                }))
+                }));
             }
             GpuFramework::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
-                    Some(thread::spawn(move || {
-                        crate::cuda::lottery::worker(
-                            ps,
-                            gpu_progress,
-                            gpu_matches,
-                            gpu_stop,
-                            gpu_hit,
-                            gpu_deadline,
-                            gpu_start,
-                        );
-                    }))
+                    let n_devices = crate::cuda::CudaScanner::device_count() as u32;
+                    for dev_idx in 0..n_devices {
+                        // One worker thread per device; each clones its own Arc.
+                        let progress = progress.clone();
+                        let matches = matches.clone();
+                        let stop_flag = stop_flag.clone();
+                        let hit_flag = hit_flag.clone();
+                        handles.push(thread::spawn(move || {
+                            crate::cuda::lottery::worker(
+                                ps,
+                                dev_idx,
+                                progress,
+                                matches,
+                                stop_flag,
+                                hit_flag,
+                                deadline,
+                                start,
+                            );
+                        }));
+                    }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
                     eprintln!("  [GPU] CUDA feature not compiled -- falling back to CPU-only.");
-                    None
                 }
             }
             GpuFramework::Auto => {
@@ -137,8 +171,9 @@ pub fn run(
                 unreachable!("framework Auto must be resolved before workers::run")
             }
         }
+        handles
     } else {
-        None
+        Vec::new()
     };
 
     // ── heartbeat ticker (just print line, no channel) ───────────────
@@ -177,10 +212,10 @@ pub fn run(
     for h in handles {
         let _ = h.join();
     }
-    // Join the GPU worker (if spawned).  It observes the same deadline as the
-    // CPU workers, so it should already be finishing; this just ensures we
-    // wait for its final match flush before reporting.
-    if let Some(h) = gpu_handle {
+    // Join the GPU worker(s) (if spawned).  They observe the same deadline as
+    // the CPU workers, so they should already be finishing; this just ensures
+    // we wait for their final match flush before reporting.
+    for h in gpu_handles {
         let _ = h.join();
     }
     // Signal the heartbeat ticker to stop and wait for it.  Without the join,

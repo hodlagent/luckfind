@@ -21,6 +21,15 @@ rem                              still reports "CUDA kernel was not compiled":
 rem                              cargo's build-script cache can keep a stale
 rem                              stub PTX alive across `cargo build` and even
 rem                              `cargo clean -p <pkg>`.
+rem
+rem  Optional: set CUDA_ARCH to target a specific GPU (default sm_75, Turing+).
+rem    set CUDA_ARCH=sm_89   for RTX 40-series (Ada)
+rem    set CUDA_ARCH=sm_86   for RTX 30-series (Ampere)
+rem    set CUDA_ARCH=sm_61   for GTX 10-series (Pascal) and older
+rem
+rem  NOTE for distribution: a binary built with a NEW CUDA toolkit embeds a NEW
+rem  PTX ISA version, which requires a RECENT NVIDIA driver on the target
+rem  machine (see installer\README.md FAQ "Failed to load CUDA PTX module").
 rem ===========================================================================
 
 set "ROOT=%~dp0"
@@ -92,7 +101,7 @@ if errorlevel 1 goto :fail
 echo.
 echo [OK] Build complete: %ROOT%target\release\luckfind.exe
 echo [OK] Run:           %ROOT%target\release\luckfind.exe --gpu_framework cuda
-echo [OK] Expect:        "[CUDA] lottery worker up on NVIDIA ..." in the startup log
+echo [OK] Expect:        "N CUDA device(s) detected" plus one "[CUDA] lottery worker #i up on ..." line per GPU in the startup log
 exit /b 0
 
 :fail

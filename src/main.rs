@@ -233,13 +233,25 @@ fn main() {
 }
 
 /// Probe CUDA availability (feature-gated: without the `cuda` feature the
-/// backend cannot be used at all).
+/// backend cannot be used at all).  On success, logs the full device inventory
+/// — a custom PC with a mainboard GPU plus several discrete cards shows each
+/// one, and `workers::run` / `puzzle::run` / `remote::run` spawn one worker per
+/// device.
 fn probe_cuda() -> bool {
     #[cfg(feature = "cuda")]
     {
+        // `probe()` prints a helpful message when the CUDA kernel was not
+        // compiled at build time (nvcc/cl.exe unavailable).
         let ok = crate::cuda::CudaScanner::probe();
         if ok {
-            eprintln!("  [GPU] CUDA device detected -- enabling GPU lottery worker.");
+            let names = crate::cuda::CudaScanner::device_names();
+            eprintln!(
+                "  [GPU] {} CUDA device(s) detected -- enabling one GPU worker per device.",
+                names.len()
+            );
+            for (i, name) in names.iter().enumerate() {
+                eprintln!("  [GPU]   device #{i}: {name}");
+            }
         }
         ok
     }

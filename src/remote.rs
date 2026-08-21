@@ -245,7 +245,27 @@ pub fn run(
     }
 
     // ── 2. shared state + SIGINT handler (mirrors puzzle.rs) ───────────────
-    let progress = Arc::new(Progress::new(n_workers as u64));
+    // GPU worker count for the heartbeat's alive counter: WebGPU = 1 worker,
+    // CUDA = one thread per physical device (mainboard + discrete cards).
+    let gpu_worker_count = if gpu_available {
+        match framework {
+            crate::framework::GpuFramework::WebGpu => 1,
+            crate::framework::GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::CudaScanner::device_count() as usize
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    0
+                }
+            }
+            crate::framework::GpuFramework::Auto => 0, // resolved before remote::run
+        }
+    } else {
+        0
+    };
+    let progress = Arc::new(Progress::new((n_workers + gpu_worker_count) as u64));
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     // 命中即停：hit_flag 记录首个命中者（赢家负责打印 [HIT]）；stop_flag 由
@@ -310,45 +330,88 @@ pub fn run(
         )
     });
 
-    // ── 3b. GPU worker thread ────────────────────────────────────────────────
-    // One additional worker that claims pending chunks from the hub and scans
-    // them with the GPU (100k strided walkers, dense zero-overlap tiling,
-    // heartbeats + release-at-rotation for resume).  Runs alongside the CPU
-    // workers, all pulling from the same hub claim pool.  Skipped when main()
-    // resolved no usable GPU device (framework stays as resolved, never Auto).
-    let gpu_handle = if gpu_available {
-        let client = client.clone();
-        let worker_id = worker_id.clone();
-        let progress = progress.clone();
-        let matches = matches.clone();
-        let stop_flag = stop_flag.clone();
-        let hit_flag = hit_flag.clone();
-        Some(std::thread::spawn(move || {
-            remote_gpu_worker_entry(
-                &client,
-                &worker_id,
-                target_h160,
-                puzzle_number,
-                &progress,
-                &matches,
-                &stop_flag,
-                &hit_flag,
-                start,
-                framework,
-            )
-        }))
-    } else {
-        None
-    };
+    // ── 3b. GPU worker thread(s) ─────────────────────────────────────────────
+    // One worker per physical CUDA device (or a single WebGPU worker) that
+    // claims pending chunks from the hub and scans them with the GPU (100k
+    // strided walkers, dense zero-overlap tiling, heartbeats + release-at-
+    // rotation for resume).  Runs alongside the CPU workers, all pulling from
+    // the same hub claim pool.  Skipped when main() resolved no usable GPU
+    // device (framework stays as resolved, never Auto).
+    let mut gpu_handles: Vec<_> = Vec::new();
+    if gpu_available {
+        match framework {
+            crate::framework::GpuFramework::WebGpu => {
+                let client = client.clone();
+                let worker_id = worker_id.clone();
+                let progress = progress.clone();
+                let matches = matches.clone();
+                let stop_flag = stop_flag.clone();
+                let hit_flag = hit_flag.clone();
+                gpu_handles.push(std::thread::spawn(move || {
+                    remote_gpu_worker_entry(
+                        &client,
+                        &worker_id,
+                        target_h160,
+                        puzzle_number,
+                        &progress,
+                        &matches,
+                        &stop_flag,
+                        &hit_flag,
+                        start,
+                        framework,
+                        0, // WebGPU: single device
+                    )
+                }));
+            }
+            crate::framework::GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let n_devices = crate::cuda::CudaScanner::device_count() as u32;
+                    for dev_idx in 0..n_devices {
+                        // One worker thread per device; each clones its own Arc.
+                        let client = client.clone();
+                        let worker_id = worker_id.clone();
+                        let progress = progress.clone();
+                        let matches = matches.clone();
+                        let stop_flag = stop_flag.clone();
+                        let hit_flag = hit_flag.clone();
+                        gpu_handles.push(std::thread::spawn(move || {
+                            remote_gpu_worker_entry(
+                                &client,
+                                &worker_id,
+                                target_h160,
+                                puzzle_number,
+                                &progress,
+                                &matches,
+                                &stop_flag,
+                                &hit_flag,
+                                start,
+                                framework,
+                                dev_idx,
+                            )
+                        }));
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    term_line("[remote] CUDA feature not compiled — running CPU-only.");
+                }
+            }
+            crate::framework::GpuFramework::Auto => {
+                // Resolved to a concrete backend in main() before we get here.
+                unreachable!("framework Auto must be resolved before remote::run")
+            }
+        }
+    }
 
     for h in handles {
         drop(h.join());
     }
-    // The GPU worker finishes its current claim on its own (or stops promptly
-    // once the hub runs out of chunks / a hit fires), so join it before the
-    // stop_flag below — otherwise the flag would cut it off mid-chunk and leak
+    // The GPU workers finish their current claim on their own (or stop promptly
+    // once the hub runs out of chunks / a hit fires), so join them before the
+    // stop_flag below — otherwise the flag would cut them off mid-chunk and leak
     // the lease.
-    if let Some(h) = gpu_handle {
+    for h in gpu_handles {
         drop(h.join());
     }
     // Every worker has returned.  Stop the ticker and wait for it to exit so
@@ -780,7 +843,11 @@ fn remote_gpu_worker_entry(
     hit_flag: &AtomicBool,
     start: Instant,
     framework: crate::framework::GpuFramework,
+    device_index: u32,
 ) {
+    // Only the CUDA arm consumes `device_index` (WebGPU always uses device 0);
+    // silence the unused-param warning in a non-CUDA build.
+    let _ = device_index;
     match framework {
         crate::framework::GpuFramework::WebGpu => {
             let gpu_ctx = match crate::gpu::GpuContext::new_blocking(0) {
@@ -826,22 +893,20 @@ fn remote_gpu_worker_entry(
         crate::framework::GpuFramework::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                if !crate::cuda::CudaScanner::probe() {
-                    term_line("[remote] CUDA unavailable — running CPU-only.");
-                    return;
-                }
                 let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
-                let mut scanner = match crate::cuda::CudaScanner::new(&candidates) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        term_line(&format!(
-                            "[remote] CudaScanner::new failed ({e}) — running CPU-only."
-                        ));
-                        return;
-                    }
-                };
+                let mut scanner =
+                    match crate::cuda::CudaScanner::new_on_device(&candidates, device_index) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            term_line(&format!(
+                                "[remote] CUDA device #{device_index} init failed ({e}) — running CPU-only on this card."
+                            ));
+                            return;
+                        }
+                    };
                 term_line(&format!(
-                    "[remote] CUDA worker up on {}",
+                    "[remote] CUDA worker #{} up on {}",
+                    scanner.device_index(),
                     scanner.device_name()
                 ));
                 scanner.stride = crate::gpu::NUM_GPU_THREADS;
@@ -857,7 +922,8 @@ fn remote_gpu_worker_entry(
                     stop_flag,
                     hit_flag,
                     start,
-                    "CUDA",
+                    // Per-card label so [claim] / [HIT] lines identify the GPU.
+                    &format!("CUDA[{}]", scanner.device_index()),
                 );
             }
             #[cfg(not(feature = "cuda"))]

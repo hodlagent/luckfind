@@ -9,7 +9,7 @@ use crate::gpu::{GpuMatchOutput, GpuState, GpuConfig};
 use crate::cuda::{NUM_GPU_THREADS, WORKGROUP_SIZE, MAX_MATCHES};
 
 use cust::context::{Context as CudaContext, ContextFlags};
-use cust::device::Device;
+use cust::device::{Device, DeviceAttribute};
 use cust::memory::{CopyDestination, DeviceBox, DeviceBuffer};
 use cust::module::Module;
 use cust::stream::{Stream, StreamFlags};
@@ -47,6 +47,8 @@ pub struct CudaScanner {
     pub total_ops: u64,
     /// Device name for logging.
     device_name: String,
+    /// CUDA device ordinal this scanner runs on (0-based).
+    device_index: u32,
     // Dropped LAST (see struct doc): device before context.
     #[allow(dead_code)]
     device: Device,
@@ -55,14 +57,27 @@ pub struct CudaScanner {
 }
 
 impl CudaScanner {
-    /// Initialize CUDA scanner with the given candidate hash160s.
+    /// Initialize CUDA scanner with the given candidate hash160s on device 0.
+    ///
+    /// Backward-compatible convenience — multi-GPU callers should use
+    /// [`Self::new_on_device`] to pick a specific device ordinal.
     pub fn new(candidates: &[[u32; 5]]) -> Result<Self> {
+        Self::new_on_device(candidates, 0)
+    }
+
+    /// Initialize CUDA scanner with the given candidate hash160s on a specific
+    /// device ordinal (0-based, as reported by `nvidia-smi` / `Device::num_devices`).
+    ///
+    /// Each scanner owns its own CUDA context for `device_index`; a worker thread
+    /// per device is the supported multi-GPU arrangement (cust docs: "Users can
+    /// simply make new contexts for every thread with no concern").
+    pub fn new_on_device(candidates: &[[u32; 5]], device_index: u32) -> Result<Self> {
         // Initialize CUDA
         cust::init(cust::CudaFlags::empty())
             .context("CUDA initialization failed — is the NVIDIA driver installed?")?;
 
-        let device = Device::get_device(0)
-            .context("No CUDA-capable device found")?;
+        let device = Device::get_device(device_index)
+            .context(format!("No CUDA-capable device at index {device_index}"))?;
         let device_name = device.name()?;
 
         let context = CudaContext::new(device.clone())
@@ -75,8 +90,19 @@ impl CudaScanner {
 
         // Load PTX module (compiled from kernel.cu at build time)
         let ptx = Self::get_ptx();
-        let module = Module::from_ptx(ptx, &[])
-            .context("Failed to load CUDA PTX module — kernel compilation may have failed at build time")?;
+        let (ptx_ver, ptx_arch) = Self::ptx_header(ptx);
+        let cc = Self::compute_capability(device.clone());
+        let module = Module::from_ptx(ptx, &[]).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load CUDA PTX module on {device_name} (compute capability {cc}).\n\
+                 Embedded PTX: {ptx_ver} targeting {ptx_arch}\n\
+                 Underlying driver error: {e}\n\
+                 This usually means the NVIDIA driver on this machine is too old to JIT-\
+                 compile the PTX ISA this binary was built with.  Update the driver \
+                 (https://www.nvidia.com/drivers) and retry.  If it still fails, rebuild \
+                 luckfind with an older CUDA toolkit, or set CUDA_ARCH to match this GPU."
+            )
+        })?;
 
         // Allocate device memory
         let device_states = DeviceBuffer::<GpuState>::zeroed(NUM_GPU_THREADS as usize)
@@ -120,9 +146,15 @@ impl CudaScanner {
             initial_scalars: Vec::new(),
             total_ops: 0,
             device_name,
+            device_index,
             device,
             context,
         })
+    }
+
+    /// Get the CUDA device ordinal this scanner runs on.
+    pub fn device_index(&self) -> u32 {
+        self.device_index
     }
 
     /// Get the device name for logging.
@@ -130,7 +162,50 @@ impl CudaScanner {
         &self.device_name
     }
 
-    /// Probe whether a CUDA device is available without creating a full scanner.
+    /// Number of CUDA-capable devices visible to the driver (0 = none/disabled).
+    ///
+    /// Gated on `cuda_compiled` (set by build.rs only when nvcc actually
+    /// produced a real PTX) so a stub PTX from a failed nvcc run never reports
+    /// phantom devices.  Quiet by design — callers decide how to log it.
+    pub fn device_count() -> u32 {
+        #[cfg(not(cuda_compiled))]
+        {
+            0
+        }
+        #[cfg(cuda_compiled)]
+        {
+            if cust::init(cust::CudaFlags::empty()).is_err() {
+                return 0;
+            }
+            Device::num_devices().unwrap_or(0)
+        }
+    }
+
+    /// Names of all CUDA-capable devices, in device-ordinal order.
+    ///
+    /// Used at startup to log the multi-GPU inventory ("识别多张显卡").  Empty
+    /// when CUDA is disabled or no device is reachable.
+    pub fn device_names() -> Vec<String> {
+        #[cfg(not(cuda_compiled))]
+        {
+            Vec::new()
+        }
+        #[cfg(cuda_compiled)]
+        {
+            if cust::init(cust::CudaFlags::empty()).is_err() {
+                return Vec::new();
+            }
+            let n = Device::num_devices().unwrap_or(0);
+            (0..n)
+                .filter_map(|i| Device::get_device(i).ok())
+                .filter_map(|d| d.name().ok())
+                .collect()
+        }
+    }
+
+    /// Probe whether any CUDA device is available without creating a full
+    /// scanner.  True when ≥1 device is reachable; per-device `new_on_device`
+    /// still fails individually (e.g. a too-old GPU that cannot JIT the PTX).
     ///
     /// Gated on `cuda_compiled` (set by build.rs only when nvcc actually
     /// produced a real PTX).  Without the gate, a stub PTX from a failed nvcc
@@ -145,10 +220,7 @@ impl CudaScanner {
         }
         #[cfg(cuda_compiled)]
         {
-            if cust::init(cust::CudaFlags::empty()).is_err() {
-                return false;
-            }
-            Device::get_device(0).is_ok()
+            Self::device_count() > 0
         }
     }
 
@@ -156,6 +228,37 @@ impl CudaScanner {
     /// The PTX is embedded at compile time by build.rs.
     fn get_ptx() -> &'static str {
         include_str!(concat!(env!("OUT_DIR"), "/luckfind.ptx"))
+    }
+
+    /// Extract the PTX ISA version and target arch from the embedded header,
+    /// e.g. (".version 8.7", ".target sm_89").  Used to diagnose driver-vs-PTX
+    /// compatibility when `cuModuleLoadData` fails.
+    fn ptx_header(ptx: &str) -> (String, String) {
+        let grab = |prefix: &str| -> String {
+            ptx.lines()
+                .find_map(|l| {
+                    l.trim().strip_prefix(prefix).map(|rest| {
+                        let v = rest.trim();
+                        if v.is_empty() {
+                            format!("{prefix}?")
+                        } else {
+                            format!("{prefix}{v}")
+                        }
+                    })
+                })
+                .unwrap_or_else(|| format!("{prefix}?"))
+        };
+        (grab(".version"), grab(".target"))
+    }
+
+    /// Human-readable device compute capability ("8.9"), or "?" if unreadable.
+    fn compute_capability(device: Device) -> String {
+        let major = device.clone().get_attribute(DeviceAttribute::ComputeCapabilityMajor);
+        let minor = device.get_attribute(DeviceAttribute::ComputeCapabilityMinor);
+        match (major, minor) {
+            (Ok(m), Ok(n)) => format!("{m}.{n}"),
+            _ => "?".to_string(),
+        }
     }
 
     /// Initialize states with random starting points inside the puzzle key space.

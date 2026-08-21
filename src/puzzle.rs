@@ -745,7 +745,23 @@ pub fn run(
 
     // ── 2. shared state + SIGINT flag ───────────────────────────────────────
     let ctx = Arc::new(Mutex::new(ctx));
-    let progress = Arc::new(Progress::new(n_workers as u64));
+    // GPU worker count for the heartbeat's alive counter: WebGPU = 1 worker,
+    // CUDA = one thread per physical device (mainboard + discrete cards).
+    let gpu_worker_count = match framework {
+        crate::framework::GpuFramework::WebGpu => 1,
+        crate::framework::GpuFramework::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::CudaScanner::device_count() as usize
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                0
+            }
+        }
+        crate::framework::GpuFramework::Auto => 0, // resolved before puzzle::run
+    };
+    let progress = Arc::new(Progress::new((n_workers + gpu_worker_count) as u64));
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     // 命中即停：`hit_flag` 标记首个命中者（赢家负责打印 [HIT]）。`stop_flag` 由
@@ -799,55 +815,71 @@ pub fn run(
         }));
     }
 
-    // ── 3b. GPU worker thread ────────────────────────────────────────────────
-    // One additional worker that claims whatever pending chunks the CPU workers
-    // haven't taken and scans them with the GPU (100k strided walkers, dense
-    // zero-overlap tiling, per-dispatch checkpoint).  Falls back to CPU-only if
-    // the selected backend is unavailable.  Rotation is passed through so the
-    // GPU worker participates in the same per-claim park-and-rotate strategy as
-    // the CPUs.
-    let gpu_ctx = ctx.clone();
-    let gpu_progress = progress.clone();
-    let gpu_matches = matches.clone();
-    let gpu_stop = stop_flag.clone();
-    let gpu_hit = hit_flag.clone();
-    let gpu_handle = std::thread::spawn(move || {
-        match framework {
-            crate::framework::GpuFramework::WebGpu => gpu_puzzle_worker(
-                target_h160,
-                gpu_ctx,
-                &gpu_progress,
-                &gpu_matches,
-                &gpu_stop,
-                &gpu_hit,
-                start,
-                gpu_rotate_keys,
-            ),
-            crate::framework::GpuFramework::Cuda => {
-                #[cfg(feature = "cuda")]
-                {
-                    cuda_puzzle_worker(
-                        target_h160,
-                        gpu_ctx,
-                        &gpu_progress,
-                        &gpu_matches,
-                        &gpu_stop,
-                        &gpu_hit,
-                        start,
-                        gpu_rotate_keys,
-                    );
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    term_line("[puzzle] CUDA feature not compiled — running CPU-only.");
+    // ── 3b. GPU worker thread(s) ─────────────────────────────────────────────
+    // One worker per physical CUDA device (or a single WebGPU worker) that
+    // claims whatever pending chunks the CPU workers haven't taken and scans
+    // them with the GPU (100k strided walkers, dense zero-overlap tiling,
+    // per-dispatch checkpoint).  Falls back to CPU-only for that card if the
+    // backend/device is unavailable; the other devices and CPUs continue.
+    // Rotation is passed through so each GPU worker participates in the same
+    // per-claim park-and-rotate strategy as the CPUs.
+    let mut gpu_handles: Vec<_> = Vec::new();
+    match framework {
+        crate::framework::GpuFramework::WebGpu => {
+            let gpu_ctx = ctx.clone();
+            let gpu_progress = progress.clone();
+            let gpu_matches = matches.clone();
+            let gpu_stop = stop_flag.clone();
+            let gpu_hit = hit_flag.clone();
+            gpu_handles.push(std::thread::spawn(move || {
+                gpu_puzzle_worker(
+                    target_h160,
+                    gpu_ctx,
+                    &gpu_progress,
+                    &gpu_matches,
+                    &gpu_stop,
+                    &gpu_hit,
+                    start,
+                    gpu_rotate_keys,
+                );
+            }));
+        }
+        crate::framework::GpuFramework::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                let n_devices = crate::cuda::CudaScanner::device_count() as u32;
+                for dev_idx in 0..n_devices {
+                    // One worker thread per device; each clones its own Arc.
+                    let gpu_ctx = ctx.clone();
+                    let gpu_progress = progress.clone();
+                    let gpu_matches = matches.clone();
+                    let gpu_stop = stop_flag.clone();
+                    let gpu_hit = hit_flag.clone();
+                    gpu_handles.push(std::thread::spawn(move || {
+                        cuda_puzzle_worker(
+                            target_h160,
+                            gpu_ctx,
+                            &gpu_progress,
+                            &gpu_matches,
+                            &gpu_stop,
+                            &gpu_hit,
+                            start,
+                            gpu_rotate_keys,
+                            dev_idx,
+                        );
+                    }));
                 }
             }
-            crate::framework::GpuFramework::Auto => {
-                // Resolved to a concrete backend in main() before we get here.
-                unreachable!("framework Auto must be resolved before puzzle::run")
+            #[cfg(not(feature = "cuda"))]
+            {
+                term_line("[puzzle] CUDA feature not compiled — running CPU-only.");
             }
         }
-    });
+        crate::framework::GpuFramework::Auto => {
+            // Resolved to a concrete backend in main() before we get here.
+            unreachable!("framework Auto must be resolved before puzzle::run")
+        }
+    }
 
     // ── 4. heartbeat ticker: status line only (no periodic DB save) ──────────
     let hb_ctx = ctx.clone();
@@ -923,7 +955,9 @@ pub fn run(
     for h in handles {
         drop(h.join());
     }
-    drop(gpu_handle.join()); // GPU worker (no-op if it fell back to CPU-only)
+    for h in gpu_handles {
+        drop(h.join()); // GPU workers (no-op if a card fell back to CPU-only)
+    }
     drop(hb_handle); // ticker sees stop flag on its next tick and exits
 
     let (final_file, final_matches) = {
@@ -1657,9 +1691,10 @@ fn gpu_puzzle_worker(
     );
 }
 
-/// One CUDA puzzle worker thread — same dense-tiling scan as `gpu_puzzle_worker`
-/// but on the CUDA backend.  Falls back to CPU-only when CUDA is unavailable
-/// (no device, or the kernel was not compiled — see `CudaScanner::probe`).
+/// One CUDA puzzle worker thread for a single device ordinal — same dense-tiling
+/// scan as `gpu_puzzle_worker` but on the CUDA backend.  Falls back to CPU-only
+/// for that card when the device is unavailable (no device, or the kernel was
+/// not compiled — see `CudaScanner::device_count`); other cards continue.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
 fn cuda_puzzle_worker(
@@ -1671,21 +1706,21 @@ fn cuda_puzzle_worker(
     hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
+    device_index: u32,
 ) {
-    if !crate::cuda::CudaScanner::probe() {
-        term_line("[puzzle] CUDA unavailable — running CPU-only.");
-        return;
-    }
     let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
-    let mut scanner = match crate::cuda::CudaScanner::new(&candidates) {
+    let mut scanner = match crate::cuda::CudaScanner::new_on_device(&candidates, device_index) {
         Ok(s) => s,
         Err(e) => {
-            term_line(&format!("[puzzle] CudaScanner::new failed ({e}) — running CPU-only."));
+            term_line(&format!(
+                "[puzzle] CUDA device #{device_index} init failed ({e}) — running CPU-only on this card."
+            ));
             return;
         }
     };
     term_line(&format!(
-        "[puzzle] CUDA worker up on {}",
+        "[puzzle] CUDA worker #{} up on {}",
+        scanner.device_index(),
         scanner.device_name()
     ));
     // Dense-tiling config: stride = N threads, single target candidate.
@@ -1702,7 +1737,8 @@ fn cuda_puzzle_worker(
         hit_flag,
         start,
         rotate_keys,
-        "CUDA",
+        // Per-card label so [claim] / [HIT] lines identify the physical GPU.
+        &format!("CUDA[{}]", scanner.device_index()),
     );
 }
 

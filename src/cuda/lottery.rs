@@ -18,9 +18,10 @@ use crate::workers::MatchEvent;
 /// Re-seed the GPU walkers after this many keys have been scanned.
 pub const RESEED_INTERVAL_KEYS: u64 = 1 << 26;
 
-/// One CUDA GPU lottery worker thread.
+/// One CUDA GPU lottery worker thread for a single device ordinal.
 pub fn worker(
     puzzle_set: &'static crate::puzzles::PuzzleSet,
+    device_index: u32,
     progress: Arc<Progress>,
     matches: Arc<Mutex<Vec<MatchEvent>>>,
     stop_flag: Arc<AtomicBool>,
@@ -28,18 +29,26 @@ pub fn worker(
     deadline: Option<Instant>,
     start: Instant,
 ) {
-    // Set up CUDA scanner.  If no CUDA device is available, log and fall back.
+    // Set up CUDA scanner on this device.  If that device is unavailable (e.g.
+    // a too-old GPU that cannot JIT the PTX), log and fall back — other devices
+    // have their own workers and are unaffected.
     let candidates = convert::puzzle_set_to_candidates(puzzle_set);
     let candidate_count = puzzle_set.ranges().len() as u32;
 
-    let mut scanner = match CudaScanner::new(&candidates) {
+    let mut scanner = match CudaScanner::new_on_device(&candidates, device_index) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("  [CUDA] scanner init failed ({e}) — lottery running CPU-only.");
+            eprintln!(
+                "  [CUDA] device #{device_index} scanner init failed ({e}) — lottery running CPU-only on this card."
+            );
             return;
         }
     };
-    eprintln!("  [CUDA] lottery worker up on {}", scanner.device_name());
+    eprintln!(
+        "  [CUDA] lottery worker #{} up on {}",
+        scanner.device_index(),
+        scanner.device_name()
+    );
 
     // Lottery config: stride 1 (step = G), all candidates.
     scanner.stride = 1;
@@ -70,7 +79,7 @@ pub fn worker(
                         let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
                         let mut out = Vec::new();
                         for m in &batch_matches {
-                            let mut ev = gpu_match_to_event(m, puzzle_set, start);
+                            let mut ev = gpu_match_to_event(m, puzzle_set, device_index, start);
                             // CPU verification
                             let h = btc::hash160(&ev.compressed);
                             if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h) {
@@ -94,9 +103,10 @@ pub fn worker(
                             .is_ok()
                         {
                             println!(
-                                "[HIT] 🎯 puzzle=#{} worker=CUDA sk_hex={}",
+                                "[HIT] 🎯 puzzle=#{} worker=CUDA[{}] sk_hex={}",
                                 first.puzzle_number
                                     .map_or_else(String::new, |n| n.to_string()),
+                                device_index,
                                 hex::encode(first.private_key),
                             );
                         }
@@ -122,7 +132,8 @@ pub fn worker(
     }
 
     eprintln!(
-        "  [CUDA] lottery worker done. total_keys={}",
+        "  [CUDA] lottery worker #{} done. total_keys={}",
+        scanner.device_index(),
         scanner.total_ops
     );
 }
@@ -131,6 +142,7 @@ pub fn worker(
 fn gpu_match_to_event(
     m: &GpuMatchOutput,
     _puzzle_set: &crate::puzzles::PuzzleSet,
+    device_index: u32,
     start: Instant,
 ) -> MatchEvent {
     let priv_be = convert::limbs_to_be_bytes(&m.scalar);
@@ -142,7 +154,8 @@ fn gpu_match_to_event(
         private_key: priv_be,
         compressed: pk.serialize().to_vec(),
         uncompressed: pk.serialize_uncompressed().to_vec(),
-        worker_id: 0,
+        // CUDA device ordinal — distinguishes which physical card found it.
+        worker_id: device_index,
         chunk_id: None,
         key_index: 0,
         elapsed: start.elapsed().as_secs_f64(),

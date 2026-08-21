@@ -153,6 +153,40 @@ Notes:
 - Verify the backend: `target\release\luckfind.exe --gpu_framework cuda`
   should log `[CUDA] lottery worker up on NVIDIA ...` at startup.
 
+**Multi-GPU (mainboard + discrete cards):** all CUDA-capable devices are
+enumerated at startup and **one worker thread is spawned per device**, in every
+mode (lottery, `--puzzle`, `--remote`).  Startup logs the full inventory, e.g.
+
+```
+  [GPU] 2 CUDA device(s) detected -- enabling one GPU worker per device.
+  [GPU]   device #0: NVIDIA GeForce RTX 3070
+  [GPU]   device #1: NVIDIA GeForce RTX 3090
+  [CUDA] lottery worker #0 up on NVIDIA GeForce RTX 3070
+  [CUDA] lottery worker #1 up on NVIDIA GeForce RTX 3090
+```
+
+Each card runs its own CUDA context (one OS thread per device); a card that
+fails to load the kernel (e.g. too old to JIT the embedded PTX) logs a diagnostic
+and skips itself — the other cards and the CPU workers continue.  `[HIT]` /
+`[claim]` lines carry the device ordinal (`worker=CUDA[0]`, `w=CUDA[1]`) so you
+can tell which physical GPU found a key.  Use `nvidia-smi` to confirm the load
+spreads across cards.
+
+### Windows: building an installer (distribute to other machines)
+
+To hand `luckfind.exe` to machines that don't have VS / CUDA toolkit installed,
+use the [`installer/`](installer/README.md) package.  The target machine only
+needs an NVIDIA driver; the installer auto-installs the Microsoft VC++ 2015-2022
+x64 runtime (the only MSVC dependency of the exe) and copies the binary:
+
+```bat
+cd installer
+build-installer.bat        :: build exe → fetch vc_redist → produce Luckfind-Setup.exe
+```
+
+A portable option (`luckfind.exe` + `install-vcredist.bat`) is also provided in
+[`installer/README.md`](installer/README.md).
+
 ## Usage
 
 ```sh
@@ -173,7 +207,7 @@ bin/luckfind --bench                           # 5s speed benchmark, then exit
 | `--load`, `-l` | 1.0 | Accepted for back-compat; unused |
 | `--output-dir`, `-o` | `.` | Directory for `aman_<UTC>.txt` |
 | `--heartbeat`, `-H` | 10.0 | Seconds between progress lines |
-| `--gpu_framework` | auto | `auto` / `webgpu` / `cuda` |
+| `--gpu_framework` | auto | `auto` / `webgpu` / `cuda`; `cuda` uses every detected GPU, one worker each |
 | `--config` | auto | TOML config file; else `luckfind.toml`/`config.toml` in cwd |
 | `--puzzle` | — | Puzzle mode worklist (`.json` → `.db`) |
 | `--remote` | — | Remote mode hub URL (`http://host:port`) |
