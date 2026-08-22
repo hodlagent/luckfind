@@ -200,6 +200,11 @@ bin/luckfind --config luckfind.toml            # run from a TOML config file
 bin/luckfind --bench                           # 5s speed benchmark, then exit
 ```
 
+Remote-mode wire protocol (claim / heartbeat / release / done, plus the hub's
+reclaim timing) is documented in [`docs/remote-protocol.md`](docs/remote-protocol.md);
+the hub's HTTP API (endpoints, payloads, error codes) lives in the lan-hub repo
+(`docs/remote-api.md`).
+
 | Flag | Default | Description |
 |---|---|---|
 | `--duration`, `-d` | none (forever) | Runtime limit in minutes |
@@ -237,6 +242,18 @@ mode = "puzzle"
 # parking its chunk and claiming a fresh random one.  0 disables rotation.
 cpu_rotate_keys = 134217728      # 2^27, CPU per-claim budget
 gpu_rotate_keys = 2147483648     # 2^31, GPU per-claim budget
+
+# CPU workers: enabled toggles CPU scanning (default true); load is the
+# proportion (0.1..=1.0) of the `--workers` thread count that actually runs.
+# load = 0.5 leaves half the CPU threads idle for other work.
+[cpu]
+enabled = true
+load = 1.0
+
+# GPU collision scanning: engaged only when enabled (default true) AND a GPU
+# device is actually available.  false forces a CPU-only run even on a GPU box.
+[gpu]
+enabled = true
 
 [puzzle]                         # required when mode = "puzzle"
 database = "bin/71.db"           #   → run: bin/luckfind --config luckfind.toml
