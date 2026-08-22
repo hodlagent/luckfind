@@ -72,19 +72,27 @@
 
 | 端点 | 方法 | 请求体（节选） | 语义 |
 |---|---|---|---|
-| `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况 |
+| `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；`meta.solved/win` 表明是否已有人命中 |
 | `/api/chunks/claim` | POST | `{worker_id, count}` | 领取 `count` 个 pending chunk |
 | `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
-| `/api/chunks/{id}/done` | POST | `{worker_id}` | 扫完/命中：置 finished、删 lease |
+| `/api/chunks/{id}/done` | POST | `{worker_id}` | 整段扫完：置 finished、删 lease |
+| `/api/win` | POST | `{worker_id, chunk_id}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved |
 | `/api/chunks/{id}/release` | POST | `{worker_id, current_hex?, end_hex?}` | 旋转/放弃：保存进度、回退 pending、删 lease |
 
 响应/错误约定：
 
-- **claim 成功**返回 `{granted, chunks: [{id, current_hex, end_hex}]}`；
-  `granted=0` 表示 hub 当前没有可领的 pending chunk。
+- **claim 成功**返回 `{granted, chunks: [{id, current_hex, end_hex}], solved}`；
+  `granted=0` 表示 hub 当前没有可领的 pending chunk；`solved=true` 表示别的 worker
+  已命中 → worker 应停止。
+- **heartbeat 成功**返回 `{ok, solved}`——`solved=true` 让正在扫 chunk 的 worker
+  **提前放弃本 claim**（下轮 claim 退出），不必等一轮扫完。
 - **404**：chunk 无 lease（`_require_owner`，`puzzle.py:166`）→ lease 已丢。
-- **409**：chunk 被别的 worker 持有（`puzzle.py:168`）→ lease 已丢。
+- **409**：chunk 被别的 worker 持有（`puzzle.py:168`）→ lease 已丢；`/api/win` 的
+  409 表示 puzzle 已被其他 worker 先标记 solved。
 - 心跳 `keys`/`rate` 是瞬态指标，hub 只存内存、不落库（`metrics.py`）。
+- solved 落盘：`POST /api/win` 后 hub 在 `backend/data/` 写
+  `{puzzle_number}_{timestamp}.txt`（worker_id/chunk_id，**不含私钥**）；文件存在即
+  solved，重启不丢。
 
 ---
 
@@ -100,9 +108,10 @@ worker                                   hub (lan-hub)
 
 ② 领取 chunk（每个线程 ≤1 个）
    └─ POST /api/chunks/claim ─────────→ {worker_id, count: 1}
-   ←──────────────────────────────────── {granted, chunks[0]}
+   ←──────────────────────────────────── {granted, chunks[0], solved}
+   └─ solved=true → 别的 worker 已命中，直接退出
    └─ granted=0：
-      ├─ 查一次 /api/status，pending+running==0 → 全部扫完，退出
+      ├─ 查一次 /api/status，solved 或 pending+running==0 → 退出
       └─ 否则 sleep 2s 重试（CLAIM_IDLE）
 
 ③ 扫描阶段（方向随机 FWD/REV；GPU 固定 forward 密集铺片）
@@ -110,6 +119,7 @@ worker                                   hub (lan-hub)
       POST /api/chunks/{id}/heartbeat → {worker_id, current|end, keys, rate}
          · forward 发 current_hex，reverse 发 end_hex —— 两字段各承载完整续扫位置
          · keys/rate = 整机累计 keys + 该窗口速率（hub 内存缓存）
+   └─ 响应 solved=true → 别的 worker 已命中，**提前放弃本 claim**（下轮 claim 退出）
    └─ 心跳 404/409 → lease 已丢，放弃本 chunk 直接重新 claim（绝不崩溃）
 
 ④a 旋转预算打满 / 首次 Ctrl+C：
@@ -117,8 +127,10 @@ worker                                   hub (lan-hub)
         （断点交还 hub，下一轮再 claim 新 chunk）
 
 ④b 扫完 / 命中：
-   └─ POST /api/chunks/{id}/done    ──→ {worker_id}
-        （命中时该 worker 打印 [HIT]，done 后整个 run 停止）
+   └─ 扫完：POST /api/chunks/{id}/done ─→ {worker_id}
+   └─ 命中：POST /api/win ──────────────→ {worker_id, chunk_id}
+        （打印 [HIT]；hub 落 win 记录、置 solved；整个 run 停止，
+          其它 worker 在下一次 claim/心跳读到 solved 也停止）
 
 ⑤ 背景 status ticker（独立线程，默认每 10s）
    └─ GET /api/status        ────────→   仅重绘状态行，不参与 lease 维护
@@ -186,6 +198,9 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
    `heartbeat_secs` 查一次 `/api/status` 重绘进度行，与 lease 维护完全无关。
 3. **`claim` 失败 ≠ lease 丢失**。transport 错误（hub 慢/挂）只 sleep 2s 重试；
    只有 404/409 才代表该 chunk 的 lease 已不归我们（`is_lease_lost`，`remote.rs:113`）。
+4. **`win` ≠ `done`**。`/api/win` 只在命中时调用：除了 done 的最终化，还会让 hub 落
+   win 记录文件并置 puzzle solved，从而广播停止其它 worker。扫完一整个区间（没命中）
+   仍走 `done`。`/api/win` 不带私钥——私钥只留在命中 worker 本地的 `aman_*.txt`。
 
 ---
 
@@ -201,5 +216,6 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 | status ticker | `remote.rs:532-609` | — |
 | lease 归属校验（404/409） | `remote.rs:113-115` | `puzzle.py:160-168` |
 | 心跳落库 + lease 刷新 | — | `puzzle.py:170-204` |
-| done / release | `remote.rs:180-207` | `puzzle.py:206-255` |
+| done / win / release | `remote.rs:180-235` | `puzzle.py:206-290`、`win.py` |
+| solved 广播（claim/heartbeat/status 响应） | `remote.rs` 三处停止点 | `routes.py`、`puzzle.py:solved()` |
 | 回收循环与孤儿清理 | — | `main.py:26-40`、`puzzle.py:326-379` |

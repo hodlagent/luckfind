@@ -9,8 +9,14 @@
 //!   2. scans it with the shared CPU core (`crate::puzzle::scan_chunk`),
 //!   3. keeps the lease alive with throttled heartbeats (~30s ≪ the hub's 120s
 //!      reclaim timeout) that also carry the scan position,
-//!   4. reports back via `done` (finished / match) or `release` (parked, with
-//!      the resume position — forward `current`, reverse `end`).
+//!   4. reports back via `win` (match) / `done` (finished) or `release`
+//!      (parked, with the resume position — forward `current`, reverse `end`).
+//!
+//! Solved signaling: when a worker finds the key it posts `/api/win`; the hub
+//! persists the win record and marks the puzzle solved.  That state is
+//! broadcast on claim / heartbeat / status responses, and every worker stops
+//! promptly when it sees it (mid-claim workers abort on the next heartbeat;
+//! idle workers exit on the next claim).
 //!
 //! Crash recovery is the hub's job: a worker that dies (or loses the network)
 //! stops heartbeating, and the hub reclaims the lease after 120s, reverting the
@@ -67,6 +73,9 @@ struct HubMeta {
     puzzle_number: u32,
     target: String,
     hash160: Option<String>,
+    /// puzzle 已被某个 worker 命中（hub 落盘 win 记录）。旧 hub 不返回 → false。
+    #[serde(default)]
+    solved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +107,17 @@ struct ClaimResponse {
     granted: usize,
     #[serde(default)]
     chunks: Vec<ClaimedChunk>,
+    /// hub 已 solved：别的 worker 已命中 → 本 worker 应停止。旧 hub 不返回 → false。
+    #[serde(default)]
+    solved: bool,
+}
+
+/// `POST /api/chunks/{id}/heartbeat` 的响应体：`{ok, solved?}`。solved 用于让正在
+/// 扫 chunk 的 worker 尽快停止；旧 hub 不返回 solved → 默认 false。
+#[derive(Debug, Default, Deserialize)]
+struct HeartbeatResp {
+    #[serde(default)]
+    solved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +174,8 @@ impl HubClient {
         resp.into_body().read_json()
     }
 
+    /// Heartbeat。Ok(true) 表示 hub 已 solved（别的 worker 命中）——调用方应尽快
+    /// 停止本 claim。响应体解析失败按未 solved 处理（旧 hub 只回 `{ok:true}`）。
     fn heartbeat(
         &self,
         chunk_id: u32,
@@ -162,7 +184,7 @@ impl HubClient {
         end_hex: Option<String>,
         keys: Option<u64>,
         rate: Option<f64>,
-    ) -> Result<(), ureq::Error> {
+    ) -> Result<bool, ureq::Error> {
         let body = ChunkUpdateBody {
             worker_id: worker_id.to_string(),
             current_hex,
@@ -170,11 +192,12 @@ impl HubClient {
             keys,
             rate,
         };
-        let _ = self
+        let resp = self
             .agent
             .post(&self.url(&format!("/api/chunks/{chunk_id}/heartbeat")))
             .send_json(body)?;
-        Ok(())
+        let parsed: HeartbeatResp = resp.into_body().read_json().unwrap_or_default();
+        Ok(parsed.solved)
     }
 
     fn done(&self, chunk_id: u32, worker_id: &str) -> Result<(), ureq::Error> {
@@ -182,6 +205,16 @@ impl HubClient {
             .agent
             .post(&self.url(&format!("/api/chunks/{chunk_id}/done")))
             .send_json(json!({ "worker_id": worker_id }))?;
+        Ok(())
+    }
+
+    /// 命中上报（取代 done）：hub 落 win 记录 + 置 puzzle solved。409（已被别的
+    /// worker 先标记 solved）按 lease 丢失处理即可——本 worker 放弃本 chunk。
+    fn win(&self, chunk_id: u32, worker_id: &str) -> Result<(), ureq::Error> {
+        let _ = self
+            .agent
+            .post(&self.url("/api/win"))
+            .send_json(json!({ "worker_id": worker_id, "chunk_id": chunk_id }))?;
         Ok(())
     }
 
@@ -491,6 +524,13 @@ fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
     };
 
     let meta = &status.meta;
+    if meta.solved {
+        term_line(&format!(
+            "[remote] hub 已 solved（有 worker 命中 puzzle #{}）— 无需工作。",
+            meta.puzzle_number,
+        ));
+        std::process::exit(0);
+    }
     let target_h160 = btc::legacy_address_hash160(&meta.target).unwrap_or_else(|| {
         eprintln!("[remote] hub target {} is not a valid P2PKH address", meta.target);
         std::process::exit(2);
@@ -651,6 +691,12 @@ fn remote_worker(
             }
         };
 
+        if claimed.solved {
+            // 别的 worker 已命中：hub 不再发任务，本 worker 停止。
+            term_line("[remote] hub 已 solved（其他 worker 找到私钥）— 退出。");
+            return;
+        }
+
         if claimed.granted == 0 || claimed.chunks.is_empty() {
             // Nothing pending: every chunk is running elsewhere, or the puzzle
             // is complete.  Check the hub before spinning.
@@ -658,7 +704,7 @@ fn remote_worker(
                 return;
             }
             match client.status() {
-                Ok(s) if s.summary.pending + s.summary.running == 0 => return, // all done
+                Ok(s) if s.meta.solved || s.summary.pending + s.summary.running == 0 => return, // solved / all done
                 _ => {}
             }
             std::thread::sleep(CLAIM_IDLE);
@@ -693,6 +739,9 @@ fn remote_worker(
         // to the end of the claim, and re-claim; the hub already reverted the
         // chunk to pending at the last successful heartbeat.
         let mut lease_lost = false;
+        // Set by the heartbeat closure when the hub reports solved (someone
+        // else found the key); we then abort the scan and skip the release.
+        let mut solved_flag = false;
         let mut last_hb = Instant::now();
         // Worker-wide cumulative keys at the last heartbeat — the delta over
         // the heartbeat window is the rate broadcast to the hub (same source
@@ -736,9 +785,14 @@ fn remote_worker(
                     0.0
                 };
                 match client.heartbeat(chunk_id, worker_id, cur, end, Some(keys), Some(rate)) {
-                    Ok(()) => {
+                    Ok(solved) => {
                         last_hb = Instant::now();
                         last_keys = keys;
+                        if solved {
+                            // 别的 worker 已命中：尽快放弃本 claim（下轮 claim 退出）。
+                            solved_flag = true;
+                            abort_flag.store(true, Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         if is_lease_lost(&e) {
@@ -758,14 +812,19 @@ fn remote_worker(
         if lease_lost {
             continue; // hub already parked our chunk; nothing to finalize
         }
+        if solved_flag {
+            // 别的 worker 已命中：hub 已 solved，无需 release/park——下轮 claim
+            // 读到 solved 即退出。
+            continue;
+        }
 
         if outcome.matched {
-            // Win: mark the chunk finished on the hub, then stop (scan_chunk
-            // already set stop_flag + hit_flag for every worker).
-            if let Err(e) = client.done(chunk_id, worker_id) {
+            // Win: report the hit to the hub (`/api/win` — hub 落 win 记录 + 置
+            // solved), then stop (scan_chunk already set stop_flag + hit_flag).
+            if let Err(e) = client.win(chunk_id, worker_id) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
-                        "[remote] done failed ({e}) — hub will reclaim the chunk"
+                        "[remote] win failed ({e}) — hub will reclaim the chunk"
                     ));
                 }
             }
@@ -990,6 +1049,11 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                 continue;
             }
         };
+        if claimed.solved {
+            // 别的 worker 已命中：hub 不再发任务，本 worker 停止。
+            term_line("[remote] hub 已 solved（其他 worker 找到私钥）— 退出。");
+            return;
+        }
         if claimed.granted == 0 || claimed.chunks.is_empty() {
             // Nothing pending: every chunk is running elsewhere, or the puzzle
             // is complete.  Check the hub before spinning.
@@ -997,7 +1061,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                 return;
             }
             match client.status() {
-                Ok(s) if s.summary.pending + s.summary.running == 0 => return, // all done
+                Ok(s) if s.meta.solved || s.summary.pending + s.summary.running == 0 => return, // solved / all done
                 _ => {}
             }
             std::thread::sleep(CLAIM_IDLE);
@@ -1040,6 +1104,8 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
         let mut hit = false; // CPU-verified match → this chunk is the winner
         let mut lease_lost = false;
+        // 心跳报告 hub 已 solved（别的 worker 命中）→ 提前退出，不 park。
+        let mut solved = false;
         let mut last_hb = Instant::now();
         // Worker-wide cumulative keys at the last heartbeat — the delta over
         // the heartbeat window is the rate broadcast to the hub.
@@ -1094,9 +1160,14 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                     Some(keys),
                     Some(rate),
                 ) {
-                    Ok(()) => {
+                    Ok(hub_solved) => {
                         last_hb = Instant::now();
                         last_keys = keys;
+                        if hub_solved {
+                            // 别的 worker 已命中：尽快退出（下轮 claim 停止）。
+                            solved = true;
+                            break;
+                        }
                     }
                     Err(e) => {
                         if is_lease_lost(&e) {
@@ -1200,14 +1271,19 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         if lease_lost {
             continue; // hub already parked our chunk; nothing to finalize
         }
+        if solved {
+            // 别的 worker 已命中：hub 已 solved，无需 release/park——下轮 claim
+            // 读到 solved 即退出。
+            continue;
+        }
 
         if hit {
-            // Win: mark the chunk finished on the hub, then stop (the scan
-            // already set stop_flag + hit_flag for every worker).
-            if let Err(e) = client.done(chunk_id, worker_id) {
+            // Win: report the hit to the hub (`/api/win` — hub 落 win 记录 + 置
+            // solved), then stop (the scan already set stop_flag + hit_flag).
+            if let Err(e) = client.win(chunk_id, worker_id) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
-                        "[remote] done failed ({e}) — hub will reclaim the chunk"
+                        "[remote] win failed ({e}) — hub will reclaim the chunk"
                     ));
                 }
             }
