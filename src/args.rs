@@ -54,6 +54,9 @@ pub struct Cli {
     ///   mode = "random" | "puzzle" | "remote"   (default "random")
     ///   cpu_rotate_keys = <u64>                 (puzzle rotation budget)
     ///   gpu_rotate_keys = <u64>                 (puzzle rotation budget)
+    ///   [cpu] enabled = true|false              (default true)
+    ///   [cpu] load = 0.1..=1.0                  (proportion of CPU threads; default 1.0)
+    ///   [gpu] enabled = true|false              (default true; GPU used only if a device is available)
     ///   [puzzle] database = "<path>"            (required when mode = "puzzle")
     ///   [remote] uri = "<url>"                  (required when mode = "remote")
     #[arg(long)]

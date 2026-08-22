@@ -596,6 +596,12 @@ fn save_dirty(ctx: &mut PuzzleCtx) -> Result<(), String> {
 /// `None` preserves classic behaviour — a chunk is scanned to completion per
 /// claim.  When set, `n_workers` slots each churn through random chunks, giving
 /// a "jump around the worklist" effect instead of sweeping it in order.
+///
+/// `framework` selects the concrete GPU backend (never `Auto`).  `gpu` gates
+/// whether any GPU worker threads are spawned at all — the resolved
+/// `[gpu] enabled` × device-availability result from main.  When `false`, the
+/// run is CPU-only; each worker keeps its self-probing fallback so a card that
+/// fails to initialise still degrades to CPU-only for that thread.
 pub fn run(
     path: &Path,
     n_workers: usize,
@@ -604,6 +610,7 @@ pub fn run(
     gpu_rotate_keys: Option<u64>,
     output_dir: Option<&Path>,
     framework: crate::framework::GpuFramework,
+    gpu: bool,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
     //
@@ -747,19 +754,24 @@ pub fn run(
     let ctx = Arc::new(Mutex::new(ctx));
     // GPU worker count for the heartbeat's alive counter: WebGPU = 1 worker,
     // CUDA = one thread per physical device (mainboard + discrete cards).
-    let gpu_worker_count = match framework {
-        crate::framework::GpuFramework::WebGpu => 1,
-        crate::framework::GpuFramework::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                crate::cuda::CudaScanner::device_count() as usize
+    // Gated on `gpu` (the config `[gpu] enabled` × device-availability result).
+    let gpu_worker_count = if gpu {
+        match framework {
+            crate::framework::GpuFramework::WebGpu => 1,
+            crate::framework::GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::CudaScanner::device_count() as usize
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    0
+                }
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                0
-            }
+            crate::framework::GpuFramework::Auto => 0, // resolved before puzzle::run
         }
-        crate::framework::GpuFramework::Auto => 0, // resolved before puzzle::run
+    } else {
+        0
     };
     let progress = Arc::new(Progress::new((n_workers + gpu_worker_count) as u64));
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
@@ -824,60 +836,66 @@ pub fn run(
     // Rotation is passed through so each GPU worker participates in the same
     // per-claim park-and-rotate strategy as the CPUs.
     let mut gpu_handles: Vec<_> = Vec::new();
-    match framework {
-        crate::framework::GpuFramework::WebGpu => {
-            let gpu_ctx = ctx.clone();
-            let gpu_progress = progress.clone();
-            let gpu_matches = matches.clone();
-            let gpu_stop = stop_flag.clone();
-            let gpu_hit = hit_flag.clone();
-            gpu_handles.push(std::thread::spawn(move || {
-                gpu_puzzle_worker(
-                    target_h160,
-                    gpu_ctx,
-                    &gpu_progress,
-                    &gpu_matches,
-                    &gpu_stop,
-                    &gpu_hit,
-                    start,
-                    gpu_rotate_keys,
-                );
-            }));
-        }
-        crate::framework::GpuFramework::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                let n_devices = crate::cuda::CudaScanner::device_count() as u32;
-                for dev_idx in 0..n_devices {
-                    // One worker thread per device; each clones its own Arc.
-                    let gpu_ctx = ctx.clone();
-                    let gpu_progress = progress.clone();
-                    let gpu_matches = matches.clone();
-                    let gpu_stop = stop_flag.clone();
-                    let gpu_hit = hit_flag.clone();
-                    gpu_handles.push(std::thread::spawn(move || {
-                        cuda_puzzle_worker(
-                            target_h160,
-                            gpu_ctx,
-                            &gpu_progress,
-                            &gpu_matches,
-                            &gpu_stop,
-                            &gpu_hit,
-                            start,
-                            gpu_rotate_keys,
-                            dev_idx,
-                        );
-                    }));
+    // GPU workers only when `gpu` is true (config `[gpu] enabled` + a resolved
+    // device).  Each worker still self-probes its device and degrades to
+    // CPU-only on init failure — this gate just avoids spawning the threads at
+    // all when the config disabled the GPU.
+    if gpu {
+        match framework {
+            crate::framework::GpuFramework::WebGpu => {
+                let gpu_ctx = ctx.clone();
+                let gpu_progress = progress.clone();
+                let gpu_matches = matches.clone();
+                let gpu_stop = stop_flag.clone();
+                let gpu_hit = hit_flag.clone();
+                gpu_handles.push(std::thread::spawn(move || {
+                    gpu_puzzle_worker(
+                        target_h160,
+                        gpu_ctx,
+                        &gpu_progress,
+                        &gpu_matches,
+                        &gpu_stop,
+                        &gpu_hit,
+                        start,
+                        gpu_rotate_keys,
+                    );
+                }));
+            }
+            crate::framework::GpuFramework::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let n_devices = crate::cuda::CudaScanner::device_count() as u32;
+                    for dev_idx in 0..n_devices {
+                        // One worker thread per device; each clones its own Arc.
+                        let gpu_ctx = ctx.clone();
+                        let gpu_progress = progress.clone();
+                        let gpu_matches = matches.clone();
+                        let gpu_stop = stop_flag.clone();
+                        let gpu_hit = hit_flag.clone();
+                        gpu_handles.push(std::thread::spawn(move || {
+                            cuda_puzzle_worker(
+                                target_h160,
+                                gpu_ctx,
+                                &gpu_progress,
+                                &gpu_matches,
+                                &gpu_stop,
+                                &gpu_hit,
+                                start,
+                                gpu_rotate_keys,
+                                dev_idx,
+                            );
+                        }));
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    term_line("[puzzle] CUDA feature not compiled — running CPU-only.");
                 }
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                term_line("[puzzle] CUDA feature not compiled — running CPU-only.");
+            crate::framework::GpuFramework::Auto => {
+                // Resolved to a concrete backend in main() before we get here.
+                unreachable!("framework Auto must be resolved before puzzle::run")
             }
-        }
-        crate::framework::GpuFramework::Auto => {
-            // Resolved to a concrete backend in main() before we get here.
-            unreachable!("framework Auto must be resolved before puzzle::run")
         }
     }
 

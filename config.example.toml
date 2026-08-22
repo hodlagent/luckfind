@@ -28,6 +28,23 @@ mode = "remote"
 # cpu_rotate_keys = 134217728
 # gpu_rotate_keys = 4294967296
 
+# ── CPU workers ──────────────────────────────────────────────────────────────
+# `enabled` toggles CPU scanning entirely (default true).  `load` is the
+# proportion (0.1 ..= 1.0) of the resolved `--workers` thread count that
+# actually runs — 1.0 (default) = all threads, 0.5 = half, and so on.  A
+# machine shared with other work can set load < 1 to leave CPU cores idle.
+[cpu]
+enabled = true
+load = 0.5
+
+# ── GPU collision scanning ───────────────────────────────────────────────────
+# `enabled` (default true) gates whether the GPU is used for hashing/collision
+# at all.  The GPU is engaged only when this is true AND a device is actually
+# available (`--gpu_framework auto` probes CUDA, then WebGPU).  Setting it to
+# false forces a CPU-only run even on a GPU box.
+[gpu]
+enabled = true
+
 # ── mode = "puzzle" ─────────────────────────────────────────────────────────
 # Required when mode = "puzzle".  Path to the worklist (.db runtime format,
 # or .json one-time import).

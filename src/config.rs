@@ -21,6 +21,18 @@
 //! cpu_rotate_keys = 134217728    # 2^27 (default)
 //! gpu_rotate_keys = 2147483648   # 2^31 (default)
 //!
+//! # CPU workers: `enabled` toggles CPU scanning (default true); `load` is the
+//! # proportion (0.1..=1.0) of the resolved `--workers` thread count to run
+//! # (default 1.0 = all threads).
+//! [cpu]
+//! enabled = true
+//! load = 1.0
+//!
+//! # GPU collision scanning: engaged only when `enabled` (default true) AND a
+//! # GPU device is actually available.
+//! [gpu]
+//! enabled = true
+//!
 //! [puzzle]                        # required when mode = "puzzle"
 //! database = "bin/71.db"
 //!
@@ -69,12 +81,39 @@ pub struct Config {
     pub cpu_rotate_keys: Option<u64>,
     /// Per-claim GPU rotation (reclaim) budget in puzzle mode.  `0` disables.
     pub gpu_rotate_keys: Option<u64>,
+    /// `[cpu]` section — CPU worker availability and load.
+    #[serde(default)]
+    pub cpu: CpuSection,
+    /// `[gpu]` section — GPU availability for collision scanning.
+    #[serde(default)]
+    pub gpu: GpuSection,
     /// `[puzzle]` section — required when `mode = "puzzle"`.
     #[serde(default)]
     pub puzzle: PuzzleSection,
     /// `[remote]` section — required when `mode = "remote"`.
     #[serde(default)]
     pub remote: RemoteSection,
+}
+
+/// `[cpu]` section.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct CpuSection {
+    /// Whether CPU workers run at all.  Absent ⇒ `true`.
+    pub enabled: Option<bool>,
+    /// Proportion (0.1..=1.0) of the resolved `--workers` thread count that
+    /// actually runs.  `1.0` = all threads (default).  Absent ⇒ `1.0`.
+    pub load: Option<f64>,
+}
+
+/// `[gpu]` section.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct GpuSection {
+    /// Whether the GPU is used for collision scanning.  The GPU is engaged
+    /// only when this is `true` (absent ⇒ `true`) AND a device is actually
+    /// available.
+    pub enabled: Option<bool>,
 }
 
 /// `[puzzle]` section.
@@ -162,6 +201,9 @@ mod tests {
         assert!(cfg.mode.is_none());
         assert!(cfg.cpu_rotate_keys.is_none());
         assert!(cfg.gpu_rotate_keys.is_none());
+        assert!(cfg.cpu.enabled.is_none());
+        assert!(cfg.cpu.load.is_none());
+        assert!(cfg.gpu.enabled.is_none());
         assert!(cfg.puzzle.database.is_none());
         assert!(cfg.remote.uri.is_none());
     }
@@ -173,6 +215,13 @@ mod tests {
             cpu_rotate_keys = 134217728
             gpu_rotate_keys = 2147483648
 
+            [cpu]
+            enabled = false
+            load = 0.5
+
+            [gpu]
+            enabled = true
+
             [puzzle]
             database = "bin/71.db"
 
@@ -183,8 +232,26 @@ mod tests {
         assert_eq!(cfg.mode.as_deref(), Some("puzzle"));
         assert_eq!(cfg.cpu_rotate_keys, Some(134217728));
         assert_eq!(cfg.gpu_rotate_keys, Some(2147483648));
+        assert_eq!(cfg.cpu.enabled, Some(false));
+        assert_eq!(cfg.cpu.load, Some(0.5));
+        assert_eq!(cfg.gpu.enabled, Some(true));
         assert_eq!(cfg.puzzle.database.as_deref(), Some("bin/71.db"));
         assert_eq!(cfg.remote.uri.as_deref(), Some("http://192.168.1.10:42069"));
+    }
+
+    #[test]
+    fn cpu_gpu_sections_are_optional() {
+        // A config with neither section still deserializes with defaults.
+        let cfg: Config = toml::from_str("mode = \"random\"").unwrap();
+        assert!(cfg.cpu.enabled.is_none());
+        assert!(cfg.cpu.load.is_none());
+        assert!(cfg.gpu.enabled.is_none());
+
+        // Setting only `[gpu] enabled` leaves `[cpu]` at defaults.
+        let cfg: Config = toml::from_str("[gpu]\nenabled = false").unwrap();
+        assert_eq!(cfg.gpu.enabled, Some(false));
+        assert!(cfg.cpu.enabled.is_none());
+        assert!(cfg.cpu.load.is_none());
     }
 
     #[test]

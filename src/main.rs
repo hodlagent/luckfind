@@ -110,6 +110,28 @@ fn main() {
     let rotate_keys = resolve_rotate(cli.cpu_rotate_keys, cfg.cpu_rotate_keys, 1u64 << 27);
     let gpu_rotate_keys = resolve_rotate(cli.gpu_rotate_keys, cfg.gpu_rotate_keys, 1u64 << 31);
 
+    // CPU worker availability + load, from the config `[cpu]` section.
+    // `enabled` toggles CPU scanning entirely (default true); `load` is the
+    // proportion (0.1..=1.0) of the resolved `--workers` thread count that
+    // actually runs (default 1.0 = all threads).  The load value is validated
+    // only while CPU is enabled — when disabled it is unused.
+    let cpu_enabled = cfg.cpu.enabled.unwrap_or(true);
+    let cpu_load = if cpu_enabled {
+        let l = cfg.cpu.load.unwrap_or(1.0);
+        if !(0.1..=1.0).contains(&l) {
+            eprintln!("[config] [cpu] load must be in 0.1..=1.0, got {l}");
+            std::process::exit(2);
+        }
+        l
+    } else {
+        1.0
+    };
+    let cpu_workers = if cpu_enabled {
+        ((cli.workers() as f64) * cpu_load).ceil().max(1.0) as usize
+    } else {
+        0
+    };
+
     if cli.bench {
         bench(cli.workers(), cli.duration.unwrap_or(5.0));
         return;
@@ -123,53 +145,83 @@ fn main() {
     // ── GPU backend resolution (before the remote/puzzle/--bench branches:
     //    remote and puzzle mode both need the resolved framework too).  `auto`
     //    probes CUDA first — CUDA exists because WebGPU's NVIDIA support is
-    //    limited — then WebGPU.
+    //    limited — then WebGPU.  The config `[gpu] enabled` key gates the whole
+    //    thing: when disabled we skip probing entirely and run CPU-only, so the
+    //    GPU is used for collision only when `gpu.enabled = true` AND a device
+    //    is actually available.
     let mut framework = cli.gpu_framework;
-    let gpu_available = match framework {
-        crate::framework::GpuFramework::WebGpu => probe_webgpu(),
-        crate::framework::GpuFramework::Cuda => probe_cuda(),
-        crate::framework::GpuFramework::Auto => {
-            // Platform policy: Windows/Linux prefer CUDA (NVIDIA); macOS goes
-            // straight to WebGPU (Metal) — CUDA does not apply there.
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            {
-                eprintln!("  [GPU] auto: probing backends (CUDA preferred)…");
-                if probe_cuda() {
-                    framework = crate::framework::GpuFramework::Cuda;
-                    true
-                } else if probe_webgpu() {
+    let gpu_enabled = cfg.gpu.enabled.unwrap_or(true);
+    let gpu_available = if !gpu_enabled {
+        eprintln!("  [GPU] disabled in config (`[gpu] enabled = false`) — running CPU-only.");
+        // Keep the "framework is never Auto downstream" invariant; no GPU
+        // workers spawn because gpu_available = false.
+        framework = crate::framework::GpuFramework::WebGpu;
+        false
+    } else {
+        let avail = match framework {
+            crate::framework::GpuFramework::WebGpu => probe_webgpu(),
+            crate::framework::GpuFramework::Cuda => probe_cuda(),
+            crate::framework::GpuFramework::Auto => {
+                // Platform policy: Windows/Linux prefer CUDA (NVIDIA); macOS
+                // goes straight to WebGPU (Metal) — CUDA does not apply there.
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                {
+                    eprintln!("  [GPU] auto: probing backends (CUDA preferred)…");
+                    if probe_cuda() {
+                        framework = crate::framework::GpuFramework::Cuda;
+                        true
+                    } else if probe_webgpu() {
+                        framework = crate::framework::GpuFramework::WebGpu;
+                        true
+                    } else {
+                        // No accelerator found; keep a displayable value, worker
+                        // runs CPU-only (gpu_available = false below).
+                        framework = crate::framework::GpuFramework::WebGpu;
+                        false
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    eprintln!("  [GPU] auto: macOS — selecting WebGPU (Metal)…");
+                    if probe_webgpu() {
+                        framework = crate::framework::GpuFramework::WebGpu;
+                        true
+                    } else {
+                        framework = crate::framework::GpuFramework::WebGpu;
+                        false
+                    }
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+                {
                     framework = crate::framework::GpuFramework::WebGpu;
-                    true
-                } else {
-                    // No accelerator found; keep a displayable value, worker
-                    // runs CPU-only (gpu_available = false below).
-                    framework = crate::framework::GpuFramework::WebGpu;
-                    false
+                    probe_webgpu()
                 }
             }
-            #[cfg(target_os = "macos")]
-            {
-                eprintln!("  [GPU] auto: macOS — selecting WebGPU (Metal)…");
-                if probe_webgpu() {
-                    framework = crate::framework::GpuFramework::WebGpu;
-                    true
-                } else {
-                    framework = crate::framework::GpuFramework::WebGpu;
-                    false
-                }
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-            {
-                framework = crate::framework::GpuFramework::WebGpu;
-                probe_webgpu()
-            }
+        };
+        if !avail {
+            eprintln!(
+                "  [GPU] No {} device available — running CPU-only.",
+                framework
+            );
         }
+        avail
     };
-    if !gpu_available {
+
+    // A run with neither backend is a configuration mistake — surface it rather
+    // than silently scanning nothing.
+    if !cpu_enabled {
+        if gpu_available {
+            eprintln!("  [CPU] disabled in config (`[cpu] enabled = false`) — running GPU-only.");
+        } else {
+            eprintln!("  [CPU] disabled in config (`[cpu] enabled = false`).");
+        }
+    }
+    if cpu_workers == 0 && !gpu_available {
         eprintln!(
-            "  [GPU] No {} device available — running CPU-only.",
-            framework
+            "[config] no CPU workers and no GPU available — nothing to scan. \
+             Set `[cpu] enabled = true` and/or ensure `[gpu] enabled = true` with a usable device."
         );
+        std::process::exit(2);
     }
 
     // ── remote mode: claim chunks over HTTP from a LAN hub (lan-hub) ────────
@@ -181,7 +233,7 @@ fn main() {
         let (stats, _matches) = remote::run(
             remote_url,
             cli.worker_id(),
-            cli.workers(),
+            cpu_workers,
             cli.heartbeat,
             Some(Path::new(&cli.output_dir)),
             framework,
@@ -201,12 +253,13 @@ fn main() {
         // 扫描多少 keys 后停放当前子区间并随机重新选择。
         let (stats, _matches) = puzzle::run(
             Path::new(puzzle_path),
-            cli.workers(),
+            cpu_workers,
             cli.heartbeat,
             rotate_keys,
             gpu_rotate_keys,
             Some(Path::new(&cli.output_dir)),
             framework,
+            gpu_available,
         );
         // progress 由 puzzle::run 打印；aman_<TS>.txt 已在 run() 内落盘（先于 sqlite）。
         let _ = stats;
@@ -225,7 +278,7 @@ fn main() {
         heartbeat_secs: cli.heartbeat,
     };
 
-    let (stats, matches) = workers::run(cli.workers(), target, limits, gpu_available, framework);
+    let (stats, matches) = workers::run(cpu_workers, target, limits, gpu_available, framework);
 
     println!();
     report::final_report(&stats, &matches, &start);
