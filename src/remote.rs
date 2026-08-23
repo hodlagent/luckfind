@@ -970,6 +970,9 @@ fn remote_gpu_worker_entry(
                 ));
                 scanner.stride = crate::gpu::NUM_GPU_THREADS;
                 scanner.num_candidates = 1;
+                // Per-card label so [claim] / [HIT] lines identify the GPU.
+                // Compute before `scanner` is moved into the worker.
+                let backend_label = format!("CUDA[{}]", scanner.device_index());
                 remote_gpu_worker(
                     client,
                     worker_id,
@@ -981,8 +984,7 @@ fn remote_gpu_worker_entry(
                     stop_flag,
                     hit_flag,
                     start,
-                    // Per-card label so [claim] / [HIT] lines identify the GPU.
-                    &format!("CUDA[{}]", scanner.device_index()),
+                    &backend_label,
                 );
             }
             #[cfg(not(feature = "cuda"))]

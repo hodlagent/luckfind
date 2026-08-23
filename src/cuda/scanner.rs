@@ -57,14 +57,6 @@ pub struct CudaScanner {
 }
 
 impl CudaScanner {
-    /// Initialize CUDA scanner with the given candidate hash160s on device 0.
-    ///
-    /// Backward-compatible convenience — multi-GPU callers should use
-    /// [`Self::new_on_device`] to pick a specific device ordinal.
-    pub fn new(candidates: &[[u32; 5]]) -> Result<Self> {
-        Self::new_on_device(candidates, 0)
-    }
-
     /// Initialize CUDA scanner with the given candidate hash160s on a specific
     /// device ordinal (0-based, as reported by `nvidia-smi` / `Device::num_devices`).
     ///

@@ -1744,6 +1744,9 @@ fn cuda_puzzle_worker(
     // Dense-tiling config: stride = N threads, single target candidate.
     scanner.stride = crate::gpu::NUM_GPU_THREADS;
     scanner.num_candidates = 1;
+    // Per-card label so [claim] / [HIT] lines identify the physical GPU.
+    // Compute before `scanner` is moved into the loop.
+    let backend_label = format!("CUDA[{}]", scanner.device_index());
 
     puzzle_gpu_scan_loop(
         target_h160,
@@ -1755,8 +1758,7 @@ fn cuda_puzzle_worker(
         hit_flag,
         start,
         rotate_keys,
-        // Per-card label so [claim] / [HIT] lines identify the physical GPU.
-        &format!("CUDA[{}]", scanner.device_index()),
+        &backend_label,
     );
 }
 
