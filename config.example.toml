@@ -30,9 +30,10 @@ mode = "remote"
 
 # ── CPU workers ──────────────────────────────────────────────────────────────
 # `enabled` toggles CPU scanning entirely (default true).  `load` is the
-# proportion (0.1 ..= 1.0) of the resolved `--workers` thread count that
-# actually runs — 1.0 (default) = all threads, 0.5 = half, and so on.  A
-# machine shared with other work can set load < 1 to leave CPU cores idle.
+# proportion (0.1 ..= 1.0) of the resolved worker thread count that actually
+# runs — the base is `--workers`, defaulting to ALL logical CPUs, so the
+# default run uses num_cpus × load threads.  1.0 = all cores, 0.5 = half, and
+# so on.  A machine shared with other work can set load < 1 to leave cores idle.
 [cpu]
 enabled = true
 load = 0.5

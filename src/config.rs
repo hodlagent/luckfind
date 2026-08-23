@@ -22,8 +22,9 @@
 //! gpu_rotate_keys = 2147483648   # 2^31 (default)
 //!
 //! # CPU workers: `enabled` toggles CPU scanning (default true); `load` is the
-//! # proportion (0.1..=1.0) of the resolved `--workers` thread count to run
-//! # (default 1.0 = all threads).
+//! # proportion (0.1..=1.0) of the resolved worker thread count to run — the
+//! # base is `--workers`, defaulting to all logical CPUs (default 1.0 = all
+//! # cores).
 //! [cpu]
 //! enabled = true
 //! load = 1.0
@@ -101,8 +102,9 @@ pub struct Config {
 pub struct CpuSection {
     /// Whether CPU workers run at all.  Absent ⇒ `true`.
     pub enabled: Option<bool>,
-    /// Proportion (0.1..=1.0) of the resolved `--workers` thread count that
-    /// actually runs.  `1.0` = all threads (default).  Absent ⇒ `1.0`.
+    /// Proportion (0.1..=1.0) of the resolved worker thread count that
+    /// actually runs.  The base is `--workers`, defaulting to all logical CPUs.
+    /// `1.0` = all threads (default).  Absent ⇒ `1.0`.
     pub load: Option<f64>,
 }
 

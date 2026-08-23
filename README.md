@@ -208,7 +208,7 @@ the hub's HTTP API (endpoints, payloads, error codes) lives in the lan-hub repo
 | Flag | Default | Description |
 |---|---|---|
 | `--duration`, `-d` | none (forever) | Runtime limit in minutes |
-| `--workers`, `-w` | CPUs / 2 | OS thread count |
+| `--workers`, `-w` | CPUs | OS thread count (default all logical CPUs) |
 | `--load`, `-l` | 1.0 | Accepted for back-compat; unused |
 | `--output-dir`, `-o` | `.` | Directory for `aman_<UTC>.txt` |
 | `--heartbeat`, `-H` | 10.0 | Seconds between progress lines |
@@ -244,8 +244,9 @@ cpu_rotate_keys = 134217728      # 2^27, CPU per-claim budget
 gpu_rotate_keys = 2147483648     # 2^31, GPU per-claim budget
 
 # CPU workers: enabled toggles CPU scanning (default true); load is the
-# proportion (0.1..=1.0) of the `--workers` thread count that actually runs.
-# load = 0.5 leaves half the CPU threads idle for other work.
+# proportion (0.1..=1.0) of the resolved worker thread count (--workers,
+# default all logical CPUs) that actually runs.  load = 0.5 leaves half the
+# CPU cores idle for other work.
 [cpu]
 enabled = true
 load = 1.0

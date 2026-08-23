@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(short = 'd', long)]
     pub duration: Option<f64>,
 
-    /// Worker thread count.  Defaults to half the logical-CPU count.
+    /// Worker thread count.  Defaults to the logical-CPU count.
     #[arg(short = 'w', long)]
     pub workers: Option<usize>,
 
@@ -135,7 +135,7 @@ impl Cli {
 
     pub fn workers(&self) -> usize {
         self.workers
-            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() / 2))
+            .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()))
     }
 
     /// Resolve the worker identity for remote mode: explicit `--worker-id`

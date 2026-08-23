@@ -112,9 +112,11 @@ fn main() {
 
     // CPU worker availability + load, from the config `[cpu]` section.
     // `enabled` toggles CPU scanning entirely (default true); `load` is the
-    // proportion (0.1..=1.0) of the resolved `--workers` thread count that
-    // actually runs (default 1.0 = all threads).  The load value is validated
-    // only while CPU is enabled — when disabled it is unused.
+    // proportion (0.1..=1.0) of the resolved worker thread count that actually
+    // runs — the base is `--workers`, defaulting to all logical CPUs, so the
+    // default run uses `num_cpus × load` threads (1.0 = all cores).  The load
+    // value is validated only while CPU is enabled — when disabled it is
+    // unused.
     let cpu_enabled = cfg.cpu.enabled.unwrap_or(true);
     let cpu_load = if cpu_enabled {
         let l = cfg.cpu.load.unwrap_or(1.0);
