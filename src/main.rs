@@ -232,6 +232,9 @@ fn main() {
     // chunks over HTTP.  When a GPU device was resolved above, a dedicated GPU
     // worker thread claims + dense-tiles chunks alongside the CPU workers.
     if let Some(ref remote_url) = remote_url {
+        // 旋转预算（reclaim count）来自 CLI/配置文件解析后的 rotate_keys 与
+        // gpu_rotate_keys（见上方解析），在 remote 模式下同时作为 claim 的
+        // capability 声明给 hub——hub 据此优先分配宽度匹配的 chunk。
         let (stats, _matches) = remote::run(
             remote_url,
             cli.worker_id(),
@@ -240,6 +243,8 @@ fn main() {
             Some(Path::new(&cli.output_dir)),
             framework,
             gpu_available,
+            rotate_keys,
+            gpu_rotate_keys,
         );
         // progress 由 remote::run 打印；aman_<TS>.txt 已在 run() 内落盘。
         let _ = stats;

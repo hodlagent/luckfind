@@ -44,16 +44,21 @@
 
 ### 2.1 Worker 端（`src/remote.rs`）
 
-| 常量 | 值 | 作用 | 位置 |
+| 常量/配置 | 值 | 作用 | 位置 |
 |---|---|---|---|
 | `HEARTBEAT_INTERVAL` | 30s | 扫描期间的心跳节流 | `remote.rs:49` |
 | `CLAIM_IDLE` | 2s | 无 chunk 可领时的重试间隔 | `remote.rs:53` |
-| `ROTATION_BUDGET` (CPU) | 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领 | `remote.rs:39`（= `puzzle.rs:83`） |
-| `GPU_ROTATION_BUDGET` | 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领 | `remote.rs:45` |
+| `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
+| `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
 | HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `remote.rs:134` |
 | HTTP 单请求超时 | 15s | 同上 | `remote.rs:135` |
 | 启动重连 | 每 2s 一次，上限 90s | `connect()` 拿 /api/status | `remote.rs:478` |
 | claim 失败日志节流 | 30s | hub 故障时每 30s 才打印一次 | `remote.rs:631` |
+
+> 旋转预算不是 `remote.rs` 内的常量——由 CLI 或配置文件 `cpu_rotate_keys` /
+> `gpu_rotate_keys` 解析后传入（`main.rs` `resolve_rotate`，默认 2²⁷ / 2³¹，`0`
+> 禁用 = 扫到整段完成）。每个 claim 会把该值作为 `capability` 声明给 hub（`0`
+> 由 hub 按默认 2⁴¹ 处理），hub 据此优先分配宽度匹配的 chunk。
 
 ### 2.2 Hub 端（`lan-hub/backend/app/config.py`）
 
@@ -73,7 +78,7 @@
 | 端点 | 方法 | 请求体（节选） | 语义 |
 |---|---|---|---|
 | `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；`meta.solved/win` 表明是否已有人命中 |
-| `/api/chunks/claim` | POST | `{worker_id, count}` | 领取 `count` 个 pending chunk |
+| `/api/chunks/claim` | POST | `{worker_id, count, capability}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk |
 | `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
 | `/api/chunks/{id}/done` | POST | `{worker_id}` | 整段扫完：置 finished、删 lease |
 | `/api/win` | POST | `{worker_id, chunk_id}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved |
@@ -107,7 +112,7 @@ worker                                   hub (lan-hub)
    └─ pending+running == 0  → 直接退出「nothing to do」
 
 ② 领取 chunk（每个线程 ≤1 个）
-   └─ POST /api/chunks/claim ─────────→ {worker_id, count: 1}
+   └─ POST /api/chunks/claim ─────────→ {worker_id, count: 1, capability: rotate_keys|gpu_rotate_keys}
    ←──────────────────────────────────── {granted, chunks[0], solved}
    └─ solved=true → 别的 worker 已命中，直接退出
    └─ granted=0：
@@ -180,10 +185,13 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 
 `release` 不只是「扫完了」，它还让 hub 的断点位置**比心跳更频繁地刷新**：
 
-- **CPU**：每 2²⁷ keys release 一次。1.4 Mkeys/s 下单线程约 **96s** 一次，
-  实际短于 120s 回收线，与心跳共同维持 lease 存活。
-- **GPU**：每 2³¹ keys release 一次。约 100 Mkeys/s 下约 **20s** 一次，
-  比 30s 心跳更频繁——`remote.rs:42-44` 注释明确说明这是有意为之。
+- **CPU**：默认每 `cpu_rotate_keys`（2²⁷）keys release 一次。1.4 Mkeys/s 下单线程
+  约 **96s** 一次，实际短于 120s 回收线，与心跳共同维持 lease 存活。
+- **GPU**：默认每 `gpu_rotate_keys`（2³¹）keys release 一次。约 100 Mkeys/s 下约
+  **20s** 一次，比 30s 心跳更频繁——有意为之：release-at-rotation 比 30s 心跳更
+  频繁地刷新 hub 的续扫位置。
+- 配置 `0` 禁用旋转：worker 把 chunk 扫到整段完成（`done`）才释放，claim 的
+  `capability` 声明为 0（hub 按默认 2⁴¹ 处理）。
 
 > 因此「lease 存活」其实由两条路径共同保证：30s 心跳是保底，旋转 release 是加分。
 
@@ -208,7 +216,7 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 
 | 逻辑 | Rust | hub |
 |---|---|---|
-| 心跳/旋转/release 常量 | `remote.rs:37-53` | `config.py:67-71` |
+| 心跳常量 / 旋转预算（config 解析传入） | `remote.rs:43-50`；`main.rs` `resolve_rotate` | `config.py:67-71` |
 | HTTP 封装与超时 | `remote.rs:119-208` | `routes.py` |
 | 启动 connect + hash160 校验 | `remote.rs:477-528` | — |
 | CPU worker 主循环 | `remote.rs:618-826` | — |

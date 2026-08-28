@@ -40,15 +40,13 @@ use crate::puzzle::{
 };
 use crate::workers::{fmt_comma, MatchEvent};
 
-/// Per-claim rotation budget: park the chunk and re-claim after this many keys,
-/// exactly matching local puzzle mode (`puzzle::ROTATION_BUDGET`).
-const ROTATION_BUDGET: u64 = puzzle::ROTATION_BUDGET;
-
-/// Per-claim rotation budget for the GPU remote worker.  Mirrors the local
-/// puzzle mode's GPU cadence (`gpu_rotate_keys = 2^31` in `main.rs`).  At
-/// ~100 Mkeys/s a claim lasts ~20s, so the release-at-rotation also keeps the
-/// hub's resume position fresher than the 30s heartbeat alone.
-const GPU_ROTATION_BUDGET: u64 = 1u64 << 31;
+// Per-claim rotation (reclaim) budgets are resolved config/CLI values threaded
+// in from main() — `rotate_keys` (CPU) and `gpu_rotate_keys` (GPU), defaulting
+// to 2^27 / 2^31 exactly like local puzzle mode.  Each claim declares the same
+// number to the hub as its `capability`, so the hub hands out chunks sized to
+// what the worker actually scans before reclaiming.  `None` (a config `0`)
+// disables rotation: the chunk is scanned to completion and the claim declares
+// capability 0, which the hub treats as its 2^41 default.
 
 /// Lease-refresh cadence.  The hub reclaims leases after 120s, so 30s gives a
 /// comfortable margin while keeping LAN traffic negligible.
@@ -166,11 +164,23 @@ impl HubClient {
         resp.into_body().read_json()
     }
 
-    fn claim(&self, worker_id: &str, count: usize) -> Result<ClaimResponse, ureq::Error> {
+    /// Claim `count` pending chunks, declaring how many keys this worker scans
+    /// before it reclaims (`capability`).  The hub uses the capability to prefer
+    /// handing out chunks it won't have to split mid-scan; 0 = hub default 2^41.
+    fn claim(
+        &self,
+        worker_id: &str,
+        count: usize,
+        capability: u64,
+    ) -> Result<ClaimResponse, ureq::Error> {
         let resp = self
             .agent
             .post(&self.url("/api/chunks/claim"))
-            .send_json(json!({ "worker_id": worker_id, "count": count }))?;
+            .send_json(json!({
+                "worker_id": worker_id,
+                "count": count,
+                "capability": capability
+            }))?;
         resp.into_body().read_json()
     }
 
@@ -267,6 +277,8 @@ pub fn run(
     output_dir: Option<&Path>,
     framework: crate::framework::GpuFramework,
     gpu_available: bool,
+    rotate_keys: Option<u64>,
+    gpu_rotate_keys: Option<u64>,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     let client = Arc::new(HubClient::new(remote_url));
 
@@ -344,6 +356,7 @@ pub fn run(
                 &matches,
                 &stop_flag,
                 &hit_flag,
+                rotate_keys,
                 start,
             )
         }));
@@ -390,6 +403,7 @@ pub fn run(
                         &matches,
                         &stop_flag,
                         &hit_flag,
+                        gpu_rotate_keys,
                         start,
                         framework,
                         0, // WebGPU: single device
@@ -418,6 +432,7 @@ pub fn run(
                                 &matches,
                                 &stop_flag,
                                 &hit_flag,
+                                gpu_rotate_keys,
                                 start,
                                 framework,
                                 dev_idx,
@@ -665,6 +680,7 @@ fn remote_worker(
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
     hit_flag: &AtomicBool,
+    rotate_keys: Option<u64>,
     start: Instant,
 ) {
     // Throttle for claim-failure logging so a hub outage prints once / 30s,
@@ -677,7 +693,10 @@ fn remote_worker(
         }
 
         // ── claim one chunk ───────────────────────────────────────────────
-        let claimed = match client.claim(worker_id, 1) {
+        // Claim capability = how many keys this worker scans before reclaiming
+        // (the rotation budget, below).  0 (= rotation disabled) maps to the
+        // hub's default 2^41, the largest chunk it will hand out.
+        let claimed = match client.claim(worker_id, 1, rotate_keys.unwrap_or(0)) {
             Ok(c) => c,
             Err(e) => {
                 // Transport error (hub down / slow).  Back off and retry; if
@@ -760,7 +779,7 @@ fn remote_worker(
             start: start_bytes,
             end: end_bytes,
             dir,
-            rotate_keys: Some(ROTATION_BUDGET),
+            rotate_keys,
             progress,
             matches,
             stop_flag,
@@ -900,6 +919,7 @@ fn remote_gpu_worker_entry(
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
     hit_flag: &AtomicBool,
+    rotate_keys: Option<u64>,
     start: Instant,
     framework: crate::framework::GpuFramework,
     device_index: u32,
@@ -945,6 +965,7 @@ fn remote_gpu_worker_entry(
                 matches,
                 stop_flag,
                 hit_flag,
+                rotate_keys,
                 start,
                 "GPU",
             );
@@ -983,6 +1004,7 @@ fn remote_gpu_worker_entry(
                     matches,
                     stop_flag,
                     hit_flag,
+                    rotate_keys,
                     start,
                     &backend_label,
                 );
@@ -1023,6 +1045,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
     matches: &Mutex<Vec<MatchEvent>>,
     stop_flag: &AtomicBool,
     hit_flag: &AtomicBool,
+    rotate_keys: Option<u64>,
     start: Instant,
     backend_label: &str,
 ) {
@@ -1040,7 +1063,10 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         }
 
         // ── claim one chunk ───────────────────────────────────────────────
-        let claimed = match client.claim(worker_id, 1) {
+        // Claim capability = how many keys this worker scans before reclaiming
+        // (the rotation budget, below).  0 (= rotation disabled) maps to the
+        // hub's default 2^41, the largest chunk it will hand out.
+        let claimed = match client.claim(worker_id, 1, rotate_keys.unwrap_or(0)) {
             Ok(c) => c,
             Err(e) => {
                 if last_fail_log.elapsed() >= Duration::from_secs(30) {
@@ -1259,13 +1285,16 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
             }
 
             // ── rotation ──────────────────────────────────────────────────
-            // Park after GPU_ROTATION_BUDGET keys scanned *this claim* and let
-            // the loop claim a fresh pending chunk.  `scanned_keys` resets
-            // every claim, so this is a per-claim budget exactly like the CPU
+            // Park after `rotate_keys` keys scanned *this claim* and let the
+            // loop claim a fresh pending chunk.  `scanned_keys` resets every
+            // claim, so this is a per-claim budget exactly like the CPU
             // worker's.  Releasing also keeps the hub's resume position fresher
-            // than the 30s heartbeat would on its own.
-            if scanned_keys >= GPU_ROTATION_BUDGET {
-                break;
+            // than the 30s heartbeat would on its own.  `None` (= config 0)
+            // disables rotation: the chunk is scanned to completion.
+            if let Some(rot) = rotate_keys {
+                if scanned_keys >= rot {
+                    break;
+                }
             }
         }
 
