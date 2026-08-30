@@ -34,6 +34,12 @@
 //! [gpu]
 //! enabled = true
 //!
+//! # Which pubkey serialisations the scan compares against the target.  Both
+//! # default to true — a puzzle address may have been derived from either form.
+//! [btc]
+//! check_compressed_pk = true
+//! check_uncompressed_pk = true
+//!
 //! [puzzle]                        # required when mode = "puzzle"
 //! database = "bin/71.db"
 //!
@@ -88,6 +94,9 @@ pub struct Config {
     /// `[gpu]` section — GPU availability for collision scanning.
     #[serde(default)]
     pub gpu: GpuSection,
+    /// `[btc]` section — which pubkey serialisations are checked.
+    #[serde(default)]
+    pub btc: BtcSection,
     /// `[puzzle]` section — required when `mode = "puzzle"`.
     #[serde(default)]
     pub puzzle: PuzzleSection,
@@ -118,6 +127,31 @@ pub struct GpuSection {
     pub enabled: Option<bool>,
 }
 
+/// `[btc]` section.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct BtcSection {
+    /// Whether the scan compares the hash160 of the compressed (33-byte) pubkey
+    /// to the target.  Absent ⇒ `true`.
+    pub check_compressed_pk: Option<bool>,
+    /// Whether the scan compares the hash160 of the uncompressed (65-byte)
+    /// pubkey to the target.  Absent ⇒ `true`.
+    pub check_uncompressed_pk: Option<bool>,
+}
+
+/// Resolved `[btc]` settings — which pubkey serialisations the scan checks.
+///
+/// This is the value threaded through `workers::run` / `puzzle::run` /
+/// `remote::run` and down to the CPU hot path, the GPU shaders/kernel, and the
+/// CPU-side match re-verification, so every layer gates on the same switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtcCheck {
+    /// Compare the compressed (33-byte) pubkey's hash160 to the target.
+    pub compressed: bool,
+    /// Compare the uncompressed (65-byte) pubkey's hash160 to the target.
+    pub uncompressed: bool,
+}
+
 /// `[puzzle]` section.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -142,6 +176,15 @@ impl Config {
         let cfg: Config = toml::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Resolve the `[btc]` switches to concrete booleans.  Absent keys default
+    /// to `true` (both serialisations checked — the historical behaviour).
+    pub fn btc_check(&self) -> BtcCheck {
+        BtcCheck {
+            compressed: self.btc.check_compressed_pk.unwrap_or(true),
+            uncompressed: self.btc.check_uncompressed_pk.unwrap_or(true),
+        }
     }
 }
 
@@ -206,8 +249,12 @@ mod tests {
         assert!(cfg.cpu.enabled.is_none());
         assert!(cfg.cpu.load.is_none());
         assert!(cfg.gpu.enabled.is_none());
+        assert!(cfg.btc.check_compressed_pk.is_none());
+        assert!(cfg.btc.check_uncompressed_pk.is_none());
         assert!(cfg.puzzle.database.is_none());
         assert!(cfg.remote.uri.is_none());
+        // Absent `[btc]` keys default to both serialisations checked.
+        assert_eq!(cfg.btc_check(), BtcCheck { compressed: true, uncompressed: true });
     }
 
     #[test]
@@ -224,6 +271,10 @@ mod tests {
             [gpu]
             enabled = true
 
+            [btc]
+            check_compressed_pk = false
+            check_uncompressed_pk = true
+
             [puzzle]
             database = "bin/71.db"
 
@@ -237,6 +288,9 @@ mod tests {
         assert_eq!(cfg.cpu.enabled, Some(false));
         assert_eq!(cfg.cpu.load, Some(0.5));
         assert_eq!(cfg.gpu.enabled, Some(true));
+        assert_eq!(cfg.btc.check_compressed_pk, Some(false));
+        assert_eq!(cfg.btc.check_uncompressed_pk, Some(true));
+        assert_eq!(cfg.btc_check(), BtcCheck { compressed: false, uncompressed: true });
         assert_eq!(cfg.puzzle.database.as_deref(), Some("bin/71.db"));
         assert_eq!(cfg.remote.uri.as_deref(), Some("http://192.168.1.10:42069"));
     }
@@ -254,6 +308,21 @@ mod tests {
         assert_eq!(cfg.gpu.enabled, Some(false));
         assert!(cfg.cpu.enabled.is_none());
         assert!(cfg.cpu.load.is_none());
+    }
+
+    #[test]
+    fn btc_section_is_optional() {
+        // A config with no `[btc]` section deserializes with both switches open.
+        let cfg: Config = toml::from_str("mode = \"random\"").unwrap();
+        assert!(cfg.btc.check_compressed_pk.is_none());
+        assert!(cfg.btc.check_uncompressed_pk.is_none());
+        assert_eq!(cfg.btc_check(), BtcCheck { compressed: true, uncompressed: true });
+
+        // Setting only one switch leaves the other at its default.
+        let cfg: Config = toml::from_str("[btc]\ncheck_compressed_pk = false").unwrap();
+        assert_eq!(cfg.btc.check_compressed_pk, Some(false));
+        assert!(cfg.btc.check_uncompressed_pk.is_none());
+        assert_eq!(cfg.btc_check(), BtcCheck { compressed: false, uncompressed: true });
     }
 
     #[test]

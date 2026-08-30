@@ -40,6 +40,12 @@ pub struct CudaScanner {
     pub stride: u32,
     /// Number of active candidate slots.
     pub num_candidates: u32,
+    /// Whether the kernel checks the compressed (33-byte) pubkey (0/1).
+    /// Mirrors `[btc] check_compressed_pk`; default 1.
+    pub check_compressed_pk: u32,
+    /// Whether the kernel checks the uncompressed (65-byte) pubkey (0/1).
+    /// Mirrors `[btc] check_uncompressed_pk`; default 1.
+    pub check_uncompressed_pk: u32,
     /// Steps per dispatch call.
     pub steps_per_call: u32,
     /// Initial scalar per thread (LE limbs), for test verification.
@@ -119,6 +125,10 @@ impl CudaScanner {
             steps_per_call: 1,
             num_candidates: candidates.len().min(78) as u32,
             stride: 1,
+            check_compressed_pk: 1,   // default: both serialisations checked
+            check_uncompressed_pk: 1,
+            _pad: 0,
+            _pad2: 0,
         };
         let device_config = DeviceBox::new(&gpu_config)
             .context("Failed to allocate device config")?;
@@ -134,6 +144,8 @@ impl CudaScanner {
             config: gpu_config,
             stride: 1,
             num_candidates: candidates.len().min(78) as u32,
+            check_compressed_pk: 1,
+            check_uncompressed_pk: 1,
             steps_per_call: 1,
             initial_scalars: Vec::new(),
             total_ops: 0,
@@ -352,6 +364,10 @@ impl CudaScanner {
             steps_per_call: self.steps_per_call,
             num_candidates: self.num_candidates,
             stride: self.stride,
+            check_compressed_pk: self.check_compressed_pk,
+            check_uncompressed_pk: self.check_uncompressed_pk,
+            _pad: 0,
+            _pad2: 0,
         };
         self.config = config;
         self.device_config.copy_from(&config)

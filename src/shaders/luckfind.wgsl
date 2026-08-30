@@ -16,6 +16,10 @@ fn jacobian(x: array<u32, 8>, y: array<u32, 8>, z: array<u32, 8>) -> JacobianPoi
 
 struct GpuConfig {
     num_threads: u32, steps_per_call: u32, num_candidates: u32, stride: u32,
+    // `[btc]` check switches (0 = skip that pubkey serialisation).  The two
+    // trailing pad u32 keep the uniform struct a multiple of 16 bytes (naga
+    // requires it); must match Rust `GpuConfig` and the CUDA kernel layout.
+    check_compressed_pk: u32, check_uncompressed_pk: u32, _pad: u32, _pad2: u32,
 }
 struct GpuState {
     x: array<u32, 8>, y: array<u32, 8>, z: array<u32, 8>, scalar: array<u32, 8>,
@@ -250,33 +254,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x_affine = fe_mul(s.x, z2_inv);
         let y_affine = fe_mul(s.y, z3_inv);
 
-        // 4. Serialize the compressed pubkey as 9 big-endian u32 words.
-        var prefix: u32;
-        if ((y_affine[0] & 1u) == 0u) { prefix = 0x02u; } else { prefix = 0x03u; }
+        // 4. Serialize the pubkey for hashing — but only the serialisations
+        //    enabled by `[btc]` config (a disabled form is never serialized or
+        //    hashed, mirroring the CPU workers).  `x_be`/`y_be` are shared by
+        //    both forms and cheap (limb byte-swaps), so they stay upfront.
         let x_be = limbs_to_be_words(x_affine);
         let y_be = limbs_to_be_words(y_affine);
-        let cpk = compressed_pubkey_to_words(prefix, x_be);
 
-        // 5-6. SHA256 + RIPEMD160 (hash160) via kangaroo's verified compressors.
-        // Hash BOTH serialisations: the compressed form (33B) and the
-        // uncompressed form (65B, 0x04||X||Y) — a puzzle address may have been
-        // derived from either, mirroring the CPU workers' c-or-u comparison.
-        let sha = sha256_33bytes(cpk);
-        let h160 = hash160_from_sha256(sha.h);
-        // Candidate buffer is little-endian; flip kangaroo's big-endian output.
-        let h160_le = hash160_be_to_le(h160);
-        let upk = uncompressed_pubkey_to_words(x_be, y_be);
-        let sha_u = sha256_65bytes(upk);
-        let h160_u = hash160_from_sha256(sha_u.h);
-        let h160_u_le = hash160_be_to_le(h160_u);
-
-        // 7. Candidate match — compressed first; if that misses, try the
-        //    uncompressed hash.  The match record stores whichever hash hit so
+        // 5-7. SHA256 + RIPEMD160 (hash160) + candidate match, per enabled
+        //    serialisation.  Compressed first; if that misses, try the
+        //    uncompressed form.  The match record stores whichever hash hit so
         //    GpuMatchOutput.hash160 reflects the matched serialisation.
-        let m = candidate_match(h160_le);
-        var matched = m;
-        var matched_h = h160.h;
-        if (m == 0xFFFFFFFFu) {
+        var matched = 0xFFFFFFFFu;
+        var matched_h = array<u32, 5>(0u, 0u, 0u, 0u, 0u);
+        if (config.check_compressed_pk != 0u) {
+            var prefix: u32;
+            if ((y_affine[0] & 1u) == 0u) { prefix = 0x02u; } else { prefix = 0x03u; }
+            let cpk = compressed_pubkey_to_words(prefix, x_be);
+            let sha = sha256_33bytes(cpk);
+            let h160 = hash160_from_sha256(sha.h);
+            // Candidate buffer is little-endian; flip kangaroo's big-endian output.
+            let h160_le = hash160_be_to_le(h160);
+            let m = candidate_match(h160_le);
+            if (m != 0xFFFFFFFFu) {
+                matched = m;
+                matched_h = h160.h;
+            }
+        }
+        if (matched == 0xFFFFFFFFu && config.check_uncompressed_pk != 0u) {
+            let upk = uncompressed_pubkey_to_words(x_be, y_be);
+            let sha_u = sha256_65bytes(upk);
+            let h160_u = hash160_from_sha256(sha_u.h);
+            let h160_u_le = hash160_be_to_le(h160_u);
             let m_u = candidate_match(h160_u_le);
             if (m_u != 0xFFFFFFFFu) {
                 matched = m_u;

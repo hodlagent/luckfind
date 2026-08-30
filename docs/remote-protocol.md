@@ -50,6 +50,7 @@
 | `CLAIM_IDLE` | 2s | 无 chunk 可领时的重试间隔 | `remote.rs:53` |
 | `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
 | `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
+| `check_compressed_pk` / `check_uncompressed_pk` | 默认均 true | 决定 worker 把压缩（33B）/非压缩（65B）公钥的 hash160 与目标比较；被禁用的序列化在 CPU/GPU 热路径上不再计算。**不改变 hub 协议**——chunk 照常领取扫描，只是命中判定只看启用的序列化 | `[btc]` 配置段 → `BtcCheck`，贯穿 CPU `scan_chunk`/`worker_loop` 与 GPU shader/kernel |
 | HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `remote.rs:134` |
 | HTTP 单请求超时 | 15s | 同上 | `remote.rs:135` |
 | 启动重连 | 每 2s 一次，上限 90s | `connect()` 拿 /api/status | `remote.rs:478` |

@@ -46,6 +46,17 @@ load = 0.5
 [gpu]
 enabled = true
 
+# ── pubkey serialisations to check ───────────────────────────────────────────
+# Which forms of the public key the scan compares against the target hash160.
+# A puzzle address may have been derived from either the compressed (33-byte)
+# or the uncompressed (65-byte) serialisation, so both default to true.  Setting
+# one to false skips that form's serialize + hash160 entirely on the CPU and GPU
+# hot paths — a useful win when you know the target only ever used one form.
+# At least one must remain enabled (both false is a config error, exit 2).
+[btc]
+check_compressed_pk = true
+check_uncompressed_pk = true
+
 # ── mode = "puzzle" ─────────────────────────────────────────────────────────
 # Required when mode = "puzzle".  Path to the worklist (.db runtime format,
 # or .json one-time import).

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::btc;
+use crate::config::BtcCheck;
 use crate::gpu::{convert, GpuContext, GpuMatchOutput, GpuScanner, NUM_GPU_THREADS};
 use crate::progress::Progress;
 use crate::workers::MatchEvent;
@@ -47,6 +48,7 @@ pub fn worker(
     hit_flag: Arc<AtomicBool>,
     deadline: Option<Instant>,
     start: Instant,
+    check: BtcCheck,
 ) {
     // Set up GPU.  If no device is available (CI, headless, no Metal/Vulkan)
     // we log and fall back to CPU-only — never block the whole run on a GPU.
@@ -75,6 +77,8 @@ pub fn worker(
     // the `new()` defaults, but set them explicitly for clarity.
     scanner.stride = 1;
     scanner.num_candidates = candidate_count;
+    scanner.check_compressed_pk = check.compressed as u32;
+    scanner.check_uncompressed_pk = check.uncompressed as u32;
 
     // Seed walkers at random positions inside the puzzle key space.
     if let Err(e) = scanner.init_random(puzzle_set) {
@@ -109,21 +113,27 @@ pub fn worker(
                         for m in &batch_matches {
                             let mut ev = gpu_match_to_event(m, puzzle_set, start);
                             // CPU verification — re-derive the pubkey, hash160 it, and
-                            // confirm it matches the puzzle set.  Defense in depth
-                            // against spurious GPU matches (impossible with a 160-bit
-                            // hash, but cheap insurance).
-                            let h = btc::hash160(&ev.compressed);
-                            if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h) {
+                            // confirm it matches the puzzle set.  Gated by the same
+                            // `[btc]` switches as the shader, so a serialisation that
+                            // is disabled for checking is never accepted here either.
+                            // Defense in depth against spurious GPU matches
+                            // (impossible with a 160-bit hash, but cheap insurance).
+                            // The `matched` lookup keeps the two candidate pushes in
+                            // if/else exclusivity so `ev` is moved exactly once.
+                            let matched = if check.compressed {
+                                puzzle_set
+                                    .puzzle_number_for_hash160(&btc::hash160(&ev.compressed))
+                            } else {
+                                None
+                            };
+                            if let Some(pn) = matched {
                                 ev.puzzle_number = Some(pn);
                                 g.push(ev.clone());
                                 out.push(ev);
-                            }
-                            // Uncompressed variant: the GPU kernel hashes both the
-                            // compressed and uncompressed pubkeys.  We verified the
-                            // compressed one above; check the uncompressed too.
-                            else {
-                                let h_u = btc::hash160(&ev.uncompressed);
-                                if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h_u) {
+                            } else if check.uncompressed {
+                                if let Some(pn) = puzzle_set
+                                    .puzzle_number_for_hash160(&btc::hash160(&ev.uncompressed))
+                                {
                                     ev.puzzle_number = Some(pn);
                                     g.push(ev.clone());
                                     out.push(ev);

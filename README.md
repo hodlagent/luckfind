@@ -256,6 +256,15 @@ load = 1.0
 [gpu]
 enabled = true
 
+# Which pubkey serialisations the scan compares against the target hash160.
+# Both default to true — a puzzle address may have been derived from either the
+# compressed (33-byte) or uncompressed (65-byte) form.  Setting one to false
+# skips that form's serialize + hash160 entirely on the CPU and GPU hot paths.
+# Both false is a config error (exit 2).
+[btc]
+check_compressed_pk = true
+check_uncompressed_pk = true
+
 [puzzle]                         # required when mode = "puzzle"
 database = "bin/71.db"           #   → run: bin/luckfind --config luckfind.toml
 

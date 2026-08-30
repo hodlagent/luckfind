@@ -26,12 +26,17 @@ typedef int i32;
 // Field element: 8 x u32 limbs, little-endian
 typedef struct { u32 v[8]; } fe_t;
 
-// Config: 16 bytes, matches GpuConfig
+// Config: 32 bytes, matches GpuConfig (two check switches + two pad fields
+// keep the WGSL uniform struct a multiple of 16 bytes).
 typedef struct {
     u32 num_threads;
     u32 steps_per_call;
     u32 num_candidates;
     u32 stride;
+    u32 check_compressed_pk;   // [btc] check_compressed_pk (0 = skip)
+    u32 check_uncompressed_pk; // [btc] check_uncompressed_pk (0 = skip)
+    u32 _pad;
+    u32 _pad2;
 } GpuConfig;
 
 // State: 192 bytes, matches GpuState
@@ -807,53 +812,49 @@ extern "C" __global__ void luckfind_kernel(
         fe_mul(&s.x, &z2_inv, &x_affine);
         fe_mul(&s.y, &z3_inv, &y_affine);
 
-        // Compressed pubkey prefix
-        u32 prefix = ((x_affine.v[0] | y_affine.v[0]) & 1u) == 0 ? 0x02u : 0x03u;
-        // Actually use y_affine parity
-        prefix = (y_affine.v[0] & 1u) == 0 ? 0x02u : 0x03u;
-
         u32 x_be[8], y_be[8];
         limbs_to_be_words(&x_affine, x_be);
         limbs_to_be_words(&y_affine, y_be);
-        u32 cpk[9];
-        compressed_pubkey_to_words(prefix, x_be, cpk);
-
-        // SHA256
-        u32 sha_out[8];
-        sha256_33bytes(cpk, sha_out);
-
-        // RIPEMD160
-        u32 h160_be[5];
-        ripemd160_32bytes(sha_out, h160_be);
-
-        // Convert to LE for comparison
-        u32 h160_le[5];
-        for (int i = 0; i < 5; i++) {
-            u32 w = h160_be[i];
-            h160_le[i] = ((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) |
-                         ((w >> 8) & 0xFF00u) | ((w >> 24) & 0xFFu);
-        }
 
         // Candidate match — compressed first; if that misses, hash the
-        // uncompressed form (0x04||X||Y, 65B) and try again.  A puzzle address
-        // may have been derived from either serialisation (mirrors the CPU
-        // workers' c-or-u comparison).  matched_uncomp keeps the emitted
-        // hash160 true to whichever serialisation actually hit.
+        // uncompressed form (0x04||X||Y, 65B) and try again.  Each serialisation
+        // is only hashed when enabled by `[btc]` config (mirrors the CPU workers
+        // and the WGSL shader).  matched_uncomp keeps the emitted hash160 true
+        // to whichever serialisation actually hit.
         u32 m = 0xFFFFFFFFu;
         bool matched_uncomp = false;
-        for (u32 i = 0; i < config.num_candidates; i++) {
-            if (h160_le[0] == candidates[i * 5 + 0] &&
-                h160_le[1] == candidates[i * 5 + 1] &&
-                h160_le[2] == candidates[i * 5 + 2] &&
-                h160_le[3] == candidates[i * 5 + 3] &&
-                h160_le[4] == candidates[i * 5 + 4]) {
-                m = i;
-                break;
+        u32 h160_be[5] = {0, 0, 0, 0, 0};
+        u32 h160_u_be[5] = {0, 0, 0, 0, 0};
+        if (config.check_compressed_pk) {
+            // Compressed pubkey prefix (parity of y).
+            u32 prefix = (y_affine.v[0] & 1u) == 0 ? 0x02u : 0x03u;
+            u32 cpk[9];
+            compressed_pubkey_to_words(prefix, x_be, cpk);
+
+            u32 sha_out[8];
+            sha256_33bytes(cpk, sha_out);
+            ripemd160_32bytes(sha_out, h160_be);
+
+            // Convert to LE for comparison
+            u32 h160_le[5];
+            for (int i = 0; i < 5; i++) {
+                u32 w = h160_be[i];
+                h160_le[i] = ((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) |
+                             ((w >> 8) & 0xFF00u) | ((w >> 24) & 0xFFu);
+            }
+            for (u32 i = 0; i < config.num_candidates; i++) {
+                if (h160_le[0] == candidates[i * 5 + 0] &&
+                    h160_le[1] == candidates[i * 5 + 1] &&
+                    h160_le[2] == candidates[i * 5 + 2] &&
+                    h160_le[3] == candidates[i * 5 + 3] &&
+                    h160_le[4] == candidates[i * 5 + 4]) {
+                    m = i;
+                    break;
+                }
             }
         }
 
-        u32 h160_u_be[5];
-        if (m == 0xFFFFFFFFu) {
+        if (m == 0xFFFFFFFFu && config.check_uncompressed_pk) {
             u32 upk[17];
             uncompressed_pubkey_to_words(x_be, y_be, upk);
             u32 sha_u[8];

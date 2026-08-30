@@ -19,6 +19,12 @@ pub struct GpuScanner {
     pub stride: u32,
     /// Number of active candidate slots (1 = puzzle single target; 77 = lottery set).
     pub num_candidates: u32,
+    /// Whether the kernel checks the compressed (33-byte) pubkey (0/1).
+    /// Mirrors `[btc] check_compressed_pk`; default 1.
+    pub check_compressed_pk: u32,
+    /// Whether the kernel checks the uncompressed (65-byte) pubkey (0/1).
+    /// Mirrors `[btc] check_uncompressed_pk`; default 1.
+    pub check_uncompressed_pk: u32,
     /// Initial scalar per thread (LE limbs), for CPU-side match verification.
     initial_scalars: Vec<[u32; 8]>,
     pub total_ops: u64,
@@ -47,6 +53,8 @@ impl GpuScanner {
             steps_per_call: 1,   // 1 step × 100k threads = 100k keys/dispatch (avoids TDR)
             stride: 1,           // lottery default; puzzle sets this to NUM_GPU_THREADS
             num_candidates: 77,  // lottery set size; puzzle mode overrides to 1
+            check_compressed_pk: 1,   // default: both serialisations checked
+            check_uncompressed_pk: 1,
             initial_scalars: Vec::new(),
             total_ops: 0,
             #[cfg(target_os = "macos")]
@@ -177,6 +185,10 @@ impl GpuScanner {
             steps_per_call: self.steps_per_call,
             num_candidates: self.num_candidates,
             stride: self.stride,
+            check_compressed_pk: self.check_compressed_pk,
+            check_uncompressed_pk: self.check_uncompressed_pk,
+            _pad: 0,
+            _pad2: 0,
         };
         self.ctx
             .queue()

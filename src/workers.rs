@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::BtcCheck;
 use crate::framework::GpuFramework;
 use crate::puzzles::PuzzleSet;
 use crate::progress::Progress;
@@ -42,6 +43,7 @@ pub fn run(
     limits: RuntimeLimits,
     gpu: bool,
     framework: GpuFramework,
+    check: BtcCheck,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // Number of GPU worker threads the framework will spawn, counted into the
     // heartbeat's "alive" counter so the status line reflects all backends:
@@ -102,6 +104,7 @@ pub fn run(
                     &hit_flag,
                     deadline,
                     start,
+                    check,
                 );
             })
         })
@@ -134,6 +137,7 @@ pub fn run(
                         hit_flag,
                         deadline,
                         start,
+                        check,
                     );
                 }));
             }
@@ -157,6 +161,7 @@ pub fn run(
                                 hit_flag,
                                 deadline,
                                 start,
+                                check,
                             );
                         }));
                     }
@@ -243,6 +248,7 @@ fn worker_loop(
     hit_flag: &AtomicBool,
     deadline: Option<Instant>,
     start: Instant,
+    check: BtcCheck,
 ) {
     let secp = secp256k1::Secp256k1::new();
 
@@ -289,17 +295,34 @@ fn worker_loop(
             }
         }
 
-        let pk_c = pk.serialize();
-        let pk_u = pk.serialize_uncompressed();
-
-        let h_c = crate::btc::hash160(&pk_c);
-        let h_u = crate::btc::hash160(&pk_u);
-
-        let hit = ps.contains(&h_c) || ps.contains(&h_u);
+        // Check only the pubkey serialisations enabled by `[btc]` config: the
+        // disabled form's serialize + hash160 are skipped entirely (a puzzle
+        // address derived from the other form can never match here anyway).
+        let mut hit = false;
+        if check.compressed && ps.contains(&crate::btc::hash160(&pk.serialize())) {
+            hit = true;
+        }
+        if !hit && check.uncompressed && ps.contains(&crate::btc::hash160(&pk.serialize_uncompressed())) {
+            hit = true;
+        }
 
         if hit {
-            let puzzle_number = ps.puzzle_number_for_hash160(&h_c)
-                .or_else(|| ps.puzzle_number_for_hash160(&h_u));
+            let pk_c = pk.serialize();
+            let pk_u = pk.serialize_uncompressed();
+            // Determine which puzzle matched, restricted to the enabled
+            // serialisations so a disabled form is never attributed a win.
+            let puzzle_number = if check.compressed {
+                ps.puzzle_number_for_hash160(&crate::btc::hash160(&pk_c))
+            } else {
+                None
+            }
+            .or_else(|| {
+                if check.uncompressed {
+                    ps.puzzle_number_for_hash160(&crate::btc::hash160(&pk_u))
+                } else {
+                    None
+                }
+            });
             let ev = MatchEvent {
                 private_key: sk.secret_bytes(),
                 compressed: pk_c.to_vec(),

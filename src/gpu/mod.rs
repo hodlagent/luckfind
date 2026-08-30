@@ -26,7 +26,9 @@ pub use scanner::{GpuScanner, GpuMatchOutput};
 /// propagates everywhere: bind group sizing, dispatch count, init buffer.
 pub const NUM_GPU_THREADS: u32 = 100_000;
 
-/// Matches the WGSL `Config` layout exactly. 16 bytes.
+/// Matches the WGSL `Config` layout exactly. 32 bytes (WGSL uniform structs
+/// must be a multiple of 16 bytes; the two check switches plus two pad fields
+/// fill out the second 16-byte block).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[cfg_attr(feature = "cuda", derive(cust_derive::DeviceCopy))]
@@ -37,7 +39,19 @@ pub struct GpuConfig {
     /// Keys advanced per shader step (`P += stride·G`, `scalar += stride`).
     /// 1 = lottery (step = G); N = puzzle dense-tiling (step = N·G).
     pub stride: u32,
+    /// Whether the kernel compares the compressed (33-byte) pubkey's hash160.
+    /// Mirrors `[btc] check_compressed_pk`; 0 disables.  Default 1.
+    pub check_compressed_pk: u32,
+    /// Whether the kernel compares the uncompressed (65-byte) pubkey's hash160.
+    /// Mirrors `[btc] check_uncompressed_pk`; 0 disables.  Default 1.
+    pub check_uncompressed_pk: u32,
+    /// Padding — kept to satisfy the WGSL uniform 16-byte alignment rule.
+    pub _pad: u32,
+    /// Padding — kept to satisfy the WGSL uniform 16-byte alignment rule.
+    pub _pad2: u32,
 }
+
+const _: [(); 32] = [(); std::mem::size_of::<GpuConfig>()];
 
 /// Matches the WGSL `GeneratorPoint` layout. 64 bytes.
 /// Uploaded from Rust to avoid hand-transcribing secp256k1 constants into WGSL.

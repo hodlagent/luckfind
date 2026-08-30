@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::btc;
+use crate::config::BtcCheck;
 use crate::cuda::scanner::CudaScanner;
 use crate::gpu::{convert, GpuMatchOutput};
 use crate::progress::Progress;
@@ -28,6 +29,7 @@ pub fn worker(
     hit_flag: Arc<AtomicBool>,
     deadline: Option<Instant>,
     start: Instant,
+    check: BtcCheck,
 ) {
     // Set up CUDA scanner on this device.  If that device is unavailable (e.g.
     // a too-old GPU that cannot JIT the PTX), log and fall back — other devices
@@ -53,6 +55,8 @@ pub fn worker(
     // Lottery config: stride 1 (step = G), all candidates.
     scanner.stride = 1;
     scanner.num_candidates = candidate_count;
+    scanner.check_compressed_pk = check.compressed as u32;
+    scanner.check_uncompressed_pk = check.uncompressed as u32;
 
     // Seed walkers at random positions inside the puzzle key space.
     if let Err(e) = scanner.init_random(puzzle_set) {
@@ -80,19 +84,31 @@ pub fn worker(
                         let mut out = Vec::new();
                         for m in &batch_matches {
                             let mut ev = gpu_match_to_event(m, puzzle_set, device_index, start);
-                            // CPU verification
-                            let h = btc::hash160(&ev.compressed);
-                            if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h) {
+                            // CPU verification — re-derive the pubkey, hash160 it, and
+                            // confirm it matches the puzzle set.  Gated by the same
+                            // `[btc]` switches as the kernel, so a serialisation that
+                            // is disabled for checking is never accepted here either.
+                            // The `matched` lookup keeps the two candidate pushes in
+                            // if/else exclusivity so `ev` is moved exactly once.
+                            let matched = if check.compressed {
+                                puzzle_set
+                                    .puzzle_number_for_hash160(&btc::hash160(&ev.compressed))
+                            } else {
+                                None
+                            };
+                            if let Some(pn) = matched {
                                 ev.puzzle_number = Some(pn);
                                 g.push(ev.clone());
                                 out.push(ev);
-                            } else {
-                                let h_u = btc::hash160(&ev.uncompressed);
-                                if let Some(pn) = puzzle_set.puzzle_number_for_hash160(&h_u) {
+                            } else if check.uncompressed {
+                                if let Some(pn) = puzzle_set
+                                    .puzzle_number_for_hash160(&btc::hash160(&ev.uncompressed))
+                                {
                                     ev.puzzle_number = Some(pn);
                                     g.push(ev.clone());
                                     out.push(ev);
                                 }
+                                // else: spurious match — drop silently.
                             }
                         }
                         out

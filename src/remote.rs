@@ -33,6 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::btc;
+use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::puzzle::{
     self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, scan_chunk,
@@ -279,6 +280,7 @@ pub fn run(
     gpu_available: bool,
     rotate_keys: Option<u64>,
     gpu_rotate_keys: Option<u64>,
+    check: BtcCheck,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     let client = Arc::new(HubClient::new(remote_url));
 
@@ -358,6 +360,7 @@ pub fn run(
                 &hit_flag,
                 rotate_keys,
                 start,
+                check,
             )
         }));
     }
@@ -407,6 +410,7 @@ pub fn run(
                         start,
                         framework,
                         0, // WebGPU: single device
+                        check,
                     )
                 }));
             }
@@ -436,6 +440,7 @@ pub fn run(
                                 start,
                                 framework,
                                 dev_idx,
+                                check,
                             )
                         }));
                     }
@@ -682,6 +687,7 @@ fn remote_worker(
     hit_flag: &AtomicBool,
     rotate_keys: Option<u64>,
     start: Instant,
+    check: BtcCheck,
 ) {
     // Throttle for claim-failure logging so a hub outage prints once / 30s,
     // not once / 2s.
@@ -779,6 +785,7 @@ fn remote_worker(
             start: start_bytes,
             end: end_bytes,
             dir,
+            check,
             rotate_keys,
             progress,
             matches,
@@ -923,6 +930,7 @@ fn remote_gpu_worker_entry(
     start: Instant,
     framework: crate::framework::GpuFramework,
     device_index: u32,
+    check: BtcCheck,
 ) {
     // Only the CUDA arm consumes `device_index` (WebGPU always uses device 0);
     // silence the unused-param warning in a non-CUDA build.
@@ -955,6 +963,8 @@ fn remote_gpu_worker_entry(
             // Dense-tiling config: stride = N threads, single target candidate.
             scanner.stride = crate::gpu::NUM_GPU_THREADS;
             scanner.num_candidates = 1;
+            scanner.check_compressed_pk = check.compressed as u32;
+            scanner.check_uncompressed_pk = check.uncompressed as u32;
             remote_gpu_worker(
                 client,
                 worker_id,
@@ -968,6 +978,7 @@ fn remote_gpu_worker_entry(
                 rotate_keys,
                 start,
                 "GPU",
+                check,
             );
         }
         crate::framework::GpuFramework::Cuda => {
@@ -991,6 +1002,8 @@ fn remote_gpu_worker_entry(
                 ));
                 scanner.stride = crate::gpu::NUM_GPU_THREADS;
                 scanner.num_candidates = 1;
+                scanner.check_compressed_pk = check.compressed as u32;
+                scanner.check_uncompressed_pk = check.uncompressed as u32;
                 // Per-card label so [claim] / [HIT] lines identify the GPU.
                 // Compute before `scanner` is moved into the worker.
                 let backend_label = format!("CUDA[{}]", scanner.device_index());
@@ -1007,6 +1020,7 @@ fn remote_gpu_worker_entry(
                     rotate_keys,
                     start,
                     &backend_label,
+                    check,
                 );
             }
             #[cfg(not(feature = "cuda"))]
@@ -1048,6 +1062,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
     rotate_keys: Option<u64>,
     start: Instant,
     backend_label: &str,
+    check: BtcCheck,
 ) {
     // Per-dispatch coverage (keys) once the scanner is configured.  Constant
     // once calibrated: `steps_per_call` defaults to 1 at construction.
@@ -1234,12 +1249,15 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                                 );
                                 // CPU verification — never trust the GPU
                                 // candidate flag alone; spurious matches are
-                                // dropped silently.  The shader checks both
-                                // serialisations (c-or-u, like the CPU worker),
-                                // so re-verify both here too.
+                                // dropped silently.  Gated by the same `[btc]`
+                                // switches as the shader, so a serialisation
+                                // disabled for checking is never accepted here
+                                // either.
                                 let h = btc::hash160(&ev.compressed);
                                 let h_u = btc::hash160(&ev.uncompressed);
-                                if h == target_h160 || h_u == target_h160 {
+                                if (check.compressed && h == target_h160)
+                                    || (check.uncompressed && h_u == target_h160)
+                                {
                                     ev.elapsed = start.elapsed().as_secs_f64();
                                     g.push(ev.clone());
                                     out.push(ev);

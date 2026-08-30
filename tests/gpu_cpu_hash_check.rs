@@ -85,12 +85,94 @@ fn gpu_cpu_hash160_compare() {
 /// one dispatch, and return the shader's own recomputed hash160 for walker 0.
 /// `None` = no match reported (shader's hash differed from the candidate).
 fn gpu_recomputed_hash(sk_be: [u8; 32], candidate: [u8; 20]) -> Option<[u8; 20]> {
+    gpu_recomputed_hash_opts(sk_be, candidate, 1, 1)
+}
+
+/// The `[btc]` check switches must gate the shader's hash/compare the same way
+/// they gate the CPU workers: a serialisation disabled via config is never
+/// serialized, hashed, or matched — so a candidate that only that serialisation
+/// could hit must NOT produce a match, while the other serialisation still does.
+#[test]
+fn gpu_hash_check_respects_btc_switches() {
+    let probe = gpu::GpuContext::new_blocking(0);
+    let device_name = match &probe {
+        Ok(c) => c.device_name().to_owned(),
+        Err(e) => {
+            println!("── GPU ────────────────────────────────────────────────────");
+            println!("  no Metal/WebGPU device, skipping gate test: {e}");
+            return;
+        }
+    };
+    drop(probe);
+
+    let sk_be = scalar_from_hex(KEY_HEX);
+    let secp = secp256k1::Secp256k1::new();
+    let pk = secp256k1::PublicKey::from_secret_key(
+        &secp,
+        &secp256k1::SecretKey::from_byte_array(sk_be).expect("valid scalar < n"),
+    );
+    let h_comp = luckfind::btc::hash160(&pk.serialize());
+    let h_uncomp = luckfind::btc::hash160(&pk.serialize_uncompressed());
+
+    println!("── GPU (Metal): `[btc]` switch gating ({device_name}) ────────");
+
+    // Both enabled (default): either serialisation's candidate matches.
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_comp, 1, 1).is_some(),
+        "default: compressed candidate should match"
+    );
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_uncomp, 1, 1).is_some(),
+        "default: uncompressed candidate should match"
+    );
+
+    // Uncompressed disabled: only the compressed candidate still matches.
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_comp, 1, 0).is_some(),
+        "check_uncompressed_pk=0: compressed candidate should still match"
+    );
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_uncomp, 1, 0).is_none(),
+        "check_uncompressed_pk=0: uncompressed candidate should NOT match"
+    );
+
+    // Compressed disabled: only the uncompressed candidate still matches.
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_comp, 0, 1).is_none(),
+        "check_compressed_pk=0: compressed candidate should NOT match"
+    );
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_uncomp, 0, 1).is_some(),
+        "check_compressed_pk=0: uncompressed candidate should still match"
+    );
+
+    // Both disabled: nothing matches.
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_comp, 0, 0).is_none(),
+        "both disabled: compressed candidate should NOT match"
+    );
+    assert!(
+        gpu_recomputed_hash_opts(sk_be, h_uncomp, 0, 0).is_none(),
+        "both disabled: uncompressed candidate should NOT match"
+    );
+}
+
+/// `gpu_recomputed_hash` with explicit `[btc]` check switches, so the test can
+/// confirm the shader skips a disabled serialisation entirely.
+fn gpu_recomputed_hash_opts(
+    sk_be: [u8; 32],
+    candidate: [u8; 20],
+    check_compressed_pk: u32,
+    check_uncompressed_pk: u32,
+) -> Option<[u8; 20]> {
     let ctx = gpu::GpuContext::new_blocking(0).expect("device probed above");
     let candidates = gpu::convert::hash160_to_candidates(&candidate);
     let mut scanner = GpuScanner::new(ctx, &candidates).expect("GpuScanner::new");
     scanner.stride = 1; // step = G, walker 0 checks exactly the seed key
     scanner.num_candidates = 1;
     scanner.steps_per_call = 1;
+    scanner.check_compressed_pk = check_compressed_pk;
+    scanner.check_uncompressed_pk = check_uncompressed_pk;
     // init_random populates initial_scalars so set_initial_state can patch walker 0.
     scanner
         .init_random(luckfind::puzzles::puzzle_set())

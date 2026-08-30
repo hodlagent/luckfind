@@ -226,6 +226,22 @@ fn main() {
         std::process::exit(2);
     }
 
+    // Which pubkey serialisations to check, from the config `[btc]` section.
+    // Both default to true (a puzzle address may be derived from either form).
+    // At least one must be enabled, or there is nothing to compare.
+    let btc_check = cfg.btc_check();
+    if !btc_check.compressed && !btc_check.uncompressed {
+        eprintln!(
+            "[config] both `[btc] check_compressed_pk` and `[btc] check_uncompressed_pk` \
+             are false — nothing to check. Enable at least one."
+        );
+        std::process::exit(2);
+    }
+    eprintln!(
+        "  [btc] checking compressed pk: {}, uncompressed pk: {}",
+        btc_check.compressed, btc_check.uncompressed
+    );
+
     // ── remote mode: claim chunks over HTTP from a LAN hub (lan-hub) ────────
     // `--puzzle` and `--remote` are mutually exclusive (clap conflicts_with).
     // The hub holds the SQLite worklist and is the single writer; workers claim
@@ -245,6 +261,7 @@ fn main() {
             gpu_available,
             rotate_keys,
             gpu_rotate_keys,
+            btc_check,
         );
         // progress 由 remote::run 打印；aman_<TS>.txt 已在 run() 内落盘。
         let _ = stats;
@@ -267,6 +284,7 @@ fn main() {
             Some(Path::new(&cli.output_dir)),
             framework,
             gpu_available,
+            btc_check,
         );
         // progress 由 puzzle::run 打印；aman_<TS>.txt 已在 run() 内落盘（先于 sqlite）。
         let _ = stats;
@@ -285,7 +303,7 @@ fn main() {
         heartbeat_secs: cli.heartbeat,
     };
 
-    let (stats, matches) = workers::run(cpu_workers, target, limits, gpu_available, framework);
+    let (stats, matches) = workers::run(cpu_workers, target, limits, gpu_available, framework, btc_check);
 
     println!();
     report::final_report(&stats, &matches, &start);

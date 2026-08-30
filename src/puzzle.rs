@@ -64,6 +64,7 @@ use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
 use crate::btc;
+use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::workers::{fmt_comma, MatchEvent};
 
@@ -611,6 +612,7 @@ pub fn run(
     output_dir: Option<&Path>,
     framework: crate::framework::GpuFramework,
     gpu: bool,
+    check: BtcCheck,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
     // ── 1. load the worklist ────────────────────────────────────────────────
     //
@@ -822,6 +824,7 @@ pub fn run(
                     &hit_flag,
                     start,
                     rotate_keys,
+                    check,
                 )
             }
         }));
@@ -858,6 +861,7 @@ pub fn run(
                         &gpu_hit,
                         start,
                         gpu_rotate_keys,
+                        check,
                     );
                 }));
             }
@@ -883,6 +887,7 @@ pub fn run(
                                 start,
                                 gpu_rotate_keys,
                                 dev_idx,
+                                check,
                             );
                         }));
                     }
@@ -1109,6 +1114,8 @@ pub(crate) struct ScanChunkOptions<'a> {
     /// Exclusive upper bound of the claimed sub-range.
     pub end: [u8; 32],
     pub dir: ScanDir,
+    /// Which pubkey serialisations to compare against `target_h160`.
+    pub check: BtcCheck,
     /// Per-claim rotation budget for wide chunks (`None` = scan to completion).
     pub rotate_keys: Option<u64>,
     pub progress: &'a Progress,
@@ -1157,6 +1164,7 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         start,
         end,
         dir,
+        check,
         rotate_keys,
         progress,
         matches,
@@ -1228,11 +1236,27 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         // ~500 kkeys/s.  We only fall through to the boundary check on
         // every 2048th iteration.
         //
-        // Note: `pk` is already derived — no per-key scalar mult here.
-        let pk_c = pk.serialize();
-        let pk_u = pk.serialize_uncompressed();
+        // Note: `pk` is already derived — no per-key scalar mult here.  Only the
+        // pubkey serialisations enabled by `[btc]` config are serialized + hashed
+        // — a disabled form is skipped entirely (it can never match the target).
+        let mut hit = false;
+        let mut pk_c: [u8; 33] = [0; 33];
+        if check.compressed {
+            pk_c = pk.serialize();
+            hit = h160_eq(&pk_c, target_h160);
+        }
+        if !hit && check.uncompressed && h160_eq(&pk.serialize_uncompressed(), target_h160) {
+            hit = true;
+        }
 
-        if h160_eq(&pk_c, target_h160) || h160_eq(&pk_u, target_h160) {
+        if hit {
+            let pk_u = pk.serialize_uncompressed();
+            // If compressed checking was disabled the serialisation was never
+            // computed on the hot path; materialise it just for the match record
+            // (both forms are always reported, regardless of the switches).
+            if !check.compressed {
+                pk_c = pk.serialize();
+            }
             let ev = MatchEvent {
                 private_key: sk.secret_bytes(),
                 compressed: pk_c.to_vec(),
@@ -1390,6 +1414,7 @@ fn puzzle_worker(
     hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
+    check: BtcCheck,
 ) {
     // Puzzle number is constant for this worker's lifetime — capture once.
     let puzzle_number = ctx.lock().ok().map(|c| c.file.puzzle_number);
@@ -1441,6 +1466,7 @@ fn puzzle_worker(
             start: start_bytes,
             end: end_bytes,
             dir,
+            check,
             rotate_keys,
             progress,
             matches,
@@ -1669,6 +1695,7 @@ fn gpu_puzzle_worker(
     hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
+    check: BtcCheck,
 ) {
     // Set up GPU.  If no GPU device is available (CI, headless) we log and
     // fall back to CPU-only — never block the whole run on a missing GPU.
@@ -1694,6 +1721,8 @@ fn gpu_puzzle_worker(
     // Dense-tiling config: stride = N threads, single target candidate.
     scanner.stride = crate::gpu::NUM_GPU_THREADS;
     scanner.num_candidates = 1;
+    scanner.check_compressed_pk = check.compressed as u32;
+    scanner.check_uncompressed_pk = check.uncompressed as u32;
 
     puzzle_gpu_scan_loop(
         target_h160,
@@ -1705,6 +1734,7 @@ fn gpu_puzzle_worker(
         hit_flag,
         start,
         rotate_keys,
+        check,
         "GPU",
     );
 }
@@ -1725,6 +1755,7 @@ fn cuda_puzzle_worker(
     start: Instant,
     rotate_keys: Option<u64>,
     device_index: u32,
+    check: BtcCheck,
 ) {
     let candidates = crate::gpu::convert::hash160_to_candidates(&target_h160);
     let mut scanner = match crate::cuda::CudaScanner::new_on_device(&candidates, device_index) {
@@ -1744,6 +1775,8 @@ fn cuda_puzzle_worker(
     // Dense-tiling config: stride = N threads, single target candidate.
     scanner.stride = crate::gpu::NUM_GPU_THREADS;
     scanner.num_candidates = 1;
+    scanner.check_compressed_pk = check.compressed as u32;
+    scanner.check_uncompressed_pk = check.uncompressed as u32;
     // Per-card label so [claim] / [HIT] lines identify the physical GPU.
     // Compute before `scanner` is moved into the loop.
     let backend_label = format!("CUDA[{}]", scanner.device_index());
@@ -1758,6 +1791,7 @@ fn cuda_puzzle_worker(
         hit_flag,
         start,
         rotate_keys,
+        check,
         &backend_label,
     );
 }
@@ -1780,6 +1814,7 @@ fn puzzle_gpu_scan_loop<S: PuzzleScannerBackend>(
     hit_flag: &AtomicBool,
     start: Instant,
     rotate_keys: Option<u64>,
+    check: BtcCheck,
     backend_label: &str,
 ) {
     // Puzzle number is constant for this worker's lifetime — capture once
@@ -1889,13 +1924,16 @@ fn puzzle_gpu_scan_loop<S: PuzzleScannerBackend>(
                                 );
                                 // CPU verification — a real puzzle solver never trusts the
                                 // GPU candidate flag alone: re-derive the pubkey, hash160
-                                // it (both serialisations — the GPU shader checks c-or-u,
-                                // matching the CPU worker), and confirm it equals the
-                                // target.  Spurious GPU matches (impossible with a 160-bit
-                                // hash, but defense in depth) are dropped here silently.
+                                // it, and confirm it equals the target.  Gated by the same
+                                // `[btc]` switches as the shader, so a serialisation that
+                                // is disabled for checking is never accepted here either.
+                                // Spurious GPU matches (impossible with a 160-bit hash,
+                                // but defense in depth) are dropped here silently.
                                 let h = btc::hash160(&ev.compressed);
                                 let h_u = btc::hash160(&ev.uncompressed);
-                                if h == target_h160 || h_u == target_h160 {
+                                if (check.compressed && h == target_h160)
+                                    || (check.uncompressed && h_u == target_h160)
+                                {
                                     ev.elapsed = start.elapsed().as_secs_f64();
                                     g.push(ev.clone());
                                     out.push(ev);
