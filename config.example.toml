@@ -28,6 +28,11 @@ mode = "remote"
 # cpu_rotate_keys = 134217728
 # gpu_rotate_keys = 4294967296
 
+[btc]
+# 检查压缩公钥和非压缩公钥
+check_compressed_pk = true
+check_uncompressed_pk = false
+
 # ── CPU workers ──────────────────────────────────────────────────────────────
 # `enabled` toggles CPU scanning entirely (default true).  `load` is the
 # proportion (0.1 ..= 1.0) of the resolved worker thread count that actually
