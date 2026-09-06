@@ -51,10 +51,12 @@
 | `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
 | `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
 | `check_compressed_pk` / `check_uncompressed_pk` | 默认均 true | 决定 worker 把压缩（33B）/非压缩（65B）公钥的 hash160 与目标比较；被禁用的序列化在 CPU/GPU 热路径上不再计算。**不改变 hub 协议**——chunk 照常领取扫描，只是命中判定只看启用的序列化 | `[btc]` 配置段 → `BtcCheck`，贯穿 CPU `scan_chunk`/`worker_loop` 与 GPU shader/kernel |
-| HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `remote.rs:134` |
-| HTTP 单请求超时 | 15s | 同上 | `remote.rs:135` |
-| 启动重连 | 每 2s 一次，上限 90s | `connect()` 拿 /api/status | `remote.rs:478` |
-| claim 失败日志节流 | 30s | hub 故障时每 30s 才打印一次 | `remote.rs:631` |
+| `identity`（`[remote]` 段） | 缺省 `<cwd>/identity.json` | 启动 auth 的本地 Nostr 身份文件（`identify` / `nostr.py create` 产出的 5 字段 JSON，0600） | `src/clientauth.rs::load_identity`（自检 secret→pubkey 派生一致；缺文件/不自洽 → exit 2） |
+| HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `HubClient::new` |
+| HTTP 单请求超时 | 15s | 同上 | `HubClient::new` |
+| auth 网络重连 | 每 2s 一次，上限 90s | `POST /api/auth` 传输层错误的有界重试（同 `connect()`） | `remote.rs::startup_auth` |
+| 启动重连 | 每 2s 一次，上限 90s | `connect()` 拿 /api/status | `remote.rs::connect` |
+| claim 失败日志节流 | 30s | hub 故障时每 30s 才打印一次 | `remote_worker` |
 
 > 旋转预算不是 `remote.rs` 内的常量——由 CLI 或配置文件 `cpu_rotate_keys` /
 > `gpu_rotate_keys` 解析后传入（`main.rs` `resolve_rotate`，默认 2²⁷ / 2³¹，`0`
@@ -78,6 +80,7 @@
 
 | 端点 | 方法 | 请求体（节选） | 语义 |
 |---|---|---|---|
+| `/api/auth` | POST | `{pubkey, name?, version?}` | **client-auth 登记**（Phase 1，明文握手）：UPSERT 该 client，返回加密信封 `auth`（见下）；hub 自身 Nostr ID 只在信封里、不进明文响应 |
 | `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；`meta.solved/win` 表明是否已有人命中 |
 | `/api/chunks/claim` | POST | `{worker_id, count, capability}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk |
 | `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
@@ -87,6 +90,12 @@
 
 响应/错误约定：
 
+- **auth 成功**返回 `{ok, pubkey, auth, client}`，其中 `auth` 是 hub 用一次性 ECDH
+  密钥（ECIES v1，`envelope.py`）加密的**信封**：`{v: 1, ephemeral_pubkey, nonce,
+  ciphertext}`，AAD = 该 client 的 pubkey。明文载荷 = `{"hub_pubkey", "server_time"}`
+  ——worker 用本地私钥 + 信封的 `ephemeral_pubkey` 解开才拿到 hub 公钥；解不开 =
+  pubkey 声明与私钥不符/被篡改。**403**（whitelist/blacklist 命中）与 **422**（pubkey
+  非法）带 `{detail}`，worker 打印后 exit 2。
 - **claim 成功**返回 `{granted, chunks: [{id, current_hex, end_hex}], solved}`；
   `granted=0` 表示 hub 当前没有可领的 pending chunk；`solved=true` 表示别的 worker
   已命中 → worker 应停止。
@@ -108,8 +117,22 @@
 worker                                   hub (lan-hub)
 ──────                                   ──────────────
 ① 启动 connect()
-   └─ GET /api/status        ────────→   失败每 2s 重试，上限 90s（remote.rs:478）
+   └─ GET /api/status        ────────→   失败每 2s 重试，上限 90s（remote.rs::connect）
    ←──────────────────────────────────── 校验 hash160 一致（不匹配直接退出，exit 2）
+
+①a client-auth（claim 前的门禁，src/remote.rs::startup_auth）
+   └─ 读 identity.json（`[remote] identity` 覆盖，缺省 <cwd>/identity.json）
+      · 自检：由 secret_key 派生 pubkey 与文件一致；缺文件/不自洽 → exit 2
+   └─ POST /api/auth        ──────────→ {pubkey: <64hex>, name: worker_id, version: 1}
+      · 非 2xx：403（名单）/ 422（pubkey 非法）→ 打印 hub detail 后 exit 2
+      · 传输层错误每 2s 重试，上限 90s
+   ←──────────────────────────────────── {ok, pubkey, auth: {v, ephemeral_pubkey,
+                                          nonce, ciphertext}, client}
+   └─ 用本地私钥 + ephemeral_pubkey 解 AES-256-GCM 信封（ECIES v1，src/clientauth.rs）
+      · tag 校验失败（非发给这把私钥/被篡改）→ exit 2
+      · 解开 → 学到 hub_pubkey → 打印 `[remote] auth ok · hub=<前缀…>`
+   └─ 写 hub.json TOFU（与 identity.json 同目录，0600）
+      · 已存 hub_pubkey ≠ 新解出的 → exit 2（删 hub.json 以接受新 hub 身份）
    └─ pending+running == 0  → 直接退出「nothing to do」
 
 ② 领取 chunk（每个线程 ≤1 个）
@@ -218,8 +241,11 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 | 逻辑 | Rust | hub |
 |---|---|---|
 | 心跳常量 / 旋转预算（config 解析传入） | `remote.rs:43-50`；`main.rs` `resolve_rotate` | `config.py:67-71` |
-| HTTP 封装与超时 | `remote.rs:119-208` | `routes.py` |
-| 启动 connect + hash160 校验 | `remote.rs:477-528` | — |
+| HTTP 封装与超时 | `HubClient`（remote.rs） | `routes.py` |
+| 启动 client-auth + 解信封 + TOFU | `remote.rs::startup_auth`/`HubClient::auth`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
+| identity.json 自检 | `clientauth.rs::load_identity` | —（hub 侧由 `nostr.py` 生成） |
+| hub.json TOFU（hub 身份跨启动校验） | `clientauth.rs::remember_hub` | — |
+| 启动 connect + hash160 校验 | `remote.rs::connect` | `routes.py` |
 | CPU worker 主循环 | `remote.rs:618-826` | — |
 | GPU worker 主循环 | `remote.rs:955-1253` | — |
 | status ticker | `remote.rs:532-609` | — |

@@ -72,3 +72,6 @@ check_uncompressed_pk = true
 # Required when mode = "remote".  Hub base URL.
 [remote]
 uri = "http://192.168.18.69:42069"
+# 本地 Nostr 身份文件（启动 auth 用，声明 client pubkey + 解开 hub 信封）。
+# 缺省 = 本目录 identity.json（与 config 自动发现同 cwd 语义）。
+# identity = "identity.json"

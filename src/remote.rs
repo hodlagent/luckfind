@@ -7,8 +7,9 @@
 //!
 //!   1. claims one chunk over HTTP (`POST /api/chunks/claim`),
 //!   2. scans it with the shared CPU core (`crate::puzzle::scan_chunk`),
-//!   3. keeps the lease alive with throttled heartbeats (~30s ≪ the hub's 120s
-//!      reclaim timeout) that also carry the scan position,
+//!   3. keeps the lease alive with throttled heartbeats (30s — comfortably under
+//!      the hub's `[reclaim] timeout_seconds`, read from its config.toml) that
+//!      also carry the scan position,
 //!   4. reports back via `win` (match) / `done` (finished) or `release`
 //!      (parked, with the resume position — forward `current`, reverse `end`).
 //!
@@ -19,7 +20,8 @@
 //! idle workers exit on the next claim).
 //!
 //! Crash recovery is the hub's job: a worker that dies (or loses the network)
-//! stops heartbeating, and the hub reclaims the lease after 120s, reverting the
+//! stops heartbeating, and the hub reclaims the lease after its `[reclaim]
+//! timeout_seconds` (read from the hub's config.toml), reverting the
 //! chunk to `pending` at the last reported position.  A 404/409 from the hub
 //! means our lease is already gone — we abandon the chunk and re-claim, never
 //! crashing.
@@ -33,6 +35,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::btc;
+use crate::clientauth;
 use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::puzzle::{
@@ -49,8 +52,9 @@ use crate::workers::{fmt_comma, MatchEvent};
 // disables rotation: the chunk is scanned to completion and the claim declares
 // capability 0, which the hub treats as its 2^41 default.
 
-/// Lease-refresh cadence.  The hub reclaims leases after 120s, so 30s gives a
-/// comfortable margin while keeping LAN traffic negligible.
+/// Lease-refresh cadence.  The hub reclaims leases after `[reclaim]
+/// timeout_seconds` (read from the hub's config.toml, not a fixed value), so
+/// 30s gives a comfortable margin while keeping LAN traffic negligible.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Sleep between claim attempts when the hub has nothing to hand out (every
@@ -133,13 +137,58 @@ fn is_lease_lost(e: &ureq::Error) -> bool {
     matches!(e, ureq::Error::StatusCode(404 | 409))
 }
 
+/// `/api/auth` 失败分类：
+/// - `Transport` — 网络层错误（超时/连接断），启动时可像 `connect()` 一样有界重试；
+/// - `Denied`    — hub 以 4xx 拒绝（whitelist/blacklist 命中 403、pubkey 非法 422…），
+///   直接带 hub 的 `detail` 文案报错；
+/// - `Envelope`  — 响应/信封本身坏（非 JSON、缺 auth 键、版本不支持、hex 非法、AES-GCM
+///   tag 校验失败）——解不开信封 = 验证不通过，一律 exit 2，绝不降级为无身份扫描。
+enum AuthErr {
+    Transport(ureq::Error),
+    Denied { code: u16, detail: String },
+    Envelope(String),
+}
+
+/// 4xx 响应体 → 可读文案：优先 FastAPI 的 `{detail: "…"}`，否则截断原始 body。
+fn body_detail(resp: ureq::http::Response<ureq::Body>) -> String {
+    let mut body = resp.into_body();
+    let text = match body.read_to_string() {
+        Ok(t) => t,
+        Err(_) => return "<响应体不可读>".to_string(),
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => v
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| clip(&text)),
+        Err(_) => clip(&text),
+    }
+}
+
+/// 控制台用：超过 ~200 字符截断。
+fn clip(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() > 200 {
+        format!("{}…", t.chars().take(200).collect::<String>())
+    } else {
+        t.to_string()
+    }
+}
+
 // ── blocking HTTP wrapper ────────────────────────────────────────────────────
 
 /// Thin wrapper over `ureq::Agent` for the lan-hub API.  Timeouts are set so a
-/// dead hub never hangs a worker thread forever (the hub reclaims leases after
-/// 120s regardless of whether the worker noticed).
+/// dead hub never hangs a worker thread forever (the hub reclaims the lease
+/// after its `[reclaim] timeout_seconds`, read from its config.toml, regardless
+/// of whether the worker noticed).
 struct HubClient {
     agent: ureq::Agent,
+    /// auth 专用 agent：`http_status_as_error(false)`，让 4xx（403 whitelist 拒绝、
+    /// 422 pubkey 非法）落到正常 `Response`，从而能读到 hub 返回的 `{detail}` 文案。
+    /// 业务请求（claim/heartbeat/…）仍走 `agent`，保留「非 2xx = Err(StatusCode)」语义
+    /// （`is_lease_lost` 依赖 404/409）。
+    auth_agent: ureq::Agent,
     base: String,
 }
 
@@ -149,11 +198,18 @@ impl HubClient {
         // Split the chain so the concrete `ConfigBuilder<AgentScope>` type is
         // pinned before `new_agent` (the timeout builders are generic over the
         // scope and would otherwise leave it ambiguous).
-        let builder = ureq::config::Config::builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_per_call(Some(Duration::from_secs(15)));
-        let agent = builder.build().new_agent();
-        Self { agent, base }
+        let builder = || {
+            ureq::config::Config::builder()
+                .timeout_connect(Some(Duration::from_secs(5)))
+                .timeout_per_call(Some(Duration::from_secs(15)))
+        };
+        let agent = builder().build().new_agent();
+        let auth_agent = builder().http_status_as_error(false).build().new_agent();
+        Self {
+            agent,
+            auth_agent,
+            base,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -163,6 +219,42 @@ impl HubClient {
     fn status(&self) -> Result<HubStatus, ureq::Error> {
         let resp = self.agent.get(&self.url("/api/status")).call()?;
         resp.into_body().read_json()
+    }
+
+    /// Phase 1 client-auth：明文 POST 登记本机身份（`identity.json` 的 pubkey），
+    /// hub 把 `{hub_pubkey, server_time}` 加密成信封（ECIES v1）返回；这里用本地私钥
+    /// + 信封的 `ephemeral_pubkey` 解开（`clientauth::decrypt_auth`）→ 拿到 hub 公钥。
+    /// 解得开 = 声明的 pubkey 与本地私钥匹配（验证通过）；hub 拒绝（名单/非法）与信封
+    /// 校验失败各自带原因返回，不做重试。
+    fn auth(
+        &self,
+        identity: &clientauth::ClientIdentity,
+        name: &str,
+    ) -> Result<clientauth::AuthReply, AuthErr> {
+        let resp = self
+            .auth_agent
+            .post(&self.url("/api/auth"))
+            .send_json(json!({
+                "pubkey": identity.pubkey,
+                "name": name,
+                "version": 1,
+            }))
+            .map_err(AuthErr::Transport)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            return Err(AuthErr::Denied {
+                code: status,
+                detail: body_detail(resp),
+            });
+        }
+        let body: serde_json::Value = resp
+            .into_body()
+            .read_json()
+            .map_err(|e| AuthErr::Envelope(format!("auth 响应不是合法 JSON：{e}")))?;
+        let env = body
+            .get("auth")
+            .ok_or_else(|| AuthErr::Envelope("auth 响应缺少 auth 信封".into()))?;
+        clientauth::decrypt_auth(identity, env).map_err(AuthErr::Envelope)
     }
 
     /// Claim `count` pending chunks, declaring how many keys this worker scans
@@ -273,6 +365,7 @@ struct ChunkUpdateBody {
 pub fn run(
     remote_url: &str,
     worker_id: String,
+    identity_path: &Path,
     n_workers: usize,
     heartbeat_secs: f64,
     output_dir: Option<&Path>,
@@ -286,6 +379,13 @@ pub fn run(
 
     // ── 1. connect to the hub and read the puzzle meta ─────────────────────
     let (target_h160, puzzle_number, summary) = connect(&client);
+
+    // ── 1b. client-auth gate ──────────────────────────────────────────────
+    // claim 之前先声明身份：明文 POST 登记 + 解开 hub 的加密信封拿 hub_pubkey
+    // （`startup_auth`），并把 hub 公钥 TOFU 进 hub.json。验证不过直接 exit 2，
+    // 绝不静默降级为无身份扫描——auth 是远程模式的启动门禁。
+    startup_auth(&client, identity_path, &worker_id);
+
     if summary.pending + summary.running == 0 {
         println!("[remote] hub reports no pending or running chunks — nothing to do.");
         return (Arc::new(Progress::new(0)), Vec::new());
@@ -587,6 +687,56 @@ fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
     (target_h160, Some(meta.puzzle_number), status.summary)
 }
 
+/// 启动 client-auth（`POST /api/auth`，docs/remote-protocol.md 时序 ①a）：加载本地
+/// `identity.json` 身份 → 明文登记 → 解开 hub 返回的加密信封拿 `hub_pubkey` → TOFU
+/// 写入 `hub.json`。打印 `[remote] auth ok · hub=<前缀…>`。
+///
+/// 失败节奏与 `connect()` 对齐：网络层错误有界重试（≤90s、2s 步进）后 exit 2；hub
+/// 拒绝（403 whitelist / 422 非法 pubkey 等，带 hub detail）、信封解密失败、身份文件
+/// 缺失/不自洽、hub 身份变化（TOFU mismatch）→ 一律带原因 exit 2。
+fn startup_auth(client: &HubClient, identity_path: &Path, name: &str) -> clientauth::AuthReply {
+    let identity = clientauth::load_identity(identity_path).unwrap_or_else(|e| {
+        eprintln!("[remote] {e}");
+        std::process::exit(2);
+    });
+    term_line(&format!(
+        "[remote] 身份: pubkey={}…",
+        &identity.pubkey[..16]
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let reply = loop {
+        match client.auth(&identity, name) {
+            Ok(reply) => break reply,
+            Err(AuthErr::Transport(e)) => {
+                if Instant::now() >= deadline {
+                    eprintln!("[remote] auth: hub unreachable after 90s ({e}) — giving up.");
+                    std::process::exit(2);
+                }
+                term_line(&format!("[remote] auth: hub unreachable ({e}) — retrying …"));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(AuthErr::Denied { code, detail }) => {
+                eprintln!("[remote] hub 拒绝 auth（HTTP {code}）：{detail}");
+                std::process::exit(2);
+            }
+            Err(AuthErr::Envelope(msg)) => {
+                eprintln!("[remote] auth 信封解密失败：{msg}");
+                std::process::exit(2);
+            }
+        }
+    };
+    term_line(&format!("[remote] auth ok · hub={}…", &reply.hub_pubkey[..16]));
+
+    // TOFU：hub_pubkey 持久化，跨启动校验 hub 身份未变（变化 → remember_hub Err → exit 2）。
+    let hub_path = clientauth::hub_json_path(identity_path);
+    clientauth::remember_hub(&hub_path, &reply, &client.base).unwrap_or_else(|e| {
+        eprintln!("[remote] {e}");
+        std::process::exit(2);
+    });
+    reply
+}
+
 /// Background status line: every `heartbeat_secs`, query the hub and rewrite
 /// the in-place line with the global view plus this worker's chunk progress.
 fn ticker(
@@ -706,7 +856,8 @@ fn remote_worker(
             Ok(c) => c,
             Err(e) => {
                 // Transport error (hub down / slow).  Back off and retry; if
-                // we held a lease, the hub reclaims it after 120s on its own.
+                // we held a lease, the hub reclaims it on its own once its
+                // `[reclaim] timeout_seconds` elapses.
                 if last_fail_log.elapsed() >= Duration::from_secs(30) {
                     term_line(&format!("[remote] claim failed ({e}) — retrying …"));
                     last_fail_log = Instant::now();
@@ -758,7 +909,8 @@ fn remote_worker(
 
         // ── scan with the shared core ─────────────────────────────────────
         // The on_position closure sends a heartbeat every HEARTBEAT_INTERVAL
-        // (30s ≪ the hub's 120s reclaim).  Forward sends `current`, reverse
+        // (30s — well under the hub's configurable `[reclaim] timeout_seconds`).
+        // Forward sends `current`, reverse
         // sends `end` — the two fields carry the full resume position.  If the
         // hub ever reports the lease lost (404/409), we stop reporting, scan
         // to the end of the claim, and re-claim; the hub already reverted the

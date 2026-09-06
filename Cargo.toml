@@ -79,6 +79,10 @@ ureq = { version = "3", default-features = false, features = ["json"] }
 # throughput over the pure-Rust fallback. RIPEMD160 stays in Rust (no asm backend).
 ripemd = "0.1"
 
+# client-auth 加密信封解密（remote 启动时解开 hub 返回的 hub_pubkey；ECIES v1：
+# AES-256-GCM，见 src/clientauth.rs 与 lan-hub backend/app/envelope.py 镜像契约）
+aes-gcm = "0.10"
+
 [features]
 default = []
 cuda = ["dep:cust", "dep:cust_derive"]

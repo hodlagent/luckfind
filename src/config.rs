@@ -166,6 +166,9 @@ pub struct PuzzleSection {
 pub struct RemoteSection {
     /// Hub base URL, e.g. `http://192.168.1.10:42069`.
     pub uri: Option<String>,
+    /// Local Nostr identity file for startup auth.  Absent ⇒ `<cwd>/identity.json`
+    /// (same cwd-discovery semantics as the config file).
+    pub identity: Option<String>,
 }
 
 impl Config {

@@ -14,6 +14,7 @@ mod report;
 mod workers;
 mod puzzle;
 mod remote;
+mod clientauth;
 mod gpu;
 mod framework;
 #[cfg(feature = "cuda")]
@@ -248,12 +249,21 @@ fn main() {
     // chunks over HTTP.  When a GPU device was resolved above, a dedicated GPU
     // worker thread claims + dense-tiles chunks alongside the CPU workers.
     if let Some(ref remote_url) = remote_url {
+        // 本地 Nostr 身份（remote 启动 auth 用）：`[remote] identity` 显式路径优先，
+        // 缺省 `<cwd>/identity.json`（与 config 自动发现同 cwd 语义）。
+        let identity_path: std::path::PathBuf = match cfg.remote.identity.as_deref() {
+            Some(p) => p.into(),
+            None => std::env::current_dir()
+                .map(|c| c.join("identity.json"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("identity.json")),
+        };
         // 旋转预算（reclaim count）来自 CLI/配置文件解析后的 rotate_keys 与
         // gpu_rotate_keys（见上方解析），在 remote 模式下同时作为 claim 的
         // capability 声明给 hub——hub 据此优先分配宽度匹配的 chunk。
         let (stats, _matches) = remote::run(
             remote_url,
             cli.worker_id(),
+            &identity_path,
             cpu_workers,
             cli.heartbeat,
             Some(Path::new(&cli.output_dir)),
