@@ -295,6 +295,17 @@ hub 开 `[pow]` 且本 client **已登记**（identity.json 在 → auth 轨）�
 
 - `x_hex`/`y_hex` **恒等于**该 grant 项的 `current_hex`/`end_hex`（hub 由同一对
   `scan_start`/`scan_end` 生成）——`pow_task()` 本地交叉校验，不符即按无任务处理。
+  两者都是 32B 大端 → **恒 64 位小写 hex**（hub `powproof.build_task` 的
+  `to_bytes(32,"big").hex()`），没有短写形式。
+- **`task` 在客户端是 `serde_json::Value`，不是结构体**：它是 `ClaimResponse` 的
+  嵌套字段，直接放强类型会让"形状漂移"（hub 改键名 / 某字段类型不符）把**整个
+  claim 响应**的反序列化拖垮 → `claim()` 返 Err → worker 无限 `claim failed —
+  retrying`，一块也领不到。形状校验因此下沉到 `pow_task()`（`from_value` 失败 →
+  警告 + 按无任务处理），最坏后果是"这一块没 pow"。多出的**未知键**照常接受
+  （向前兼容），只有类型/必填项不符才算漂移。
+- 解析 `x_hex`/`y_hex` 用 `parse_hex_key_checked`（全函数，畸形返回 `None`）而非
+  `parse_hex_key`（对 >64 字符 assert、非 hex panic）——这里处理的正是不可信的
+  hub 响应，"畸形即 `None`"的契约不能反过来打死进程。
 - `proof_count` **可配置**（hub `[pow] proof_count`，默认 6）——客户端按数据走，
   绝不硬编码；`1 + proof_count ≤ 78`（GPU 候选缓冲槽位数）。
 - **`expected_digest` 不随任务下发**（只在 hub 库里），所以 worker 只能真扫出
@@ -337,7 +348,7 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 |---|---|
 | 提交成功 | 打印 verified 工作量；响应 `solved=true`（puzzle 被别人解出）→ 停机，否则继续 claim |
 | 404 / 409 | `is_lease_lost` → 任务已作废（task 没了 / 非 active / 非本人 / lease 已丢），直接重领 |
-| 400 | digest 不符 = 客户端/hub 口径不符（真实 hash160 比对下不应发生）→ 大声警告 + `release` 弃窗 + 重领 |
+| 400 | digest 不符 → 大声警告 + `release` 弃窗 + 重领。**刻意不重试**：hub 侧 400 保持 task active、租约内可重传（`verify_pow`），但真凑不出 digest 就说明本地扫描口径与 hub 下发的 proof 集不符，重传多少次都一样——弃窗拿新任务 > 抱着一个永远收敛不了的窗口 |
 | **集齐不足** | 限流警告 + `release` 弃窗 + 重领（无法收敛，立刻还回 pending 胜过等 hub 回收超时） |
 
 ### 8.4 冻结窗口的强制语义

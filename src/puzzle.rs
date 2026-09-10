@@ -2136,6 +2136,26 @@ pub(crate) fn parse_hex_key(hex_str: &str) -> [u8; 32] {
     out
 }
 
+/// `parse_hex_key` 的全函数版本：畸形输入返回 `None`，**绝不 panic**。
+///
+/// 与 `parse_hex_key` 同语义（可带 `0x` 前缀、可短写左补零），只是把"malformed
+/// is a programming error"换成"malformed is data"。**给不可信输入用**——即
+/// hub 响应里那些客户端无权假定合法的 hex 字段（如 claim 的 pow `task`）。
+/// 可信输入（本地工作库、客户端自己编码的 hex）继续用 `parse_hex_key`，把
+/// "不可能发生"留成断言。
+pub(crate) fn parse_hex_key_checked(hex_str: &str) -> Option<[u8; 32]> {
+    let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    if s.is_empty() || s.len() > 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // 与 `parse_hex_key` 同规则：奇数长度左补一个 0，补后必为偶数。
+    let padded = format!("{:0>64}", s);
+    let raw = hex::decode(padded).ok()?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Some(out)
+}
+
 /// Hex-encode a 32-byte key (always 64 hex chars, no padding ambiguity).
 pub(crate) fn hex_encode_key(bytes: &[u8; 32]) -> String {
     hex::encode(bytes)
@@ -2991,6 +3011,40 @@ mod tests {
 
     fn both_forms() -> BtcCheck {
         BtcCheck { compressed: true, uncompressed: true }
+    }
+
+    /// `parse_hex_key_checked`：合法输入与 `parse_hex_key` 逐位相同，畸形输入
+    /// 返回 `None` 而**不是 panic**（`parse_hex_key` 对这两种输入会 assert/panic，
+    /// 所以这里绝不能拿它做对照调用）。
+    #[test]
+    fn test_parse_hex_key_checked_is_total_and_agrees_on_valid_input() {
+        // 合法：短写、0x 前缀、奇数长度、满 64 位 —— 都与 parse_hex_key 一致。
+        for s in ["1", "0x1", "abc", "0xabc", &"f".repeat(64), &"0".repeat(64)] {
+            assert_eq!(
+                parse_hex_key_checked(s),
+                Some(parse_hex_key(s)),
+                "合法输入应与 parse_hex_key 同值：{s:?}"
+            );
+        }
+        // 短写左补零（同 parse_hex_key 规则）。
+        assert_eq!(parse_hex_key_checked("0a"), Some(be32(10)));
+        assert_eq!(parse_hex_key_checked("0x0a"), Some(be32(10)));
+
+        // 畸形：非 hex / 超 64 位 / 空 / 只有前缀 / 含空白 —— 一律 None，不 panic。
+        for bad in [
+            "zz",
+            "nothex!",
+            "",
+            "0x",
+            &"a".repeat(65),
+            &"a".repeat(70),
+            " 1",
+            "1 ",
+            "0xg",
+            "１２",
+        ] {
+            assert_eq!(parse_hex_key_checked(bad), None, "畸形输入应返回 None：{bad:?}");
+        }
     }
 
     #[test]

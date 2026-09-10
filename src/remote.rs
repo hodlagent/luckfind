@@ -39,7 +39,8 @@ use crate::clientauth;
 use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::puzzle::{
-    self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, scan_chunk,
+    self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, parse_hex_key_checked,
+    scan_chunk,
     term_line, term_status, ProofHit, PuzzleScannerBackend, ResumePosition, ScanChunkOptions,
     ScanDir,
 };
@@ -132,12 +133,18 @@ struct ClaimedChunk {
     /// Phase 2 工作量证明任务（hub `[pow] enabled=true` 且本 client 已登记时随
     /// grant 项下发）。**缺省 = 无 pow 语义**——下面每条分支都跳过，行为与今日
     /// 逐字节一致（旧 hub / 匿名轨 / 窗口过窄都不带此键）。
+    ///
+    /// 刻意收成 `Value` 而不是 `ChunkTaskRaw`：`task` 在这里是**外层结构的一个
+    /// 字段**，直接放 `ChunkTaskRaw` 会让它形状不符时把整个 `ClaimResponse` 的
+    /// 反序列化拖垮——`claim()` 返 Err，worker 只能无限 `claim failed — retrying`，
+    /// 一块也领不到（hub 侧改个键名即触发）。收成 `Value` 后形状校验挪进
+    /// `pow_task()`，最坏后果退回"这一块没 pow"。
     #[serde(default)]
-    task: Option<ChunkTaskRaw>,
+    task: Option<serde_json::Value>,
 }
 
 /// claim 响应 grant 项上的原始 `task` 对象（hub `puzzle.py` 的 task_info）。
-/// 出现时各字段皆必填；用 `pow_task()` 校验后才可当 `PowTask` 用。
+/// 出现时各字段皆必填；用 `pow_task()` 反序列化 + 校验后才可当 `PowTask` 用。
 #[derive(Debug, Deserialize)]
 struct ChunkTaskRaw {
     task_id: u64,
@@ -167,7 +174,19 @@ impl ClaimedChunk {
     /// 可解析 → `x < y` → **`x_hex`/`y_hex` == `current_hex`/`end_hex`**（hub 由同一
     /// 对 scan_start/scan_end 生成，不符即协议错位，宁可不挂任务）。
     pub(crate) fn pow_task(&self) -> Option<PowTask> {
-        let raw = self.task.as_ref()?;
+        let value = self.task.as_ref()?;
+        // 形状校验在这一层做（`task` 是 `Value`）：hub 侧键名/类型漂移只让本块
+        // 退回"无 pow"，绝不拖垮整个 claim 响应。
+        let raw: ChunkTaskRaw = match serde_json::from_value(value.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                term_line(&format!(
+                    "[pow] chunk {} 任务形状不符（{e}）——按无 pow 处理",
+                    self.id
+                ));
+                return None;
+            }
+        };
         if raw.proof_count == 0 || raw.proof_hash160s.len() != raw.proof_count {
             term_line(&format!(
                 "[pow] chunk {} 任务畸形：proof_count={} 与 proof_hash160s.len()={} 不符——按无 pow 处理",
@@ -198,9 +217,27 @@ impl ClaimedChunk {
                 }
             }
         }
-        let x = parse_hex_key(&raw.x_hex);
-        let y = parse_hex_key(&raw.y_hex);
-        if x != parse_hex_key(&self.current_hex) || y != parse_hex_key(&self.end_hex) {
+        // 全函数解析：`parse_hex_key` 对畸形输入是 assert + panic（puzzle.rs），
+        // 而这里处理的正是**不可信的 hub 响应**——`pow_task()` 的契约是畸形即
+        // `None`，不能反过来把进程打死。x/y 恒为 32B 大端 hex（hub
+        // `powproof.build_task` 的 `to_bytes(32,"big").hex()`，恒 64 位）。
+        let (x, y) = match (
+            parse_hex_key_checked(&raw.x_hex),
+            parse_hex_key_checked(&raw.y_hex),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                term_line(&format!(
+                    "[pow] chunk {} 任务畸形：任务窗 hex 无法解析（x={:?} y={:?}，需 ≤64 位 hex）\
+                     ——按无 pow 处理",
+                    self.id, raw.x_hex, raw.y_hex
+                ));
+                return None;
+            }
+        };
+        if Some(x) != parse_hex_key_checked(&self.current_hex)
+            || Some(y) != parse_hex_key_checked(&self.end_hex)
+        {
             term_line(&format!(
                 "[pow] chunk {} 任务畸形：任务窗 [{}, {}) 与该 grant 项的 [{}, {}) 不符——按无 pow 处理",
                 self.id, raw.x_hex, raw.y_hex, self.current_hex, self.end_hex
@@ -585,9 +622,11 @@ pub(crate) fn hashed_proof_key(keys: &[[u8; 32]]) -> String {
 ///   `false`（调用方停机），否则 `true`（继续 claim）。
 /// - 404/409（`is_lease_lost`：task 不存在 / 非 active / 非本人 / lease 已丢）⇒
 ///   `true`——任务已作废，直接重领。
-/// - 400（digest 不符）或其它传输错 ⇒ 大声警告 + `release` 弃窗 + `true`。400 在
-///   真实 hash160 比对下不可能出现（除非 hub 下发的 proof 集与扫描口径不符），
-///   所以按客户端/hub bug 处理：弃窗重扫 > 抱着一个永远不会收敛的窗口。
+/// - 400（digest 不符）或其它传输错 ⇒ 大声警告 + `release` 弃窗 + `true`。
+///   **刻意不重试**：hub 侧 400 保持 task active、租约内可重扫后重传（`puzzle.py`
+///   `verify_pow`），但客户端在真实 hash160 比对下不该凑不出 digest——真凑不出
+///   就说明本地扫描口径与 hub 下发的 proof 集不符，重传多少次都一样。弃窗重扫
+///   （拿一份新任务）> 抱着一个永远收敛不了的窗口空转。
 /// - **未集齐**（扫描被中断，或 hub 的 proof 集在本地根本不可能命中）⇒ 限流警告 +
 ///   `release` 弃窗 + `true`：无法收敛，立刻还回 pending 胜过等 hub reclaim 超时。
 fn converge_pow(
@@ -2172,6 +2211,15 @@ mod tests {
                 "window mismatch",
                 task_json(&hex_encode_key(&be(11)), &y, 1, &[h160_hex(1)]),
             ),
+            // 任务窗 hex 非 hex / 超 64 位：**必须返回 None 而不是 panic**
+            // （`parse_hex_key` 对这两种输入是 assert + panic）。
+            ("x not hex", task_json("zz", &y, 1, &[h160_hex(1)])),
+            (
+                "x too long",
+                task_json(&"a".repeat(70), &y, 1, &[h160_hex(1)]),
+            ),
+            ("y not hex", task_json(&x, "nothex!", 1, &[h160_hex(1)])),
+            ("x empty", task_json("", &y, 1, &[h160_hex(1)])),
         ];
         for (label, task) in cases {
             let json = claim_json(Some(task));
@@ -2181,6 +2229,75 @@ mod tests {
                 "应拒绝畸形任务（{label}）"
             );
         }
+    }
+
+    /// **回归锚点（P1）**：`task` 存在但**形状不符**（键改名 / 某字段类型不符）
+    /// 时，整个 `ClaimResponse` 仍必须解析成功——否则 `claim()` 返 Err，worker
+    /// 只会无限 `claim failed — retrying`，一块也领不到。
+    ///
+    /// `task` 因此收成 `serde_json::Value`：形状校验下沉到 `pow_task()`，最坏
+    /// 后果是"这一块没 pow"，而不是"全队没活干"。hub 侧改个键名即触发。
+    #[test]
+    fn shape_drifted_task_does_not_break_the_whole_claim() {
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(1000));
+        let h = h160_hex(1);
+        let cases = [
+            // 键改名：x_hex → x
+            (
+                "renamed key",
+                format!(
+                    r#"{{"task_id":42,"x":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{h}"]}}"#
+                ),
+            ),
+            // 类型不符：proof_hash160s 是 null 而非数组
+            (
+                "null array",
+                format!(
+                    r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":null}}"#
+                ),
+            ),
+            // task_id 类型不符（字符串而非数字）
+            (
+                "task_id as string",
+                format!(
+                    r#"{{"task_id":"42","x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{h}"]}}"#
+                ),
+            ),
+            // 缺 proof_count
+            (
+                "missing proof_count",
+                format!(r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_hash160s":["{h}"]}}"#),
+            ),
+            // 根本不是对象
+            ("not an object", format!("\"whatever\"")),
+        ];
+        for (label, task) in cases {
+            let json = claim_json(Some(task));
+            let resp: ClaimResponse = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("claim 响应不该因 task 形状漂移而解析失败（{label}）：{e}"));
+            assert_eq!(resp.granted, 1, "granted 仍应可用（{label}）");
+            assert_eq!(resp.chunks[0].current_hex, x, "chunk 字段仍应可用（{label}）");
+            assert!(
+                resp.chunks[0].pow_task().is_none(),
+                "形状不符的 task 应按无 pow 处理（{label}）"
+            );
+        }
+    }
+
+    /// 形状对但**多一个未知键**仍是合法任务（向前兼容：hub 加字段不该废掉 pow）。
+    #[test]
+    fn task_with_extra_unknown_key_is_still_accepted() {
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(1000));
+        let task = format!(
+            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{}"],"future_field":123}}"#,
+            h160_hex(0xAA)
+        );
+        let resp: ClaimResponse = serde_json::from_str(&claim_json(Some(task))).unwrap();
+        let t = resp.chunks[0].pow_task().expect("未知键不该使任务失效");
+        assert_eq!(t.task_id, 42);
+        assert_eq!(t.proof_hash160s, vec![h160(0xAA)]);
     }
 
     #[test]
