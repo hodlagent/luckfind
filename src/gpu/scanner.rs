@@ -178,6 +178,31 @@ impl GpuScanner {
         Ok(())
     }
 
+    /// 替换候选槽表（槽 0 = target，槽 1..=N = pow proof hash160；见
+    /// `gpu::convert::chunk_candidates`）。**每 chunk 一次**，在 `seed_range`
+    /// 之前调用；内核按运行时的 `num_candidates` 循环候选槽，故只需重传数据 +
+    /// 改字段（`upload_config` 在每次 `step()` 前把 `num_candidates` 送上设备）。
+    ///
+    /// 候选缓冲是 78 槽定长，调用方必须传满 78 槽（定长表 + num_candidates 决定
+    /// 实际比对几个）。
+    pub fn set_candidates(&mut self, candidates: &[[u32; 5]], num_candidates: u32) {
+        assert_eq!(
+            candidates.len(),
+            78,
+            "candidate table must be the full 78 slots"
+        );
+        assert!(
+            (1..=78).contains(&num_candidates),
+            "num_candidates must be within 1..=78"
+        );
+        self.ctx.queue().write_buffer(
+            &self.buffers.candidates,
+            0,
+            bytemuck::cast_slice(candidates),
+        );
+        self.num_candidates = num_candidates;
+    }
+
     /// Upload config buffer.
     fn upload_config(&self) -> Result<()> {
         let config = GpuConfig {

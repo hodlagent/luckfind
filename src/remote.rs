@@ -40,7 +40,8 @@ use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::puzzle::{
     self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, scan_chunk,
-    term_line, term_status, PuzzleScannerBackend, ResumePosition, ScanChunkOptions, ScanDir,
+    term_line, term_status, ProofHit, PuzzleScannerBackend, ResumePosition, ScanChunkOptions,
+    ScanDir,
 };
 use crate::workers::{fmt_comma, MatchEvent};
 
@@ -128,6 +129,98 @@ struct ClaimedChunk {
     id: u32,
     current_hex: String,
     end_hex: String,
+    /// Phase 2 工作量证明任务（hub `[pow] enabled=true` 且本 client 已登记时随
+    /// grant 项下发）。**缺省 = 无 pow 语义**——下面每条分支都跳过，行为与今日
+    /// 逐字节一致（旧 hub / 匿名轨 / 窗口过窄都不带此键）。
+    #[serde(default)]
+    task: Option<ChunkTaskRaw>,
+}
+
+/// claim 响应 grant 项上的原始 `task` 对象（hub `puzzle.py` 的 task_info）。
+/// 出现时各字段皆必填；用 `pow_task()` 校验后才可当 `PowTask` 用。
+#[derive(Debug, Deserialize)]
+struct ChunkTaskRaw {
+    task_id: u64,
+    /// 任务窗口底/顶，恒等于该项的 `current_hex`/`end_hex`（hub 同源生成）。
+    x_hex: String,
+    y_hex: String,
+    /// proof 个数（hub `[pow] proof_count`，默认 6——**不得硬编码**）。
+    proof_count: usize,
+    /// 每个 proof 的压缩公钥 hash160（40-hex）。
+    proof_hash160s: Vec<String>,
+}
+
+/// 校验过的 pow 任务。由 `ClaimedChunk::pow_task` 构造——畸形任务返回 `None`
+/// （调用方按无 pow 语义走并弃窗，绝不 `fatal()`：hub 侧 bug 不该杀掉整机队）。
+#[derive(Debug, Clone)]
+pub(crate) struct PowTask {
+    pub task_id: u64,
+    pub x: [u8; 32],
+    pub y: [u8; 32],
+    pub proof_hash160s: Vec<[u8; 20]>,
+}
+
+impl ClaimedChunk {
+    /// 校验并解析本项的 pow 任务；`None` = 无任务或任务畸形。
+    ///
+    /// 校验链：`proof_count >= 1` 且与 `proof_hash160s.len()` 相符 → 每个 hash160
+    /// 可解析 → `x < y` → **`x_hex`/`y_hex` == `current_hex`/`end_hex`**（hub 由同一
+    /// 对 scan_start/scan_end 生成，不符即协议错位，宁可不挂任务）。
+    pub(crate) fn pow_task(&self) -> Option<PowTask> {
+        let raw = self.task.as_ref()?;
+        if raw.proof_count == 0 || raw.proof_hash160s.len() != raw.proof_count {
+            term_line(&format!(
+                "[pow] chunk {} 任务畸形：proof_count={} 与 proof_hash160s.len()={} 不符——按无 pow 处理",
+                self.id,
+                raw.proof_count,
+                raw.proof_hash160s.len()
+            ));
+            return None;
+        }
+        if raw.proof_hash160s.len() + 1 > 78 {
+            term_line(&format!(
+                "[pow] chunk {} 任务畸形：proof_count={} 超过候选缓冲 78 槽——按无 pow 处理",
+                self.id,
+                raw.proof_hash160s.len()
+            ));
+            return None;
+        }
+        let mut proof_hash160s = Vec::with_capacity(raw.proof_hash160s.len());
+        for h in &raw.proof_hash160s {
+            match hash160_from_hex(h) {
+                Some(v) => proof_hash160s.push(v),
+                None => {
+                    term_line(&format!(
+                        "[pow] chunk {} 任务畸形：proof hash160 {h:?} 非 40-hex——按无 pow 处理",
+                        self.id
+                    ));
+                    return None;
+                }
+            }
+        }
+        let x = parse_hex_key(&raw.x_hex);
+        let y = parse_hex_key(&raw.y_hex);
+        if x != parse_hex_key(&self.current_hex) || y != parse_hex_key(&self.end_hex) {
+            term_line(&format!(
+                "[pow] chunk {} 任务畸形：任务窗 [{}, {}) 与该 grant 项的 [{}, {}) 不符——按无 pow 处理",
+                self.id, raw.x_hex, raw.y_hex, self.current_hex, self.end_hex
+            ));
+            return None;
+        }
+        if !crate::gpu::convert::be_lt(&x, &y) {
+            term_line(&format!(
+                "[pow] chunk {} 任务畸形：窗口退化 x >= y——按无 pow 处理",
+                self.id
+            ));
+            return None;
+        }
+        Some(PowTask {
+            task_id: raw.task_id,
+            x,
+            y,
+            proof_hash160s,
+        })
+    }
 }
 
 /// True when the hub says the lease is gone: 404 (no lease on that chunk) or
@@ -406,6 +499,164 @@ impl HubClient {
             .post(&self.url(&format!("/api/chunks/{chunk_id}/release")))
             .send_json(sealed)?;
         Ok(())
+    }
+
+    /// `POST /api/pow` —— pow 窗口的收敛点（取代该窗口上的 done）。hub 校验全窗
+    /// digest 后按任务窗口终态化 chunk 并记 verified 工作量。
+    ///
+    /// 经 `sealed_body` → auth 轨自动包 v2 信封（与 claim/heartbeat/done 同款）。
+    /// 用 `self.agent`（非 auth_agent）以便非 2xx 保持 `Err(StatusCode)`——
+    /// `is_lease_lost` 照常把 404（task 没了）/ 409（task 非 active / 非本人 /
+    /// lease 已丢）判成"放弃重领"；400 = digest 不符（task 仍 active，可重扫重试，
+    /// 但真实 hash160 比对不可能对错，故调用方按客户端/hub bug 处理）。
+    /// 400 的 `{detail}` 在响应信封里，这里只能拿到状态码——日志记状态码即可。
+    fn pow(
+        &self,
+        worker_id: &str,
+        task_id: u64,
+        chunk_id: u32,
+        hashed_proof_key: &str,
+    ) -> Result<PowResp, ureq::Error> {
+        let body = self.sealed_body(&json!({
+            "worker_id": worker_id,
+            "task_id": task_id,
+            "chunk_id": chunk_id,
+            "hashed_proof_key": hashed_proof_key,
+        }));
+        let resp = self
+            .agent
+            .post(&self.url("/api/pow"))
+            .send_json(body)?;
+        Ok(resp.into_body().read_json::<PowResp>().unwrap_or_default())
+    }
+}
+
+/// `POST /api/pow` 的 200 响应体：`{ok, task_id, chunk_id, keys_scanned, solved}`。
+/// 全字段 `#[serde(default)]`——只有 `keys_scanned`/`solved` 会被用到，旧/新 hub
+/// 增删字段都不该让收敛失败。`ok`/`task_id`/`chunk_id` 是线上协议形状的一部分
+/// （单测读它们做解析回归），生产代码不据此分支。
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+struct PowResp {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    task_id: u64,
+    #[serde(default)]
+    chunk_id: u32,
+    #[serde(default)]
+    keys_scanned: u64,
+    #[serde(default)]
+    solved: bool,
+}
+
+/// `HashedProofKey = SHA256(升序 32B-BE concat)` 小写 hex —— 镜像 hub
+/// `backend/app/powproof.py::expected_digest_for`。
+///
+/// **升序是关键**：proof key 由扫描命中顺序决定（正扫/反扫、命中先后都不同），
+/// digest 必须与顺序无关，故先按无符号整数升序排好再 concat。⚠️ 姊妹实现
+/// `vanity_worker_bpi.py::compute_proof_hash` 是**按池端数组顺序拼 64-hex ASCII**
+/// ——那是另一套契约，照抄必然 400（`scripts/test_pow.py` 的 `[1,2,3]` 向量是护栏）。
+pub(crate) fn hashed_proof_key(keys: &[[u8; 32]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&[u8; 32]> = keys.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        if crate::gpu::convert::be_lt(a, b) {
+            std::cmp::Ordering::Less
+        } else if crate::gpu::convert::be_lt(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let mut h = Sha256::new();
+    for k in sorted {
+        h.update(k);
+    }
+    hex::encode(h.finalize())
+}
+
+/// pow 窗口的**唯一收敛点**（CPU / GPU 报告链共用，避免两条路径漂移）。
+///
+/// `found` 是扫描期间攒下的 proof 命中（`ProofHit{index, key}`）。先按 proof 下标
+/// 归位（同一下标重复命中只算一次），集齐 N 个即算全窗 digest 提交 `/api/pow`：
+///
+/// - 提交成功 → 打印 verified 工作量；`resp.solved`（puzzle 已被别人解出）⇒ 返回
+///   `false`（调用方停机），否则 `true`（继续 claim）。
+/// - 404/409（`is_lease_lost`：task 不存在 / 非 active / 非本人 / lease 已丢）⇒
+///   `true`——任务已作废，直接重领。
+/// - 400（digest 不符）或其它传输错 ⇒ 大声警告 + `release` 弃窗 + `true`。400 在
+///   真实 hash160 比对下不可能出现（除非 hub 下发的 proof 集与扫描口径不符），
+///   所以按客户端/hub bug 处理：弃窗重扫 > 抱着一个永远不会收敛的窗口。
+/// - **未集齐**（扫描被中断，或 hub 的 proof 集在本地根本不可能命中）⇒ 限流警告 +
+///   `release` 弃窗 + `true`：无法收敛，立刻还回 pending 胜过等 hub reclaim 超时。
+fn converge_pow(
+    client: &HubClient,
+    worker_id: &str,
+    chunk_id: u32,
+    task: &PowTask,
+    found: &[ProofHit],
+    backend: &str,
+) -> bool {
+    let need = task.proof_hash160s.len();
+    // 按 proof 下标归位：proof 是**集合**语义（digest 升序后与命中顺序无关），
+    // 同一下标重复命中不重复计数。
+    let mut slots: Vec<Option<[u8; 32]>> = vec![None; need];
+    for hit in found {
+        if let Some(slot) = slots.get_mut(hit.index) {
+            if slot.is_none() {
+                *slot = Some(hit.key);
+            }
+        }
+    }
+    let collected = slots.iter().filter(|s| s.is_some()).count();
+
+    if collected < need {
+        term_line(&format!(
+            "[pow] {backend} w={worker_id} chunk={chunk_id} 只集齐 {collected}/{need} 个 \
+             proof key —— 弃窗（release，无部分 credit）"
+        ));
+        if let Err(e) = client.release(chunk_id, worker_id, None, None) {
+            if !is_lease_lost(&e) {
+                term_line(&format!("[pow] release failed ({e}) — hub will reclaim the chunk"));
+            }
+        }
+        return true;
+    }
+
+    let keys: Vec<[u8; 32]> = slots.into_iter().flatten().collect();
+    let hashed = hashed_proof_key(&keys);
+    match client.pow(worker_id, task.task_id, chunk_id, &hashed) {
+        Ok(resp) => {
+            term_line(&format!(
+                "[pow] {backend} w={worker_id} chunk={chunk_id} task={} 收敛 ✅ verified {} keys",
+                task.task_id,
+                fmt_comma(resp.keys_scanned),
+            ));
+            !resp.solved
+        }
+        Err(e) if is_lease_lost(&e) => {
+            term_line(&format!(
+                "[pow] {backend} chunk={chunk_id} task={} 提交被拒（{e}）—— 任务已作废，重新 claim",
+                task.task_id
+            ));
+            true
+        }
+        Err(e) => {
+            term_line(&format!(
+                "[pow] {backend} chunk={chunk_id} task={} digest 提交失败（{e}）—— \
+                 客户端/hub 口径不符？弃窗重扫",
+                task.task_id
+            ));
+            if let Err(e2) = client.release(chunk_id, worker_id, None, None) {
+                if !is_lease_lost(&e2) {
+                    term_line(&format!(
+                        "[pow] release failed ({e2}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+            true
+        }
     }
 }
 
@@ -994,6 +1245,45 @@ fn remote_worker(
         let start_bytes = parse_hex_key(&chunk.current_hex);
         let end_bytes = parse_hex_key(&chunk.end_hex);
 
+        // ── pow 任务（Phase 2）────────────────────────────────────────────
+        // hub 在 `[pow] enabled=true` 且本 client 已登记（auth 轨）时随 grant
+        // 项下发。缺省 `None` ⇒ 下面的每条分支都退回今日的老路（旧 hub / 匿名
+        // 昵称轨 / 窗口过窄都不带 `task`），行为逐字节一致（回归锚点）。
+        let task = chunk.pow_task();
+        let proofs: Vec<[u8; 20]> = task
+            .as_ref()
+            .map(|t| t.proof_hash160s.clone())
+            .unwrap_or_default();
+        // proof 命中走独立 sink——**绝不**进 `matches`/`hit_flag`/`stop_flag`
+        // （那是"找到私钥"的通道，proof 只是"扫过这个位置"的凭据）。
+        let mut found_proofs: Vec<ProofHit> = Vec::new();
+        // pow 窗口**禁止 rotate**：中途 park = 弃整窗（hub 无部分 credit、task
+        // cancelled），收敛只能靠扫完整窗后 `POST /api/pow`。声明给 hub 的
+        // capability 仍是 `rotate_keys`（窗口宽度本就按它派发），只是本租约内
+        // 不许提前交还。
+        let eff_rotate = if task.is_some() { None } else { rotate_keys };
+        match (&task, rotate_keys) {
+            // capability = 0 → hub 按 `reclaim.client_capability` 默认（2^41）派窗：
+            // CPU ~500 kkeys/s 下是上千小时的租约，中断即弃整窗（R2 陷阱）。
+            (Some(_), None) => term_line(
+                "[pow] 警告：task 窗口已挂载但 rotate 预算为 0（声明 capability=0）——\
+                 hub 会按默认 2^41 派窗，本租约必须一口气扫完，中断即弃整窗。\
+                 建议给 pow 会话开一个 rotate 预算。",
+            ),
+            // 声明了 capability 仍可能拿到更宽的窗（hub 侧配置/边界情形）——
+            // 冻结窗口下无法 park，只能一口气扫完，值得先出声。
+            (Some(t), Some(cap)) => {
+                let limit = crate::gpu::convert::scalar_add_be(&t.x, cap);
+                if crate::gpu::convert::be_lt(&limit, &t.y) {
+                    term_line(&format!(
+                        "[pow] 警告：task 窗口比声明的 capability（{cap}）宽——冻结窗口不可 \
+                         park，本租约必须一口气扫完（否则弃整窗）"
+                    ));
+                }
+            }
+            (None, _) => {}
+        }
+
         // 随机扫描方向（每次 claim 掷一次硬币），与本地模式一致：两个方向覆盖
         // 相同的 key 集合 [start, end)，只改变遍历顺序。
         let reverse = puzzle::pick_random(&[true, false]).copied().unwrap_or(false);
@@ -1040,12 +1330,14 @@ fn remote_worker(
             end: end_bytes,
             dir,
             check,
-            rotate_keys,
+            rotate_keys: eff_rotate,
             progress,
             matches,
             stop_flag,
             hit_flag,
             abort_flag: Some(&abort_flag),
+            proofs: &proofs,
+            found_proofs: &mut found_proofs,
             start_elapsed: start,
             on_position: &mut |pos: &ResumePosition| {
                 if lease_lost || last_hb.elapsed() < HEARTBEAT_INTERVAL {
@@ -1127,11 +1419,37 @@ fn remote_worker(
                 }
             }
         } else if outcome.done {
-            // Whole range scanned — finished.
-            if let Err(e) = client.done(chunk_id, worker_id) {
+            match &task {
+                // pow 窗口扫完：**不调 done**（hub 对冻结窗口恒 409），收敛只能
+                // 走全窗 digest 提交；返回 false ⇒ 整个 worker 停机（puzzle 已
+                // solved），true ⇒ 继续 claim 下一块。
+                Some(t) => {
+                    if !converge_pow(client, worker_id, chunk_id, t, &found_proofs, "cpu") {
+                        return;
+                    }
+                }
+                // Whole range scanned — finished.
+                None => {
+                    if let Err(e) = client.done(chunk_id, worker_id) {
+                        if !is_lease_lost(&e) {
+                            term_line(&format!(
+                                "[remote] done failed ({e}) — hub will reclaim the chunk"
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if task.is_some() {
+            // pow 窗口被提前中断（SIGINT / stop_flag，rotate 已禁用故不会是预算）：
+            // 冻结窗口下 hub 忽略 park 进度、整窗回 pending（无部分 credit），
+            // 所以主动 release 弃窗、立刻还回去，胜过等 hub reclaim 超时。
+            term_line(&format!(
+                "[pow] w={wid} chunk={chunk_id} 扫描中断——弃整窗（无部分 credit）"
+            ));
+            if let Err(e) = client.release(chunk_id, worker_id, None, None) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
-                        "[remote] done failed ({e}) — hub will reclaim the chunk"
+                        "[pow] release failed ({e}) — hub will reclaim the chunk"
                     ));
                 }
             }
@@ -1370,11 +1688,55 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         let start_bytes = parse_hex_key(&chunk.current_hex);
         let end_bytes = parse_hex_key(&chunk.end_hex);
 
+        // ── pow 任务（Phase 2）：与 CPU 路径同款装配 ────────────────────────
+        let task = chunk.pow_task();
+        let proofs: Vec<[u8; 20]> = task
+            .as_ref()
+            .map(|t| t.proof_hash160s.clone())
+            .unwrap_or_default();
+        let mut found_proofs: Vec<ProofHit> = Vec::new();
+        let eff_rotate = if task.is_some() { None } else { rotate_keys };
+
         term_line(&format!(
             "[claim] w={backend_label} chunk={chunk_id} range={}..{}",
             abbr_hex(&start_bytes),
             abbr_hex(&end_bytes),
         ));
+
+        // ── per-chunk candidate table + check switches ─────────────────────
+        // 槽 0 = target，槽 1..=N = proof hash160。**proofs 非空时强制开压缩
+        // 比对**：proof 定义在压缩公钥上，压缩哈希不算出来就永远比不到 proof；
+        // 真实 target 的 `[btc]` 语义由下面的 CPU 重验块按原开关把关（那里用的
+        // 是配置里的 `check`，不是这里上传给内核的强制值）。
+        let candidates = crate::gpu::convert::chunk_candidates(&target_h160, &proofs);
+        let cc = if proofs.is_empty() {
+            check.compressed as u32
+        } else {
+            1
+        };
+        if let Err(e) = scanner.configure_chunk(
+            &candidates,
+            1 + proofs.len() as u32,
+            cc,
+            check.uncompressed as u32,
+        ) {
+            term_line(&format!(
+                "[remote] {backend_label} configure_chunk failed ({e}) — releasing chunk"
+            ));
+            if let Err(e) = client.release(
+                chunk_id,
+                worker_id,
+                Some(hex_encode_key(&start_bytes)),
+                None,
+            ) {
+                if !is_lease_lost(&e) {
+                    term_line(&format!(
+                        "[remote] release failed ({e}) — hub will reclaim the chunk"
+                    ));
+                }
+            }
+            continue;
+        }
 
         // ── seed the 100k strided walkers at start + i ─────────────────────
         if scanner.seed_range(start_bytes).is_err() {
@@ -1515,6 +1877,19 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                                     ev.elapsed = start.elapsed().as_secs_f64();
                                     g.push(ev.clone());
                                     out.push(ev);
+                                } else if let Some(idx) =
+                                    crate::puzzle::classify_proof(&h, &proofs)
+                                {
+                                    // pow proof 命中：**不是命中**——不进
+                                    // matches、不设 hit_flag/stop_flag，只记
+                                    // proof 下标 + 裸 key（收敛时算全窗 digest）。
+                                    // 按重算的压缩 hash160 归类、不信任 GPU 的
+                                    // candidate_index（候选槽索引根本没回传）——
+                                    // 与上面"target 命中也要 CPU 重验"同一条原则。
+                                    found_proofs.push(ProofHit {
+                                        index: idx,
+                                        key: ev.private_key,
+                                    });
                                 }
                             }
                             out
@@ -1563,7 +1938,8 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
             // worker's.  Releasing also keeps the hub's resume position fresher
             // than the 30s heartbeat would on its own.  `None` (= config 0)
             // disables rotation: the chunk is scanned to completion.
-            if let Some(rot) = rotate_keys {
+            // pow 窗口上 `eff_rotate` 恒为 `None`（中途 park = 弃整窗）——见上。
+            if let Some(rot) = eff_rotate {
                 if scanned_keys >= rot {
                     break;
                 }
@@ -1600,12 +1976,41 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         // budget boundary lands here via this path.
         let done = !crate::gpu::convert::be_lt(&current, &end_bytes);
         if done {
-            // Whole range scanned — finished.
-            if let Err(e) = client.done(chunk_id, worker_id) {
+            match &task {
+                // pow 窗口扫完：不调 done（冻结窗口恒 409），收敛只能 /api/pow。
+                Some(t) => {
+                    if !converge_pow(
+                        client,
+                        worker_id,
+                        chunk_id,
+                        t,
+                        &found_proofs,
+                        backend_label,
+                    ) {
+                        return;
+                    }
+                }
+                // Whole range scanned — finished.
+                None => {
+                    if let Err(e) = client.done(chunk_id, worker_id) {
+                        if !is_lease_lost(&e) {
+                            term_line(&format!(
+                                "[remote] done failed ({e}) — hub will reclaim the chunk"
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if task.is_some() {
+            // pow 窗口被提前中断（SIGINT / stop_flag / GPU step 失败）：冻结
+            // 窗口下 hub 忽略 park 进度、整窗回 pending（无部分 credit），主动
+            // release 弃窗胜过等 hub reclaim 超时。
+            term_line(&format!(
+                "[pow] w={backend_label} chunk={chunk_id} 扫描中断——弃整窗（无部分 credit）"
+            ));
+            if let Err(e) = client.release(chunk_id, worker_id, None, None) {
                 if !is_lease_lost(&e) {
-                    term_line(&format!(
-                        "[remote] done failed ({e}) — hub will reclaim the chunk"
-                    ));
+                    term_line(&format!("[pow] release failed ({e}) — hub will reclaim the chunk"));
                 }
             }
         } else {
@@ -1628,5 +2033,196 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         if stop_flag.load(Ordering::Relaxed) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn be(n: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&n.to_be_bytes());
+        out
+    }
+
+    fn h160(seed: u8) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[19] = seed;
+        out
+    }
+
+    fn h160_hex(seed: u8) -> String {
+        hex::encode(h160(seed))
+    }
+
+    // ── digest 契约（镜像 hub `powproof.expected_digest_for`）───────────────
+
+    #[test]
+    fn pow_digest_vector_matches_hub() {
+        // 向量由 hub 侧实测（backend/app/powproof.expected_digest_for([1,2,3])）：
+        // SHA256(升序 32B-BE concat)。⚠️ 姊妹实现 vanity_worker_bpi.py 的
+        // compute_proof_hash 是按池端数组顺序拼 64-hex ASCII——照抄必然 400，
+        // 这个向量就是那道护栏。
+        assert_eq!(
+            hashed_proof_key(&[be(1), be(2), be(3)]),
+            "9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b64783e"
+        );
+    }
+
+    #[test]
+    fn pow_digest_is_order_independent() {
+        // proof key 的收集顺序由扫描方向与命中先后决定（正扫/反扫不同），
+        // digest 必须与顺序无关 → 先升序再 concat。
+        let v = hashed_proof_key(&[be(1), be(2), be(3)]);
+        assert_eq!(v, hashed_proof_key(&[be(3), be(1), be(2)]));
+        assert_eq!(v, hashed_proof_key(&[be(2), be(3), be(1)]));
+        assert_eq!(v, hashed_proof_key(&[be(3), be(2), be(1)]));
+    }
+
+    #[test]
+    fn pow_digest_is_sensitive_to_key_set() {
+        assert_ne!(
+            hashed_proof_key(&[be(1), be(2), be(3)]),
+            hashed_proof_key(&[be(1), be(2), be(4)])
+        );
+    }
+
+    #[test]
+    fn pow_digest_orders_by_unsigned_value_not_bytes_reversed() {
+        // 升序是**无符号整数**序（大端字节序即字典序）——0x100 应排在 0x0FF 之后。
+        assert_eq!(
+            hashed_proof_key(&[be(0x100), be(0x0FF)]),
+            hashed_proof_key(&[be(0x0FF), be(0x100)])
+        );
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&be(0x0FF));
+        concat.extend_from_slice(&be(0x100));
+        use sha2::{Digest, Sha256};
+        assert_eq!(hashed_proof_key(&[be(0x100), be(0x0FF)]), hex::encode(Sha256::digest(&concat)));
+    }
+
+    // ── claim 响应反序列化 ─────────────────────────────────────────────────
+
+    /// 一个 grant 项的 JSON（`task` 可选）——`x_hex`/`y_hex` 恒等于
+    /// `current_hex`/`end_hex`，与 hub `puzzle.py` 同源生成一致。
+    fn claim_json(task: Option<String>) -> String {
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(1000));
+        let task = task.map(|t| format!(r#","task":{t}"#)).unwrap_or_default();
+        format!(
+            r#"{{"granted":1,"solved":false,"chunks":[{{"id":7,"current_hex":"{x}","end_hex":"{y}"{task}}}]}}"#
+        )
+    }
+
+    fn task_json(x: &str, y: &str, count: usize, hashes: &[String]) -> String {
+        let hashes: Vec<String> = hashes.iter().map(|h| format!("\"{h}\"")).collect();
+        format!(
+            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":{count},"proof_hash160s":[{}]}}"#,
+            hashes.join(",")
+        )
+    }
+
+    #[test]
+    fn claim_without_task_parses_as_none() {
+        // 回归锚点：旧 hub / 匿名昵称轨 / 窗口过窄（powproof 返回 None）都不带
+        // `task` 键 → None → 报告链全部走老路，行为与今日逐字节一致。
+        let resp: ClaimResponse = serde_json::from_str(&claim_json(None)).unwrap();
+        assert_eq!(resp.granted, 1);
+        assert!(!resp.solved);
+        assert!(resp.chunks[0].pow_task().is_none());
+    }
+
+    #[test]
+    fn claim_with_well_formed_task_parses() {
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(1000));
+        let json = claim_json(Some(task_json(
+            &x,
+            &y,
+            2,
+            &[h160_hex(0xAA), h160_hex(0xBB)],
+        )));
+        let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
+        let t = resp.chunks[0].pow_task().expect("well-formed task");
+        assert_eq!(t.task_id, 42);
+        assert_eq!(t.x, be(10));
+        assert_eq!(t.y, be(1000));
+        assert_eq!(t.proof_hash160s, vec![h160(0xAA), h160(0xBB)]);
+    }
+
+    #[test]
+    fn malformed_tasks_fall_back_to_none() {
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(1000));
+        let cases = [
+            // proof_count 与数组长度不符
+            (
+                "count mismatch",
+                task_json(&x, &y, 3, &[h160_hex(1)]),
+            ),
+            // proof_count = 0（不得硬编码 6，但 0 个 proof 无意义）
+            ("zero proofs", task_json(&x, &y, 0, &[])),
+            // 非 40-hex
+            ("bad hex", task_json(&x, &y, 1, &["zz".to_string()])),
+            // 长度不足 40-hex
+            ("short hex", task_json(&x, &y, 1, &["ab".repeat(19)])),
+            // 任务窗与 grant 项的 current/end 不符（协议错位）
+            (
+                "window mismatch",
+                task_json(&hex_encode_key(&be(11)), &y, 1, &[h160_hex(1)]),
+            ),
+        ];
+        for (label, task) in cases {
+            let json = claim_json(Some(task));
+            let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
+            assert!(
+                resp.chunks[0].pow_task().is_none(),
+                "应拒绝畸形任务（{label}）"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_task_window_is_rejected() {
+        // x == y：与 grant 项一致但窗口退化 → 无 proof 可放，按无 pow 处理。
+        let same = hex_encode_key(&be(1000));
+        let task = task_json(&same, &same, 1, &[h160_hex(1)]);
+        let json = format!(
+            r#"{{"granted":1,"chunks":[{{"id":7,"current_hex":"{same}","end_hex":"{same}","task":{task}}}]}}"#
+        );
+        let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
+        assert!(resp.chunks[0].pow_task().is_none());
+    }
+
+    #[test]
+    fn task_exceeding_candidate_buffer_is_rejected() {
+        // 1 + N ≤ 78：超过候选缓冲的 proof 数不可能被 GPU 比较 → 拒绝。
+        let x = hex_encode_key(&be(10));
+        let y = hex_encode_key(&be(100000));
+        let hashes: Vec<String> = (0..78u32).map(|i| h160_hex(i as u8)).collect();
+        let resp: ClaimResponse =
+            serde_json::from_str(&claim_json(Some(task_json(&x, &y, 78, &hashes)))).unwrap();
+        assert!(resp.chunks[0].pow_task().is_none());
+    }
+
+    // ── PowResp ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pow_resp_parses_and_defaults() {
+        let r: PowResp = serde_json::from_str(
+            r#"{"ok":true,"task_id":42,"chunk_id":7,"keys_scanned":990,"solved":false}"#,
+        )
+        .unwrap();
+        assert!(r.ok);
+        assert_eq!(r.task_id, 42);
+        assert_eq!(r.chunk_id, 7);
+        assert_eq!(r.keys_scanned, 990);
+        assert!(!r.solved);
+
+        // 旧/新 hub 增删字段都不该让收敛失败（全字段 serde default）。
+        let r: PowResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(r.keys_scanned, 0);
+        assert!(!r.solved);
     }
 }

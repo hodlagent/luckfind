@@ -47,9 +47,13 @@ impl GpuBuffers {
             num_threads as u64,
         )?;
 
+        // COPY_DST so the candidate table can be re-uploaded per chunk (a pow
+        // window needs target + its proof hash160s in slots 0..=N).  Without it
+        // the table is upload-once at construction — fine for the lottery/puzzle
+        // single target, not for per-chunk pow windows.
         let candidates_buf = ctx.create_buffer_init(
             "candidates",
-            wgpu::BufferUsages::STORAGE,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             candidates,
         );
 

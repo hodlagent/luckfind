@@ -1134,6 +1134,21 @@ pub(crate) struct ScanChunkOptions<'a> {
     /// dirty flag; remote: throttled heartbeat).  Never called on the per-key
     /// hot path.
     pub on_position: &'a mut dyn FnMut(&ResumePosition),
+    /// Phase 2 工作量证明：本次 claim 要一并比对的 proof hash160（压缩公钥口径）。
+    /// **空切片 = 无 pow**，扫描行为与今日逐字节一致（本地模式、匿名轨、旧 hub 都传空）。
+    /// 命中某个 proof 时**不停机**——记进 `found_proofs` 后照常推进（proof 不是命中）。
+    pub proofs: &'a [[u8; 20]],
+    /// proof 命中的收集槽。**刻意与 `matches` 分开**：proof 命中不是 win，绝不进
+    /// `MatchEvent`，绝不设 `hit_flag`/`stop_flag`，也就绝不流向 `report.rs`/`got.txt`。
+    pub found_proofs: &'a mut Vec<ProofHit>,
+}
+
+/// 本次 claim 扫到的一个 proof key。`index` 指向 claim 的 `proof_hash160s` 下标，
+/// `key` 是该 proof 的 32B 大端私钥（全窗 digest 需要的东西）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProofHit {
+    pub index: usize,
+    pub key: [u8; 32],
 }
 
 /// Result of scanning a claimed sub-range.
@@ -1173,9 +1188,14 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         abort_flag,
         start_elapsed,
         on_position,
+        proofs,
+        found_proofs,
     } = opts;
 
     let reverse = dir == ScanDir::Reverse;
+    // 循环不变量：有无 pow proof 要比对。无 pow 时下面所有 proof 分支都被短路掉，
+    // 热路径与今日逐字节一致。
+    let has_proofs = !proofs.is_empty();
 
     let secp = secp256k1::Secp256k1::new();
     // Scalar(1) so `sk += 1` per iteration.  Also kept to preserve the SK ↔ PK
@@ -1241,9 +1261,17 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         // — a disabled form is skipped entirely (it can never match the target).
         let mut hit = false;
         let mut pk_c: [u8; 33] = [0; 33];
-        if check.compressed {
+        // pow proof 恒按**压缩公钥** hash160 判定（hub `powproof.compressed_pubkey`），
+        // 与 `[btc]` 开关无关 → 有 proof 时即使压缩比对关着也要算压缩序列化。
+        // 哈希只算一次：target 与 proof 共用同一个 `h_c`（无 proof 时等同原
+        // `h160_eq(&pk_c, target_h160)`，逐字节不变）。
+        let mut h_c: [u8; 20] = [0; 20];
+        if check.compressed || has_proofs {
             pk_c = pk.serialize();
-            hit = h160_eq(&pk_c, target_h160);
+            h_c = btc::hash160(&pk_c);
+            if check.compressed {
+                hit = h_c == target_h160;
+            }
         }
         if !hit && check.uncompressed && h160_eq(&pk.serialize_uncompressed(), target_h160) {
             hit = true;
@@ -1293,6 +1321,19 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
                 invalid_start: false,
                 sk: sk.secret_bytes(),
             };
+        }
+
+        // ── pow proof 命中：记下来，**接着扫**（proof 不是命中）─────────────
+        // 刻意不设 stop_flag/hit_flag、不进 matches、不返回 matched——proof 只是
+        // "确实扫过这个位置"的证据，机队必须继续。sentinel 把最左/最右 proof 钉在
+        // x+1 / y−1，单趟正扫或反扫都必然经过全部 proof，不会漏。
+        if has_proofs {
+            if let Some(idx) = classify_proof(&h_c, proofs) {
+                found_proofs.push(ProofHit {
+                    index: idx,
+                    key: sk.secret_bytes(),
+                });
+            }
         }
 
         // ── mutate state ───────────────────────────────────────────────
@@ -1458,6 +1499,8 @@ fn puzzle_worker(
         // The hot path (pubkey derive → hash160 → point-add advance) lives in
         // `scan_chunk`; the 2048-cadence resume-position refresh is routed back
         // into this worker's in-memory chunk + dirty flag, exactly as before.
+        // 本地模式永无 pow 任务（没有 hub 下发 task）→ 空 proof 集 + 丢弃命中槽。
+        let mut local_proof_sink: Vec<ProofHit> = Vec::new();
         let outcome = scan_chunk(ScanChunkOptions {
             target_h160,
             puzzle_number,
@@ -1475,6 +1518,8 @@ fn puzzle_worker(
             // Local mode has no lease to lose — scan always runs to completion
             // or rotation budget; nothing to abort early.
             abort_flag: None,
+            proofs: &[],
+            found_proofs: &mut local_proof_sink,
             start_elapsed: start,
             on_position: &mut |pos: &ResumePosition| {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1651,12 +1696,35 @@ pub(crate) fn gpu_match_to_event(
 /// because the remote worker (`crate::remote`) runs the same dense-tiling loop
 /// against hub chunks.
 pub(crate) trait PuzzleScannerBackend {
+    /// 每个 chunk 的候选表装配（槽 0 = target，槽 1..=N = pow proof hash160）+
+    /// 两个压缩/非压缩比对开关。无 pow 任务时等价于构造时的单候选配置。
+    /// **必须在 `seed_range` 之前调用**——内核按运行时的 `num_candidates` 循环
+    /// 候选槽，候选数据随 dispatch 生效。
+    fn configure_chunk(
+        &mut self,
+        candidates: &[[u32; 5]],
+        num_candidates: u32,
+        check_compressed_pk: u32,
+        check_uncompressed_pk: u32,
+    ) -> anyhow::Result<()>;
     fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()>;
     fn step(&mut self) -> anyhow::Result<Vec<crate::gpu::GpuMatchOutput>>;
     fn steps_per_call(&mut self) -> &mut u32;
 }
 
 impl PuzzleScannerBackend for crate::gpu::GpuScanner {
+    fn configure_chunk(
+        &mut self,
+        candidates: &[[u32; 5]],
+        num_candidates: u32,
+        check_compressed_pk: u32,
+        check_uncompressed_pk: u32,
+    ) -> anyhow::Result<()> {
+        self.set_candidates(candidates, num_candidates);
+        self.check_compressed_pk = check_compressed_pk;
+        self.check_uncompressed_pk = check_uncompressed_pk;
+        Ok(())
+    }
     fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()> {
         crate::gpu::GpuScanner::seed_range(self, start_be)
     }
@@ -1670,6 +1738,18 @@ impl PuzzleScannerBackend for crate::gpu::GpuScanner {
 
 #[cfg(feature = "cuda")]
 impl PuzzleScannerBackend for crate::cuda::CudaScanner {
+    fn configure_chunk(
+        &mut self,
+        candidates: &[[u32; 5]],
+        num_candidates: u32,
+        check_compressed_pk: u32,
+        check_uncompressed_pk: u32,
+    ) -> anyhow::Result<()> {
+        self.set_candidates(candidates, num_candidates)?;
+        self.check_compressed_pk = check_compressed_pk;
+        self.check_uncompressed_pk = check_uncompressed_pk;
+        Ok(())
+    }
     fn seed_range(&mut self, start_be: [u8; 32]) -> anyhow::Result<()> {
         crate::cuda::CudaScanner::seed_range(self, start_be)
     }
@@ -2295,6 +2375,17 @@ fn h160_eq(pubkey: &[u8], target: [u8; 20]) -> bool {
     btc::hash160(pubkey) == target
 }
 
+/// 命中窗口内某个 pow proof 时返回它在 `proofs` 里的下标（hub Phase 2）。
+///
+/// 传入的必须是**压缩公钥**的 hash160——hub 的 proof 定义在压缩公钥上
+/// （`powproof.compressed_pubkey`），与被比较的 target 是否受 `[btc]` 开关约束无关。
+/// 调用方只在 `!proofs.is_empty()` 时调用（空集是常见情形，调用点已提前短路）。
+/// proof 个数 ≤ 78 且恒为个位数，线性 memcmp 远比每 key 一次哈希便宜。
+#[inline]
+pub(crate) fn classify_proof(h_c: &[u8; 20], proofs: &[[u8; 20]]) -> Option<usize> {
+    proofs.iter().position(|p| p == h_c)
+}
+
 /// Persist the worklist chunk metadata (status + current_hex) to disk.
 /// Used at claim boundaries (claim/split/rotation/finalize) — the only points
 /// where the worklist is written, so a Ctrl+C or hard-kill cannot lose more
@@ -2819,5 +2910,207 @@ mod tests {
         // (n-1)·G == -G: must serialize identically to PublicKey::negate(G).
         let expected = crate::btc::generator_public_key().negate(&secp);
         assert_eq!(neg_g.serialize(), expected.serialize());
+    }
+
+    // ── pow proof：归类 + "proof 命中不是命中"契约 ──────────────────────────
+
+    fn be32(n: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&n.to_be_bytes());
+        out
+    }
+
+    /// 小整数私钥的**压缩公钥** hash160——与 hub `powproof.hash160(compressed_pubkey)`
+    /// 同一口径（proof 定义在压缩公钥上，与被比较的 target 无关）。
+    fn proof_h160(key: u64) -> [u8; 20] {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_byte_array(be32(key)).unwrap();
+        let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        btc::hash160(&pk.serialize())
+    }
+
+    /// 不可能命中的 target（不像任何真实地址，保证被测扫描不会误判 target 命中）。
+    fn impossible_target() -> [u8; 20] {
+        [0xFF; 20]
+    }
+
+    struct ScanProbe {
+        outcome: ScanOutcome,
+        /// (proof 下标, 裸 key 32B BE)，按命中先后。
+        proofs: Vec<(usize, [u8; 32])>,
+        stop_flag: bool,
+        hit_flag: bool,
+        matches: usize,
+    }
+
+    /// 在 [start, end) 上跑一次 `scan_chunk`（小窗口 → 一次扫完，done=true）。
+    fn probe_scan(
+        start: u64,
+        end: u64,
+        dir: ScanDir,
+        check: BtcCheck,
+        target: [u8; 20],
+        proofs: &[[u8; 20]],
+    ) -> ScanProbe {
+        let progress = Progress::new(1);
+        let matches: Mutex<Vec<MatchEvent>> = Mutex::new(Vec::new());
+        let stop_flag = AtomicBool::new(false);
+        let hit_flag = AtomicBool::new(false);
+        let mut found: Vec<ProofHit> = Vec::new();
+        let outcome = scan_chunk(ScanChunkOptions {
+            target_h160: target,
+            puzzle_number: Some(76),
+            worker_id: 0,
+            chunk_id: Some(7),
+            start: be32(start),
+            end: be32(end),
+            dir,
+            check,
+            rotate_keys: None,
+            progress: &progress,
+            matches: &matches,
+            stop_flag: &stop_flag,
+            hit_flag: &hit_flag,
+            abort_flag: None,
+            proofs,
+            found_proofs: &mut found,
+            start_elapsed: Instant::now(),
+            on_position: &mut |_pos: &ResumePosition| {},
+        });
+        // 先把锁里的计数取出来再构造返回值——MutexGuard 的临时值在块尾求值时
+        // 会活过 `matches` 本身（E0597）。
+        let match_count = matches.lock().unwrap().len();
+        ScanProbe {
+            outcome,
+            proofs: found.into_iter().map(|h| (h.index, h.key)).collect(),
+            stop_flag: stop_flag.load(Ordering::Relaxed),
+            hit_flag: hit_flag.load(Ordering::Relaxed),
+            matches: match_count,
+        }
+    }
+
+    fn both_forms() -> BtcCheck {
+        BtcCheck { compressed: true, uncompressed: true }
+    }
+
+    #[test]
+    fn test_classify_proof_hit_and_miss() {
+        let proofs = [proof_h160(3), proof_h160(17)];
+        assert_eq!(classify_proof(&proof_h160(17), &proofs), Some(1));
+        assert_eq!(classify_proof(&proof_h160(3), &proofs), Some(0));
+        assert_eq!(classify_proof(&proof_h160(4), &proofs), None);
+        assert_eq!(classify_proof(&proof_h160(3), &[]), None);
+    }
+
+    /// **核心契约**：proof 命中后必须**接着扫**——不停机、不进 matches、不返回
+    /// matched，只把 (下标, 裸 key) 记进独立 sink；整个窗口扫完仍然 done。
+    #[test]
+    fn test_proof_hit_continues_scanning() {
+        let p = probe_scan(1, 64, ScanDir::Forward, both_forms(), impossible_target(),
+                           &[proof_h160(17)]);
+        assert_eq!(p.proofs, vec![(0, be32(17))], "应记下 proof 17 的裸 key");
+        assert!(p.outcome.done, "窗口扫完仍是 done（不是 matched）");
+        assert!(!p.outcome.matched, "proof 不是命中");
+        assert!(!p.stop_flag, "proof 命中不得停机（标志全队共享）");
+        assert!(!p.hit_flag, "proof 命中不得占 hit_flag");
+        assert_eq!(p.matches, 0, "proof 绝不能进 matches/[HIT]/got.txt");
+    }
+
+    /// 反扫同样集齐——digest 的证明力必须与扫描方向无关（客户端每次 claim 掷
+    /// 硬币选方向）。窗口底取 2 而非 1：反扫到 key 1 后还要推进一次
+    /// `pk += (−G)` 才够预算步数，那一步落到无穷远点（sk = 0）会提前 park——
+    /// 见 `test_reverse_scan_of_window_starting_at_one_parks`。
+    #[test]
+    fn test_proof_hit_in_reverse_scan() {
+        let p = probe_scan(2, 64, ScanDir::Reverse, both_forms(), impossible_target(),
+                           &[proof_h160(17)]);
+        assert_eq!(p.proofs, vec![(0, be32(17))]);
+        assert!(p.outcome.done);
+        assert!(!p.outcome.matched);
+        assert!(!p.stop_flag);
+        assert!(!p.hit_flag);
+    }
+
+    /// 窗口底恰为 key 1 的反扫会报 parked（done=false）：key 1 之后推进到 sk=0
+    /// 是无穷远点，`pk.combine` 失败即 `break 'scan false`，比预算检查早一步。
+    /// 真实 keyspace（puzzle 区间从 2^n 起）不会出现，但值得钉住——若真出现，
+    /// pow 窗口会被当成"没扫完"而弃置（无部分 credit）。
+    #[test]
+    fn test_reverse_scan_of_window_starting_at_one_parks() {
+        let p = probe_scan(1, 64, ScanDir::Reverse, both_forms(), impossible_target(),
+                           &[proof_h160(17)]);
+        assert!(!p.outcome.done, "key=1 之后再推进一步落到无穷远点 → parked");
+        assert!(!p.outcome.matched);
+        assert_eq!(p.proofs, vec![(0, be32(17))], "parked 前仍已覆盖全窗");
+    }
+
+    /// 多个 proof 一次扫完全部集齐；命中顺序即扫描顺序，下标各自归位。
+    #[test]
+    fn test_multiple_proofs_collected() {
+        let proofs = [proof_h160(2), proof_h160(17), proof_h160(63)];
+        let p = probe_scan(2, 64, ScanDir::Forward, both_forms(), impossible_target(), &proofs);
+        assert_eq!(p.proofs, vec![(0, be32(2)), (1, be32(17)), (2, be32(63))]);
+        assert!(p.outcome.done);
+
+        // 反扫：同样的集合、相反的顺序（digest 与顺序无关，由 remote 的升序兜住）。
+        let rev = probe_scan(2, 64, ScanDir::Reverse, both_forms(), impossible_target(), &proofs);
+        let mut got = rev.proofs.clone();
+        got.sort_by_key(|(i, _)| *i);
+        assert_eq!(got, vec![(0, be32(2)), (1, be32(17)), (2, be32(63))]);
+        assert!(rev.outcome.done);
+    }
+
+    /// `[btc] check_compressed_pk = false` 时 proof 仍必须找得到：proof 定义在
+    /// 压缩公钥上，与 target 的用户可见语义无关（关掉压缩比对只是不算 target 的
+    /// 压缩哈希，不能连 proof 一起丢）。
+    #[test]
+    fn test_proof_found_with_compressed_check_disabled() {
+        let check = BtcCheck { compressed: false, uncompressed: true };
+        let p = probe_scan(1, 64, ScanDir::Forward, check, impossible_target(),
+                           &[proof_h160(17)]);
+        assert_eq!(p.proofs, vec![(0, be32(17))]);
+        assert!(!p.outcome.matched);
+    }
+
+    /// target 命中优先于 proof：同一个 key 既是赢家又是 proof 时走 matched
+    /// （hub 侧 win 会顺带 cancel 该窗口的任务）。
+    #[test]
+    fn test_target_hit_wins_over_proof() {
+        let p = probe_scan(1, 64, ScanDir::Forward, both_forms(), proof_h160(17),
+                           &[proof_h160(17)]);
+        assert!(p.outcome.matched, "target 命中即 matched");
+        assert!(p.outcome.done);
+        assert!(p.hit_flag, "真实命中必须占 hit_flag");
+        assert!(p.stop_flag, "真实命中必须停机");
+        assert_eq!(p.matches, 1, "真实命中进 matches（走 /api/win）");
+    }
+
+    /// 无 proof（`proofs: &[]`）＝今日行为：热路径零 proof 分支，target 命中照旧。
+    #[test]
+    fn test_scan_without_proofs_is_unchanged() {
+        let p = probe_scan(1, 64, ScanDir::Forward, both_forms(), proof_h160(17), &[]);
+        assert!(p.outcome.matched);
+        assert_eq!(p.matches, 1);
+        assert!(p.proofs.is_empty());
+
+        // 不命中 → done，无任何标志。
+        let p = probe_scan(1, 64, ScanDir::Forward, both_forms(), impossible_target(), &[]);
+        assert!(p.outcome.done);
+        assert!(!p.outcome.matched);
+        assert!(p.proofs.is_empty());
+        assert!(!p.stop_flag && !p.hit_flag && p.matches == 0);
+    }
+
+    /// 边界：proof 恰在窗口两端（hub 的 sentinel_ends 恒把最左/最右 proof 钉在
+    /// x+1 / y−1）——两端必须都被扫到，正反两个方向都是。
+    #[test]
+    fn test_proofs_at_window_edges() {
+        // 窗口 [2, 64)：sentinel 端点为 key 3 与 key 63。
+        let proofs = [proof_h160(3), proof_h160(63)];
+        for dir in [ScanDir::Forward, ScanDir::Reverse] {
+            let p = probe_scan(2, 64, dir, both_forms(), impossible_target(), &proofs);
+            assert_eq!(p.proofs.len(), 2, "两端 proof 都必须扫到（dir={dir:?}）");
+            assert!(p.outcome.done);
+        }
     }
 }

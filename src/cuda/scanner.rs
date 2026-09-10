@@ -357,6 +357,26 @@ impl CudaScanner {
         Ok(())
     }
 
+    /// 替换候选槽表（槽 0 = target，槽 1..=N = pow proof hash160；见
+    /// `gpu::convert::chunk_candidates`）。**每 chunk 一次**，在 `seed_range`
+    /// 之前调用；`upload_config` 在每次 `step()` 前把 `num_candidates` 推上设备。
+    pub fn set_candidates(&mut self, candidates: &[[u32; 5]], num_candidates: u32) -> Result<()> {
+        assert_eq!(
+            candidates.len(),
+            78,
+            "candidate table must be the full 78 slots"
+        );
+        assert!(
+            (1..=78).contains(&num_candidates),
+            "num_candidates must be within 1..=78"
+        );
+        self.device_candidates
+            .copy_from(candidates)
+            .context("Failed to copy candidates to device")?;
+        self.num_candidates = num_candidates;
+        Ok(())
+    }
+
     /// Upload config to device and keep the host-side copy for the launch.
     fn upload_config(&mut self) -> Result<()> {
         let config = GpuConfig {

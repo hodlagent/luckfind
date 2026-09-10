@@ -102,14 +102,43 @@ pub fn scalar_sub_be_u64(a: &[u8; 32], b: u64) -> [u8; 32] {
     out
 }
 
+/// Pack one 20-byte hash160 into a single candidate slot (LE u32 words),
+/// matching the format RIPEMD160 output takes in the shader.
+pub fn hash160_slot(h: &[u8; 20]) -> [u32; 5] {
+    let mut out = [0u32; 5];
+    for i in 0..5 {
+        out[i] = u32::from_le_bytes(h[4 * i..4 * i + 4].try_into().unwrap());
+    }
+    out
+}
+
 /// Pack a 20-byte hash160 into the GPU candidate buffer format.  The shader's
 /// candidate binding is a fixed 78-slot array, so we return a 78-element vec
 /// with slot 0 set to `h160` (LE u32 words) and the rest zero.  The caller sets
 /// `num_candidates = 1` so only slot 0 is checked.
 pub fn hash160_to_candidates(h160: &[u8; 20]) -> Vec<[u32; 5]> {
     let mut cand = vec![[0u32; 5]; 78];
-    for i in 0..5 {
-        cand[0][i] = u32::from_le_bytes(h160[4 * i..4 * i + 4].try_into().unwrap());
+    cand[0] = hash160_slot(h160);
+    cand
+}
+
+/// 一个 chunk 的候选表：**槽 0 = 真实 target，槽 1..=N = pow proof hash160**
+/// （Phase 2；`proofs` 为空时与 `hash160_to_candidates` 逐字节相同，调用方传
+/// `num_candidates = 1`）。
+///
+/// 内核无需改动：`num_candidates` 是运行时字段，WGSL `candidate_match()` 与 CUDA
+/// `kernel.cu` 都已按它循环候选槽——加宽 1→1+N 是**数据**变更。GPU 侧不做
+/// proof 归类（槽位索引不回传），命中一律由 CPU 侧重算 hash160 后比对（见
+/// `remote.rs` 的 GPU 报告链）：与"target 命中也要 CPU 重验"同一条原则。
+pub fn chunk_candidates(target: &[u8; 20], proofs: &[[u8; 20]]) -> Vec<[u32; 5]> {
+    assert!(
+        1 + proofs.len() <= 78,
+        "1 + proof_count must fit the 78-slot GPU candidate buffer"
+    );
+    let mut cand = vec![[0u32; 5]; 78];
+    cand[0] = hash160_slot(target);
+    for (i, p) in proofs.iter().enumerate() {
+        cand[i + 1] = hash160_slot(p);
     }
     cand
 }
@@ -317,5 +346,49 @@ mod tests {
         }
         // Degenerate: a == b → 0.
         assert_eq!(scalar_sub_be_u64(&be32(0xABC), 0xABC), [0u8; 32]);
+    }
+
+    // ── pow 候选表（槽 0 = target，槽 1..=N = proof hash160）─────────────────
+
+    /// 20 字节 hash160 槽是小端 u32 字；第 i 个 4 字节小端塞进 slot[i]。
+    fn h160(seed: u8) -> [u8; 20] {
+        let mut h = [0u8; 20];
+        h[19] = seed;
+        h[0] = seed;
+        h
+    }
+
+    #[test]
+    fn test_chunk_candidates_slot_layout() {
+        let target = h160(0xAA);
+        let proofs = [h160(1), h160(2), h160(3)];
+        let cand = chunk_candidates(&target, &proofs);
+
+        assert_eq!(cand.len(), 78, "候选表恒为 78 槽（内核定长绑定）");
+        assert_eq!(cand[0], hash160_slot(&target), "槽 0 = 真实 target");
+        for (i, p) in proofs.iter().enumerate() {
+            assert_eq!(cand[i + 1], hash160_slot(p), "槽 {} = 第 {i} 个 proof", i + 1);
+        }
+        // 未用到的槽必须清零——内核按 num_candidates 循环，残留数据会在
+        // 候选数被调大时变成幽灵目标。
+        for slot in &cand[1 + proofs.len()..] {
+            assert_eq!(*slot, [0u32; 5]);
+        }
+    }
+
+    #[test]
+    fn test_chunk_candidates_no_proofs_matches_single_target() {
+        // 无 pow 任务时与老路径逐字节一致（回归锚点）。
+        let target = h160(0x5A);
+        assert_eq!(chunk_candidates(&target, &[]), hash160_to_candidates(&target));
+    }
+
+    #[test]
+    fn test_chunk_candidates_slot_encoding_is_le_words() {
+        let mut target = [0u8; 20];
+        target[0] = 0x04; // 最低地址字节 → 槽的最低 u32 的最低字节
+        let cand = chunk_candidates(&target, &[]);
+        assert_eq!(cand[0][0] & 0xFF, 0x04);
+        assert_eq!(cand[0][1], 0);
     }
 }
