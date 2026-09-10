@@ -290,7 +290,7 @@ hub 开 `[pow]` 且本 client **已登记**（identity.json 在 → auth 轨）�
 ```json
 {"id": 12, "current_hex": "…", "end_hex": "…",
  "task": {"task_id": 7, "x_hex": "…", "y_hex": "…",
-          "proof_count": 6, "proof_hash160s": ["<40hex>", …]}}
+          "proof_hash160s": ["<40hex>", …]}}
 ```
 
 - `x_hex`/`y_hex` **恒等于**该 grant 项的 `current_hex`/`end_hex`（hub 由同一对
@@ -306,8 +306,11 @@ hub 开 `[pow]` 且本 client **已登记**（identity.json 在 → auth 轨）�
 - 解析 `x_hex`/`y_hex` 用 `parse_hex_key_checked`（全函数，畸形返回 `None`）而非
   `parse_hex_key`（对 >64 字符 assert、非 hex panic）——这里处理的正是不可信的
   hub 响应，"畸形即 `None`"的契约不能反过来打死进程。
-- `proof_count` **可配置**（hub `[pow] proof_count`，默认 6）——客户端按数据走，
-  绝不硬编码；`1 + proof_count ≤ 78`（GPU 候选缓冲槽位数）。
+- **任务里没有 count 字段**：proof 个数 = `proof_hash160s` 数组长度，客户端一律按
+  数组长度走（hub 侧个数是常量 `powproof.PROOF_COUNT` = 6，不是配置项——见
+  lan-hub `docs/remote-api.md` §21.1 末）。不硬编码 6，但也不读第二个字段：
+  没有第二个字段就是没有不一致的余地。`1 + proof_hash160s.len() ≤ 78`（GPU 候选
+  缓冲槽位数），越界按畸形任务处理。
 - **`expected_digest` 不随任务下发**（只在 hub 库里），所以 worker 只能真扫出
   proof 才提交得出正确 digest。裸 proof keys 同样不出 hub。
 

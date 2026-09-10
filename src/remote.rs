@@ -151,9 +151,9 @@ struct ChunkTaskRaw {
     /// 任务窗口底/顶，恒等于该项的 `current_hex`/`end_hex`（hub 同源生成）。
     x_hex: String,
     y_hex: String,
-    /// proof 个数（hub `[pow] proof_count`，默认 6——**不得硬编码**）。
-    proof_count: usize,
-    /// 每个 proof 的压缩公钥 hash160（40-hex）。
+    /// 每个 proof 的压缩公钥 hash160（40-hex）。**数组长度即 proof 个数**——hub
+    /// 任务里不带 count 字段（`powproof.PROOF_COUNT` 是 hub 侧常量 6，见
+    /// docs/remote-protocol.md §8.1），客户端一律按本数组长度走，两边天然一致。
     proof_hash160s: Vec<String>,
 }
 
@@ -170,9 +170,9 @@ pub(crate) struct PowTask {
 impl ClaimedChunk {
     /// 校验并解析本项的 pow 任务；`None` = 无任务或任务畸形。
     ///
-    /// 校验链：`proof_count >= 1` 且与 `proof_hash160s.len()` 相符 → 每个 hash160
-    /// 可解析 → `x < y` → **`x_hex`/`y_hex` == `current_hex`/`end_hex`**（hub 由同一
-    /// 对 scan_start/scan_end 生成，不符即协议错位，宁可不挂任务）。
+    /// 校验链：`proof_hash160s` 非空 → 每个 hash160 可解析 → `x < y` →
+    /// **`x_hex`/`y_hex` == `current_hex`/`end_hex`**（hub 由同一对 scan_start/
+    /// scan_end 生成，不符即协议错位，宁可不挂任务）。
     pub(crate) fn pow_task(&self) -> Option<PowTask> {
         let value = self.task.as_ref()?;
         // 形状校验在这一层做（`task` 是 `Value`）：hub 侧键名/类型漂移只让本块
@@ -187,18 +187,16 @@ impl ClaimedChunk {
                 return None;
             }
         };
-        if raw.proof_count == 0 || raw.proof_hash160s.len() != raw.proof_count {
+        if raw.proof_hash160s.is_empty() {
             term_line(&format!(
-                "[pow] chunk {} 任务畸形：proof_count={} 与 proof_hash160s.len()={} 不符——按无 pow 处理",
-                self.id,
-                raw.proof_count,
-                raw.proof_hash160s.len()
+                "[pow] chunk {} 任务畸形：proof_hash160s 为空——按无 pow 处理",
+                self.id
             ));
             return None;
         }
         if raw.proof_hash160s.len() + 1 > 78 {
             term_line(&format!(
-                "[pow] chunk {} 任务畸形：proof_count={} 超过候选缓冲 78 槽——按无 pow 处理",
+                "[pow] chunk {} 任务畸形：{} 个 proof 超出候选缓冲 78 槽——按无 pow 处理",
                 self.id,
                 raw.proof_hash160s.len()
             ));
@@ -2154,10 +2152,12 @@ mod tests {
         )
     }
 
-    fn task_json(x: &str, y: &str, count: usize, hashes: &[String]) -> String {
+    /// 一个 `task` 对象的 JSON。**不带 count 字段**——hub 侧就是不发这个键了，
+    /// proof 个数 = `proof_hash160s` 数组长度（客户端唯一依据）。
+    fn task_json(x: &str, y: &str, hashes: &[String]) -> String {
         let hashes: Vec<String> = hashes.iter().map(|h| format!("\"{h}\"")).collect();
         format!(
-            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":{count},"proof_hash160s":[{}]}}"#,
+            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_hash160s":[{}]}}"#,
             hashes.join(",")
         )
     }
@@ -2176,12 +2176,7 @@ mod tests {
     fn claim_with_well_formed_task_parses() {
         let x = hex_encode_key(&be(10));
         let y = hex_encode_key(&be(1000));
-        let json = claim_json(Some(task_json(
-            &x,
-            &y,
-            2,
-            &[h160_hex(0xAA), h160_hex(0xBB)],
-        )));
+        let json = claim_json(Some(task_json(&x, &y, &[h160_hex(0xAA), h160_hex(0xBB)])));
         let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
         let t = resp.chunks[0].pow_task().expect("well-formed task");
         assert_eq!(t.task_id, 42);
@@ -2195,31 +2190,26 @@ mod tests {
         let x = hex_encode_key(&be(10));
         let y = hex_encode_key(&be(1000));
         let cases = [
-            // proof_count 与数组长度不符
-            (
-                "count mismatch",
-                task_json(&x, &y, 3, &[h160_hex(1)]),
-            ),
-            // proof_count = 0（不得硬编码 6，但 0 个 proof 无意义）
-            ("zero proofs", task_json(&x, &y, 0, &[])),
+            // 空数组 = 0 个 proof：没有可验证的东西，按无 pow 处理
+            ("zero proofs", task_json(&x, &y, &[])),
             // 非 40-hex
-            ("bad hex", task_json(&x, &y, 1, &["zz".to_string()])),
+            ("bad hex", task_json(&x, &y, &["zz".to_string()])),
             // 长度不足 40-hex
-            ("short hex", task_json(&x, &y, 1, &["ab".repeat(19)])),
+            ("short hex", task_json(&x, &y, &["ab".repeat(19)])),
             // 任务窗与 grant 项的 current/end 不符（协议错位）
             (
                 "window mismatch",
-                task_json(&hex_encode_key(&be(11)), &y, 1, &[h160_hex(1)]),
+                task_json(&hex_encode_key(&be(11)), &y, &[h160_hex(1)]),
             ),
             // 任务窗 hex 非 hex / 超 64 位：**必须返回 None 而不是 panic**
             // （`parse_hex_key` 对这两种输入是 assert + panic）。
-            ("x not hex", task_json("zz", &y, 1, &[h160_hex(1)])),
+            ("x not hex", task_json("zz", &y, &[h160_hex(1)])),
             (
                 "x too long",
-                task_json(&"a".repeat(70), &y, 1, &[h160_hex(1)]),
+                task_json(&"a".repeat(70), &y, &[h160_hex(1)]),
             ),
-            ("y not hex", task_json(&x, "nothex!", 1, &[h160_hex(1)])),
-            ("x empty", task_json("", &y, 1, &[h160_hex(1)])),
+            ("y not hex", task_json(&x, "nothex!", &[h160_hex(1)])),
+            ("x empty", task_json("", &y, &[h160_hex(1)])),
         ];
         for (label, task) in cases {
             let json = claim_json(Some(task));
@@ -2246,28 +2236,31 @@ mod tests {
             // 键改名：x_hex → x
             (
                 "renamed key",
-                format!(
-                    r#"{{"task_id":42,"x":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{h}"]}}"#
-                ),
+                format!(r#"{{"task_id":42,"x":"{x}","y_hex":"{y}","proof_hash160s":["{h}"]}}"#),
             ),
             // 类型不符：proof_hash160s 是 null 而非数组
             (
                 "null array",
                 format!(
-                    r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":null}}"#
+                    r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_hash160s":null}}"#
                 ),
             ),
             // task_id 类型不符（字符串而非数字）
             (
                 "task_id as string",
                 format!(
-                    r#"{{"task_id":"42","x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{h}"]}}"#
+                    r#"{{"task_id":"42","x_hex":"{x}","y_hex":"{y}","proof_hash160s":["{h}"]}}"#
                 ),
             ),
-            // 缺 proof_count
+            // 缺 x_hex
             (
-                "missing proof_count",
-                format!(r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_hash160s":["{h}"]}}"#),
+                "missing x_hex",
+                format!(r#"{{"task_id":42,"y_hex":"{y}","proof_hash160s":["{h}"]}}"#),
+            ),
+            // 缺 proof_hash160s
+            (
+                "missing proof_hash160s",
+                format!(r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}"}}"#),
             ),
             // 根本不是对象
             ("not an object", format!("\"whatever\"")),
@@ -2291,7 +2284,7 @@ mod tests {
         let x = hex_encode_key(&be(10));
         let y = hex_encode_key(&be(1000));
         let task = format!(
-            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_count":1,"proof_hash160s":["{}"],"future_field":123}}"#,
+            r#"{{"task_id":42,"x_hex":"{x}","y_hex":"{y}","proof_hash160s":["{}"],"future_field":123}}"#,
             h160_hex(0xAA)
         );
         let resp: ClaimResponse = serde_json::from_str(&claim_json(Some(task))).unwrap();
@@ -2304,7 +2297,7 @@ mod tests {
     fn degenerate_task_window_is_rejected() {
         // x == y：与 grant 项一致但窗口退化 → 无 proof 可放，按无 pow 处理。
         let same = hex_encode_key(&be(1000));
-        let task = task_json(&same, &same, 1, &[h160_hex(1)]);
+        let task = task_json(&same, &same, &[h160_hex(1)]);
         let json = format!(
             r#"{{"granted":1,"chunks":[{{"id":7,"current_hex":"{same}","end_hex":"{same}","task":{task}}}]}}"#
         );
@@ -2319,8 +2312,17 @@ mod tests {
         let y = hex_encode_key(&be(100000));
         let hashes: Vec<String> = (0..78u32).map(|i| h160_hex(i as u8)).collect();
         let resp: ClaimResponse =
-            serde_json::from_str(&claim_json(Some(task_json(&x, &y, 78, &hashes)))).unwrap();
+            serde_json::from_str(&claim_json(Some(task_json(&x, &y, &hashes)))).unwrap();
         assert!(resp.chunks[0].pow_task().is_none());
+
+        // 77 个 proof（1 + 77 = 78）正好吃满缓冲 → 收下（窗口须与 grant 项一致）。
+        let hashes: Vec<String> = (0..77u32).map(|i| h160_hex(i as u8)).collect();
+        let json = format!(
+            r#"{{"granted":1,"chunks":[{{"id":7,"current_hex":"{x}","end_hex":"{y}","task":{}}}]}}"#,
+            task_json(&x, &y, &hashes)
+        );
+        let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp.chunks[0].pow_task().unwrap().proof_hash160s.len(), 77);
     }
 
     // ── PowResp ────────────────────────────────────────────────────────────

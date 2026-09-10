@@ -133,7 +133,7 @@ pub fn hash160_to_candidates(h160: &[u8; 20]) -> Vec<[u32; 5]> {
 pub fn chunk_candidates(target: &[u8; 20], proofs: &[[u8; 20]]) -> Vec<[u32; 5]> {
     assert!(
         1 + proofs.len() <= 78,
-        "1 + proof_count must fit the 78-slot GPU candidate buffer"
+        "1 + proofs.len() must fit the 78-slot GPU candidate buffer"
     );
     let mut cand = vec![[0u32; 5]; 78];
     cand[0] = hash160_slot(target);
