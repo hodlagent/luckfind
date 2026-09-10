@@ -1299,26 +1299,20 @@ fn remote_worker(
         // capability 仍是 `rotate_keys`（窗口宽度本就按它派发），只是本租约内
         // 不许提前交还。
         let eff_rotate = if task.is_some() { None } else { rotate_keys };
-        match (&task, rotate_keys) {
-            // capability = 0 → hub 按 `reclaim.client_capability` 默认（2^41）派窗：
-            // CPU ~500 kkeys/s 下是上千小时的租约，中断即弃整窗（R2 陷阱）。
-            (Some(_), None) => term_line(
+        // capability = 0 → hub 按 `reclaim.client_capability` 默认（2^41）派窗：
+        // CPU ~500 kkeys/s 下是上千小时的租约，中断即弃整窗（R2 陷阱）。
+        //
+        // 只警告操作者**能动手**的事。曾另有一臂警告"task 窗口比声明的 capability
+        // 宽"，已删：hub 交出的切片恒 ≤ 生效 capability（`puzzle.py` 把声明值夹到
+        // `min(capability, PREFER_MAX_WIDTH)`，且各分支都按它等宽切出），真不符也
+        // 只是 hub 侧回归，租约中途改不了 capability，出声于操作者无补；判据本身
+        // 还依赖 `scalar_add_be` 的静默回绕加法，x 近 2^256 时会假阳。
+        if task.is_some() && rotate_keys.is_none() {
+            term_line(
                 "[pow] 警告：task 窗口已挂载但 rotate 预算为 0（声明 capability=0）——\
                  hub 会按默认 2^41 派窗，本租约必须一口气扫完，中断即弃整窗。\
                  建议给 pow 会话开一个 rotate 预算。",
-            ),
-            // 声明了 capability 仍可能拿到更宽的窗（hub 侧配置/边界情形）——
-            // 冻结窗口下无法 park，只能一口气扫完，值得先出声。
-            (Some(t), Some(cap)) => {
-                let limit = crate::gpu::convert::scalar_add_be(&t.x, cap);
-                if crate::gpu::convert::be_lt(&limit, &t.y) {
-                    term_line(&format!(
-                        "[pow] 警告：task 窗口比声明的 capability（{cap}）宽——冻结窗口不可 \
-                         park，本租约必须一口气扫完（否则弃整窗）"
-                    ));
-                }
-            }
-            (None, _) => {}
+            );
         }
 
         // 随机扫描方向（每次 claim 掷一次硬币），与本地模式一致：两个方向覆盖
