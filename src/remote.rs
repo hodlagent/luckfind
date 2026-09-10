@@ -137,6 +137,14 @@ fn is_lease_lost(e: &ureq::Error) -> bool {
     matches!(e, ureq::Error::StatusCode(404 | 409))
 }
 
+/// 内部错误出口：本地身份 / hub 公钥不自洽、RNG 失败、对端响应信封解不开等。auth 已把
+/// 两把 key 校验过（合法曲线点 + TOFU 一致），真走到这里 = 不该裸跑明文继续扫的内部状态
+/// 或「对端不是当初 auth 的那个 hub」——带原因 exit 2（与 auth 门禁同级，绝不静默降级）。
+fn fatal(msg: impl std::fmt::Display) -> ! {
+    eprintln!("[remote] {msg}");
+    std::process::exit(2);
+}
+
 /// `/api/auth` 失败分类：
 /// - `Transport` — 网络层错误（超时/连接断），启动时可像 `connect()` 一样有界重试；
 /// - `Denied`    — hub 以 4xx 拒绝（whitelist/blacklist 命中 403、pubkey 非法 422…），
@@ -190,6 +198,12 @@ struct HubClient {
     /// （`is_lease_lost` 依赖 404/409）。
     auth_agent: ureq::Agent,
     base: String,
+    /// 已 auth 的本地身份（`identity.json` 存在、握手通过后才有）。None = 明文匿名昵称运行
+    /// （worker_id = 昵称，业务请求不加密，旧行为）。
+    identity: Option<clientauth::ClientIdentity>,
+    /// hub 的 Nostr 公钥（解开 auth ECIES 信封拿到、TOFU 校验一致后收下）。与 `identity`
+    /// 恒同 Some/None；Some 时业务请求体用它对端派生 pair-key 做 v2 密封、2xx 响应解封。
+    hub_pubkey: Option<String>,
 }
 
 impl HubClient {
@@ -209,6 +223,8 @@ impl HubClient {
             agent,
             auth_agent,
             base,
+            identity: None,
+            hub_pubkey: None,
         }
     }
 
@@ -257,6 +273,46 @@ impl HubClient {
         clientauth::decrypt_auth(identity, env).map_err(AuthErr::Envelope)
     }
 
+    /// 业务请求体密封（client-auth 后所有工作端点共用）：已 auth（`identity`+`hub_pubkey`
+    /// 在）→ 把内层明文 body 加密成 v2 信封并包外层 `{"pubkey": <己方>, "enc": …}`；明文
+    /// 匿名昵称轨 → 原样返回（旧行为）。hub 只对带 `enc` 的请求回加密响应，所以密封与否
+    /// 是这一个开关（wire 中间件按它判定）。
+    fn sealed_body(&self, plain: &impl serde::Serialize) -> serde_json::Value {
+        let Some(id) = &self.identity else {
+            return serde_json::to_value(plain)
+                .unwrap_or_else(|e| fatal(format!("序列化业务请求体失败：{e}")));
+        };
+        let hub_pub = self
+            .hub_pubkey
+            .as_deref()
+            .unwrap_or_else(|| fatal("auth 状态不自洽：有身份文件但缺 hub 公钥".to_string()));
+        let bytes = serde_json::to_vec(plain)
+            .unwrap_or_else(|e| fatal(format!("序列化业务请求体失败：{e}")));
+        let enc = clientauth::encrypt_to_peer(id, hub_pub, &bytes)
+            .unwrap_or_else(|e| fatal(format!("密封业务请求失败：{e}")));
+        json!({ "pubkey": id.pubkey, "enc": enc })
+    }
+
+    /// 2xx 业务响应解封为 JSON Value：auth 模式且 hub 把 body 加密成 `{"enc": v2}` →
+    /// 用本地私钥 + hub 公钥解回明文 JSON（**解不开 = 对端不是当初 auth 的那个 hub**，
+    /// TOFU 违背 → exit 2，绝不把进度/命中状态当明文裸读）；明文旧 hub / 匿名模式 → 原样。
+    fn unseal_response(&self, resp: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, ureq::Error> {
+        let body: serde_json::Value = resp.into_body().read_json()?;
+        Ok(match (&self.identity, &self.hub_pubkey) {
+            (Some(id), Some(hub_pub)) => match body.get("enc") {
+                // 信封在就必须解得开（hub 只会给已登记 client 回密文）
+                Some(enc) => {
+                    let plain = clientauth::decrypt_from_peer(id, hub_pub, enc)
+                        .unwrap_or_else(|e| fatal(format!("hub 业务响应信封解密失败：{e}")));
+                    serde_json::from_slice(&plain)
+                        .unwrap_or_else(|e| fatal(format!("响应解密后不是合法 JSON：{e}")))
+                }
+                None => body, // 明文旧 hub（无 wire 中间件）→ 直通
+            },
+            _ => body,
+        })
+    }
+
     /// Claim `count` pending chunks, declaring how many keys this worker scans
     /// before it reclaims (`capability`).  The hub uses the capability to prefer
     /// handing out chunks it won't have to split mid-scan; 0 = hub default 2^41.
@@ -266,19 +322,22 @@ impl HubClient {
         count: usize,
         capability: u64,
     ) -> Result<ClaimResponse, ureq::Error> {
+        let body = self.sealed_body(&json!({
+            "worker_id": worker_id,
+            "count": count,
+            "capability": capability
+        }));
         let resp = self
             .agent
             .post(&self.url("/api/chunks/claim"))
-            .send_json(json!({
-                "worker_id": worker_id,
-                "count": count,
-                "capability": capability
-            }))?;
-        resp.into_body().read_json()
+            .send_json(body)?;
+        let value = self.unseal_response(resp)?;
+        serde_json::from_value(value).map_err(ureq::Error::Json)
     }
 
     /// Heartbeat。Ok(true) 表示 hub 已 solved（别的 worker 命中）——调用方应尽快
-    /// 停止本 claim。响应体解析失败按未 solved 处理（旧 hub 只回 `{ok:true}`）。
+    /// 停止本 claim。信封解不开会 exit 2（见 `unseal_response`）；**明文**旧 hub 只回
+    /// `{ok:true}`，其响应体解析失败按未 solved 处理（旧行为，`read_json` 容忍路径）。
     fn heartbeat(
         &self,
         chunk_id: u32,
@@ -295,29 +354,35 @@ impl HubClient {
             keys,
             rate,
         };
+        let sealed = self.sealed_body(&body);
         let resp = self
             .agent
             .post(&self.url(&format!("/api/chunks/{chunk_id}/heartbeat")))
-            .send_json(body)?;
-        let parsed: HeartbeatResp = resp.into_body().read_json().unwrap_or_default();
+            .send_json(sealed)?;
+        // read_json 失败（明文旧 hub 的非对象体）只影响 solved 读取 → 按未 solved 处理；
+        // auth 模式的信封已在 unseal_response 内强制解封，不会走到这里的默认值。
+        let value = self.unseal_response(resp).unwrap_or(serde_json::Value::Null);
+        let parsed: HeartbeatResp = serde_json::from_value(value).unwrap_or_default();
         Ok(parsed.solved)
     }
 
     fn done(&self, chunk_id: u32, worker_id: &str) -> Result<(), ureq::Error> {
+        let body = self.sealed_body(&json!({ "worker_id": worker_id }));
         let _ = self
             .agent
             .post(&self.url(&format!("/api/chunks/{chunk_id}/done")))
-            .send_json(json!({ "worker_id": worker_id }))?;
+            .send_json(body)?;
         Ok(())
     }
 
     /// 命中上报（取代 done）：hub 落 win 记录 + 置 puzzle solved。409（已被别的
     /// worker 先标记 solved）按 lease 丢失处理即可——本 worker 放弃本 chunk。
     fn win(&self, chunk_id: u32, worker_id: &str) -> Result<(), ureq::Error> {
+        let body = self.sealed_body(&json!({ "worker_id": worker_id, "chunk_id": chunk_id }));
         let _ = self
             .agent
             .post(&self.url("/api/win"))
-            .send_json(json!({ "worker_id": worker_id, "chunk_id": chunk_id }))?;
+            .send_json(body)?;
         Ok(())
     }
 
@@ -335,10 +400,11 @@ impl HubClient {
             keys: None,
             rate: None,
         };
+        let sealed = self.sealed_body(&body);
         let _ = self
             .agent
             .post(&self.url(&format!("/api/chunks/{chunk_id}/release")))
-            .send_json(body)?;
+            .send_json(sealed)?;
         Ok(())
     }
 }
@@ -364,7 +430,7 @@ struct ChunkUpdateBody {
 
 pub fn run(
     remote_url: &str,
-    worker_id: String,
+    nickname: String,
     identity_path: &Path,
     n_workers: usize,
     heartbeat_secs: f64,
@@ -375,16 +441,25 @@ pub fn run(
     gpu_rotate_keys: Option<u64>,
     check: BtcCheck,
 ) -> (Arc<Progress>, Vec<MatchEvent>) {
-    let client = Arc::new(HubClient::new(remote_url));
+    let mut client = HubClient::new(remote_url);
 
     // ── 1. connect to the hub and read the puzzle meta ─────────────────────
     let (target_h160, puzzle_number, summary) = connect(&client);
 
-    // ── 1b. client-auth gate ──────────────────────────────────────────────
+    // ── 1b. client-auth gate（identity.json 在才走；缺 → 明文匿名昵称运行）────
     // claim 之前先声明身份：明文 POST 登记 + 解开 hub 的加密信封拿 hub_pubkey
-    // （`startup_auth`），并把 hub 公钥 TOFU 进 hub.json。验证不过直接 exit 2，
-    // 绝不静默降级为无身份扫描——auth 是远程模式的启动门禁。
-    startup_auth(&client, identity_path, &worker_id);
+    // （`maybe_authenticate`），并把 hub 公钥 TOFU 进 hub.json、身份收进 client——
+    // 此后 claim/heartbeat/done/win/release 的请求体自动 v2 密封、响应解封。验证不过
+    // 直接 exit 2；**文件在 = 期望 auth，绝不静默降级为明文扫描**；文件缺失才明文匿名
+    // 昵称运行（用户 2026-09 拍板：opt-in by omission）。
+    //
+    // worker_id 双语义（hub docs/remote-api.md §1）：auth 轨把 `nickname`（旧自由文本
+    // worker_id，--worker-id / 主机名）只作为 auth 的 `name` 上报供 hub UI 显示，干活端点
+    // （claim/heartbeat/done/win/release）的 worker_id 一律用本机身份 pubkey（auth 轨记账）；
+    // 无 identity.json 则 worker_id = 昵称，走匿名轨（零账本，旧行为不变）。
+    let worker_id: String = maybe_authenticate(&mut client, identity_path, &nickname)
+        .unwrap_or_else(|| nickname);
+    let client = Arc::new(client);
 
     if summary.pending + summary.running == 0 {
         println!("[remote] hub reports no pending or running chunks — nothing to do.");
@@ -687,14 +762,30 @@ fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
     (target_h160, Some(meta.puzzle_number), status.summary)
 }
 
-/// 启动 client-auth（`POST /api/auth`，docs/remote-protocol.md 时序 ①a）：加载本地
-/// `identity.json` 身份 → 明文登记 → 解开 hub 返回的加密信封拿 `hub_pubkey` → TOFU
-/// 写入 `hub.json`。打印 `[remote] auth ok · hub=<前缀…>`。
+/// 启动 client-auth（`POST /api/auth`，docs/remote-protocol.md 时序 ①a）——**只在
+/// `identity_path` 存在时走**：加载本地 `identity.json` 身份 → 明文登记（`name` = 昵称，
+/// 供 hub UI 显示）→ 解开 hub 返回的加密信封拿 `hub_pubkey` → 校验它是合法曲线点（业务
+/// v2 密封要对它做 ECDH）→ TOFU 写入 `hub.json` → 把 `identity` + `hub_pubkey` 收进
+/// client（此后 claim/heartbeat/… 请求体自动 v2 密封）。打印 `[remote] auth ok · hub=<前缀…>`。
 ///
-/// 失败节奏与 `connect()` 对齐：网络层错误有界重试（≤90s、2s 步进）后 exit 2；hub
-/// 拒绝（403 whitelist / 422 非法 pubkey 等，带 hub detail）、信封解密失败、身份文件
-/// 缺失/不自洽、hub 身份变化（TOFU mismatch）→ 一律带原因 exit 2。
-fn startup_auth(client: &HubClient, identity_path: &Path, name: &str) -> clientauth::AuthReply {
+/// **返回 `Some(己方 pubkey, 小写 64-hex)`**——run() 把它作为干活端点（claim/heartbeat/
+/// done/win/release）的 worker_id，hub 才据此把该 client 计入 auth 轨（worker_id 双语义，
+/// docs/remote-api.md §1）。
+///
+/// `identity_path` **缺失** → 明文匿名昵称运行（worker_id = 昵称，业务请求不加密，旧行为）：
+/// 打一行日志并返回 `None`，不 exit。文件**在**但损坏/不自洽、auth 被拒（403 whitelist /
+/// 422 非法 pubkey 等）、信封解密失败、hub 公钥非法、TOFU 身份变化 → 一律带原因 exit 2
+/// （放身份文件 = 期望 auth，绝不静默降级为明文扫描）。网络层错误同 `connect()` 有界重试
+/// （≤90s、2s 步进）后 exit 2。
+fn maybe_authenticate(
+    client: &mut HubClient,
+    identity_path: &Path,
+    name: &str,
+) -> Option<String> {
+    if !identity_path.exists() {
+        term_line("[remote] 未发现 identity.json — 明文匿名昵称运行（worker_id = 昵称）");
+        return None;
+    }
     let identity = clientauth::load_identity(identity_path).unwrap_or_else(|e| {
         eprintln!("[remote] {e}");
         std::process::exit(2);
@@ -726,6 +817,12 @@ fn startup_auth(client: &HubClient, identity_path: &Path, name: &str) -> clienta
             }
         }
     };
+    // hub 公钥必须是合法曲线点（业务 v2 密封对它做 ECDH 派生 pair-key）——派生一次作证明；
+    // 非法（被篡改/坏 hub）→ exit 2，不带着坏 key 开始加密扫描。
+    clientauth::static_key(&identity, &reply.hub_pubkey).unwrap_or_else(|e| {
+        eprintln!("[remote] hub 公钥非法，无法建立业务加密信道：{e}");
+        std::process::exit(2);
+    });
     term_line(&format!("[remote] auth ok · hub={}…", &reply.hub_pubkey[..16]));
 
     // TOFU：hub_pubkey 持久化，跨启动校验 hub 身份未变（变化 → remember_hub Err → exit 2）。
@@ -734,7 +831,12 @@ fn startup_auth(client: &HubClient, identity_path: &Path, name: &str) -> clienta
         eprintln!("[remote] {e}");
         std::process::exit(2);
     });
-    reply
+
+    // 身份 + hub 公钥收进 client：此后所有业务请求自动 v2 密封（sealed_body / unseal_response）。
+    let own_pubkey = identity.pubkey.clone();
+    client.identity = Some(identity);
+    client.hub_pubkey = Some(reply.hub_pubkey);
+    Some(own_pubkey)
 }
 
 /// Background status line: every `heartbeat_secs`, query the hub and rewrite

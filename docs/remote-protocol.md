@@ -51,10 +51,10 @@
 | `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
 | `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
 | `check_compressed_pk` / `check_uncompressed_pk` | 默认均 true | 决定 worker 把压缩（33B）/非压缩（65B）公钥的 hash160 与目标比较；被禁用的序列化在 CPU/GPU 热路径上不再计算。**不改变 hub 协议**——chunk 照常领取扫描，只是命中判定只看启用的序列化 | `[btc]` 配置段 → `BtcCheck`，贯穿 CPU `scan_chunk`/`worker_loop` 与 GPU shader/kernel |
-| `identity`（`[remote]` 段） | 缺省 `<cwd>/identity.json` | 启动 auth 的本地 Nostr 身份文件（`identify` / `nostr.py create` 产出的 5 字段 JSON，0600） | `src/clientauth.rs::load_identity`（自检 secret→pubkey 派生一致；缺文件/不自洽 → exit 2） |
+| `identity`（`[remote]` 段） | 缺省 `<cwd>/identity.json` | 本地 Nostr 身份文件（`identify` / `nostr.py create` 产出的 5 字段 JSON，0600）。**存在 = auth 轨开关**：启动 auth + 业务全走 v2 静态信道信封（§3）；**缺失 → 明文匿名昵称运行**（worker_id = 昵称，用户 2026-09 拍板）；**在但损坏/不自洽 → exit 2**（不静默降级） | `src/clientauth.rs::load_identity`（自检 secret→pubkey 派生一致） |
 | HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `HubClient::new` |
 | HTTP 单请求超时 | 15s | 同上 | `HubClient::new` |
-| auth 网络重连 | 每 2s 一次，上限 90s | `POST /api/auth` 传输层错误的有界重试（同 `connect()`） | `remote.rs::startup_auth` |
+| auth 网络重连 | 每 2s 一次，上限 90s | `POST /api/auth` 传输层错误的有界重试（同 `connect()`） | `remote.rs::maybe_authenticate` |
 | 启动重连 | 每 2s 一次，上限 90s | `connect()` 拿 /api/status | `remote.rs::connect` |
 | claim 失败日志节流 | 30s | hub 故障时每 30s 才打印一次 | `remote_worker` |
 
@@ -88,6 +88,24 @@
 | `/api/win` | POST | `{worker_id, chunk_id}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved |
 | `/api/chunks/{id}/release` | POST | `{worker_id, current_hex?, end_hex?}` | 旋转/放弃：保存进度、回退 pending、删 lease |
 
+**worker_id 双语义（hub docs/remote-api.md §1，2026-09）**：干活端点
+（claim/heartbeat/done/win/release）的 `worker_id` **若是该 client 已登记的 pubkey**，
+hub 把活跃/keys 回流进其 `clients` 行（auth 轨记账）；自由文本昵称 → 匿名昵称轨
+（不积累、绝不自动建行）。本实现已对齐：identity.json 在时 `maybe_authenticate` 返回
+己方 pubkey，run() 把它作为干活端点的 `worker_id`；`nickname`（--worker-id / 主机名）
+只作 auth 的 `name` 上报供 hub UI 显示，不再出现在干活端点。identity.json **缺失** →
+返回 None，干活端点 worker_id = 昵称（匿名昵称轨，全程明文）。
+
+**业务信封（auth 轨，2026-09 §1.1 收尾，hub docs/remote-api.md §20）**：auth 成功后
+`HubClient.identity`/`hub_pubkey` 置位 → 每个业务 POST 的 body 包成
+`{"pubkey": <己方>, "enc": {v:2, nonce, ciphertext}}` 发送（pair-key
+`K = SHA-256(x(ECDH(己方秘密, even-lift(hub 公钥))))`，AES-256-GCM，aad = 发送方 =
+己方 pubkey）；响应体若是 `{"enc": {...}}`（hub 加密回，aad = hub 公钥）→ 先解出明文
+再按原 typed struct 解析。明文旧 hub / 匿名轨不包不解。**非 2xx 语义不变**（404/409 照旧
+判 lease 丢）；信封在但解密失败 → fatal exit 2（对端不是当初 auth 的那台 hub = TOFU 违背）。
+实现：`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` +
+`remote.rs::sealed_body/unseal_response`。
+
 响应/错误约定：
 
 - **auth 成功**返回 `{ok, pubkey, auth, client}`，其中 `auth` 是 hub 用一次性 ECDH
@@ -120,19 +138,24 @@ worker                                   hub (lan-hub)
    └─ GET /api/status        ────────→   失败每 2s 重试，上限 90s（remote.rs::connect）
    ←──────────────────────────────────── 校验 hash160 一致（不匹配直接退出，exit 2）
 
-①a client-auth（claim 前的门禁，src/remote.rs::startup_auth）
-   └─ 读 identity.json（`[remote] identity` 覆盖，缺省 <cwd>/identity.json）
-      · 自检：由 secret_key 派生 pubkey 与文件一致；缺文件/不自洽 → exit 2
-   └─ POST /api/auth        ──────────→ {pubkey: <64hex>, name: worker_id, version: 1}
-      · 非 2xx：403（名单）/ 422（pubkey 非法）→ 打印 hub detail 后 exit 2
-      · 传输层错误每 2s 重试，上限 90s
-   ←──────────────────────────────────── {ok, pubkey, auth: {v, ephemeral_pubkey,
-                                          nonce, ciphertext}, client}
-   └─ 用本地私钥 + ephemeral_pubkey 解 AES-256-GCM 信封（ECIES v1，src/clientauth.rs）
-      · tag 校验失败（非发给这把私钥/被篡改）→ exit 2
-      · 解开 → 学到 hub_pubkey → 打印 `[remote] auth ok · hub=<前缀…>`
-   └─ 写 hub.json TOFU（与 identity.json 同目录，0600）
-      · 已存 hub_pubkey ≠ 新解出的 → exit 2（删 hub.json 以接受新 hub 身份）
+①a client-auth / 匿名门禁（claim 前的条件开关，src/remote.rs::maybe_authenticate）
+   ├─ 读 identity.json（`[remote] identity` 覆盖，缺省 <cwd>/identity.json）
+   │     **不存在** → 明文匿名昵称运行：worker_id = 昵称，跳过全部 auth，业务不加密
+   │     （打印 `[remote] 未发现 identity.json — 明文匿名昵称运行（worker_id = 昵称）`）
+   └─ 存在：自检由 secret_key 派生 pubkey 与文件一致（不自洽 → exit 2）
+      └─ POST /api/auth        ──────────→ {pubkey: <64hex>, name: <昵称>, version: 1}
+           · name = 昵称（旧自由文本 worker_id，--worker-id / 主机名），只供 hub UI 显示
+           · 此后**干活端点的 worker_id 一律用 <pubkey>**（worker_id 双语义，见上表下方注）
+         · 非 2xx：403（名单）/ 422（pubkey 非法）→ 打印 hub detail 后 exit 2
+         · 传输层错误每 2s 重试，上限 90s
+      ←──────────────────────────────────── {ok, pubkey, auth: {v, ephemeral_pubkey,
+                                             nonce, ciphertext}, client}
+      └─ 用本地私钥 + ephemeral_pubkey 解 AES-256-GCM 信封（ECIES v1，src/clientauth.rs）
+         · tag 校验失败（非发给这把私钥/被篡改）→ exit 2
+         · 解开 → 学到 hub_pubkey → 校验是合法曲线点 → 打印 `[remote] auth ok · hub=<前缀…>`
+         · hub_pubkey 存内存（client.hub_pubkey）→ 此后业务 POST 全走 v2 信封（见 §3）
+      └─ 写 hub.json TOFU（与 identity.json 同目录，0600）
+         · 已存 hub_pubkey ≠ 新解出的 → exit 2（删 hub.json 以接受新 hub 身份）
    └─ pending+running == 0  → 直接退出「nothing to do」
 
 ② 领取 chunk（每个线程 ≤1 个）
@@ -242,7 +265,8 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 |---|---|---|
 | 心跳常量 / 旋转预算（config 解析传入） | `remote.rs:43-50`；`main.rs` `resolve_rotate` | `config.py:67-71` |
 | HTTP 封装与超时 | `HubClient`（remote.rs） | `routes.py` |
-| 启动 client-auth + 解信封 + TOFU | `remote.rs::startup_auth`/`HubClient::auth`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
+| 启动 client-auth（条件门禁）+ 解信封 + TOFU | `remote.rs::maybe_authenticate`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
+| 业务 v2 静态信道信封（包/解） | `remote.rs::sealed_body`/`unseal_response`；`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` | `routes.py` 前 `transport.py`/`wire.py`（透明中间件） |
 | identity.json 自检 | `clientauth.rs::load_identity` | —（hub 侧由 `nostr.py` 生成） |
 | hub.json TOFU（hub 身份跨启动校验） | `clientauth.rs::remember_hub` | — |
 | 启动 connect + hash160 校验 | `remote.rs::connect` | `routes.py` |

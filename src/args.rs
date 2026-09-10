@@ -112,11 +112,13 @@ pub struct Cli {
     #[arg(long)]
     pub gpu_rotate_keys: Option<u64>,
 
-    /// Worker identity reported to the hub (grouped by worker_id in the hub's
-    /// /api/status).  Defaults to the host name (nice dashboard labels), else
-    /// "luckfind-<pid>".  The host name is NOT unique across processes on the
-    /// same machine — pass distinct --worker-id when running more than one
-    /// luckfind against the same hub on one host.
+    /// Nickname for this worker, reported to the hub as auth `name` (shown in
+    /// /api/status rows / dashboard).  Defaults to the host name (nice labels),
+    /// else "luckfind-<pid>".  Remote-mode work endpoints (claim/heartbeat/
+    /// done/win) identify by the local identity pubkey (identity.json), so this
+    /// is cosmetic only: several processes sharing one identity file are ONE hub
+    /// client regardless of --worker-id.  Keep separate clients on one host by
+    /// giving each its own identity file ([remote] identity) instead.
     #[arg(long)]
     pub worker_id: Option<String>,
 
@@ -138,11 +140,11 @@ impl Cli {
             .unwrap_or_else(|| std::cmp::max(1, num_cpus::get()))
     }
 
-    /// Resolve the worker identity for remote mode: explicit `--worker-id`
+    /// Resolve the worker nickname for remote mode: explicit `--worker-id`
     /// wins, then the host name (HOSTNAME / COMPUTERNAME), else "luckfind-<pid>".
-    /// The host name is only unique per machine, not per process — two
-    /// processes on one host must pass distinct `--worker-id` to avoid being
-    /// merged in the hub dashboard.
+    /// The nickname feeds auth `name` for display only; hub accounting groups
+    /// by the identity pubkey, so processes sharing an identity.json are one
+    /// client no matter what --worker-id says.
     pub fn worker_id(&self) -> String {
         if let Some(id) = &self.worker_id {
             return id.clone();

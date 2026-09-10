@@ -2,7 +2,7 @@
 //! 拿 hub 的 Nostr 公钥（TOFU），视为验证通过。
 //!
 //! 背景（lan-hub `backend/app/envelope.py`，2026-09 定版）：client 首次 auth 时还
-//! 不知道 hub 的公钥（它正要从中取得），静态静态 `ECDH(hub_sec, client_pub)` 会死锁，
+//! 不知道 hub 的公钥（它正要从中取得），静态 `ECDH(hub_sec, client_pub)` 会死锁，
 //! 所以 hub 用 **一次性 ECDH 密钥**（ECIES）把 `{hub_pubkey, server_time}` 加密到
 //! 本 client 的 pubkey 上，明文 POST 只做登记。本模块用本地私钥 + 信封里携带的
 //! `ephemeral_pubkey` 解密——解得开 = 声明的 pubkey 与本地私钥匹配（未被人冒充/篡改）；
@@ -21,6 +21,13 @@
 //! 信封 JSON（/api/auth 响应 `auth` 键）：
 //!     { "v": 1, "ephemeral_pubkey": "<64hex>", "nonce": "<24hex>", "ciphertext": "<hex>" }
 //! 被加密的 plaintext 为 UTF-8 JSON：{"hub_pubkey": "<64hex>", "server_time": "…UTC…"}。
+//!
+//! **v2 静态信道（业务加解密，client ↔ hub 双向）**：auth 握手后 hub 公钥已知，双方
+//! 各持对方静态公钥，共享 pair-key `K = SHA-256(x(ECDH(本地私钥, even-lift(对端
+//! x-only))))`（同 v1 的取点路径，只是对端是一把静态公钥而非一次性 eph）。信封
+//! `{ "v": 2, "nonce": "<24hex>", "ciphertext": "<hex>" }`；aad 绑定**发送方**：
+//! client→hub 请求用 client 自身 pubkey（`encrypt_to_peer`），hub→client 响应用 hub
+//! pubkey（`decrypt_from_peer` 的对端即发送方）。细节见 envelope.py / docs/remote-api.md。
 
 use std::fs;
 use std::io::Write;
@@ -28,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use rand::TryRng;
 use secp256k1::ecdh::shared_secret_point;
 use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
@@ -36,6 +44,12 @@ use sha2::{Digest, Sha256};
 
 /// 与 envelope.py `ENVELOPE_VERSION` 对齐的信封版本。
 const ENVELOPE_VERSION: u64 = 1;
+
+/// 与 envelope.py `STATIC_ENVELOPE_VERSION` 对齐的 v2 静态信道版本。
+const STATIC_ENVELOPE_VERSION: u64 = 2;
+
+/// AES-GCM nonce 长度（v1/v2 一致）。
+const NONCE_BYTES: usize = 12;
 
 /// 本地 Nostr 身份（identity.json 的 pubkey / secret_key，均 64-hex 小写 x-only）。
 pub struct ClientIdentity {
@@ -180,14 +194,13 @@ pub fn decrypt_auth(id: &ClientIdentity, env: &Value) -> Result<AuthReply, Strin
         return Err("ciphertext 长度非法（应含 16B GCM tag）".to_string());
     }
 
-    // shared = client_sec × even-lift(eph_pub) 的裸 x 坐标（32B）。
+    // shared = client_sec × even-lift(eph_pub) 的裸 x 坐标（32B）→ pair-key
+    // （对端是一次性 eph 公钥，其余与 v2 静态信道同一条 pair_key 路径）。
     let eph_xonly = XOnlyPublicKey::from_byte_array(arr32(eph_x, "ephemeral_pubkey")?)
         .map_err(|e| format!("ephemeral_pubkey 不是合法曲线点：{e}"))?;
-    let eph_pk = PublicKey::from_x_only_public_key(eph_xonly, Parity::Even);
     let secret = SecretKey::from_byte_array(arr32(secret_bytes, "secret_key")?)
         .map_err(|e| format!("secret_key 不是合法标量：{e}"))?;
-    let xy = shared_secret_point(&eph_pk, &secret);
-    let key = Sha256::digest(&xy[..32]);
+    let key = pair_key(&secret, &eph_xonly);
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let plain = cipher
@@ -205,9 +218,116 @@ pub fn decrypt_auth(id: &ClientIdentity, env: &Value) -> Result<AuthReply, Strin
     let payload: Value = serde_json::from_slice(&plain)
         .map_err(|e| format!("解密后不是合法 JSON：{e}"))?;
     Ok(AuthReply {
-        hub_pubkey: str_field(&payload, "hub_pubkey")?,
+        // 统一小写（对齐另两端：hub 恒发小写、vanity 显式 .lower()）——TOFU 的
+        // hub.json 字符串比较是大小写敏感的，收口成小写避免将来 hub 侧大小写漂移误报。
+        hub_pubkey: str_field(&payload, "hub_pubkey")?.to_ascii_lowercase(),
         server_time: str_field(&payload, "server_time")?,
     })
+}
+
+// ── 2b. v2 静态信道（业务请求/响应加解密；见模块 docstring）──────────────────
+
+/// 一对密钥的 pair-key = SHA-256( x(ECDH(local_secret, even-lift(peer x-only))) )。
+/// v1 auth 解密与 v2 静态信道共用（对端分别是一次性 eph / 静态对端公钥）。镜像
+/// envelope.py `static_key`：x-only 都做 even 升点再取 ECDH 裸 x 前 32B。
+fn pair_key(secret: &SecretKey, peer_xonly: &XOnlyPublicKey) -> [u8; 32] {
+    let peer_pk = PublicKey::from_x_only_public_key(*peer_xonly, Parity::Even);
+    let xy = shared_secret_point(&peer_pk, secret);
+    Sha256::digest(&xy[..32]).into()
+}
+
+fn secret_from_hex(secret_hex: &str) -> Result<SecretKey, String> {
+    let bytes = hex_bytes(secret_hex, "secret_key", Some(32))?;
+    SecretKey::from_byte_array(arr32(bytes, "secret_key")?)
+        .map_err(|e| format!("secret_key 不是合法标量：{e}"))
+}
+
+fn xonly_from_hex(pub_hex: &str, what: &str) -> Result<XOnlyPublicKey, String> {
+    let bytes = hex_bytes(pub_hex, what, Some(32))?;
+    XOnlyPublicKey::from_byte_array(arr32(bytes, what)?)
+        .map_err(|e| format!("{what} 不是合法曲线点：{e}"))
+}
+
+/// 本地身份 + 对端静态公钥这对的共享 pair-key（[u8;32]，镜像 envelope.py `static_key`）。
+/// 本 client 调 (id, hub_pub) 即可派生出与 hub 相同的那把 K。
+pub fn static_key(id: &ClientIdentity, peer_pub_hex: &str) -> Result<[u8; 32], String> {
+    let secret = secret_from_hex(&id.secret)?;
+    let peer = xonly_from_hex(peer_pub_hex, "peer_pub")?;
+    Ok(pair_key(&secret, &peer))
+}
+
+/// v2 信封加密（固定 nonce——测试注入用；运行时由 encrypt_to_peer 生成随机 nonce）。
+/// aad = 发送方 = 本 client 自身 pubkey（envelope.py `encrypt_static` aad_pub_hex）。
+fn encrypt_with_nonce(
+    id: &ClientIdentity,
+    peer_pub_hex: &str,
+    plaintext: &[u8],
+    nonce: [u8; NONCE_BYTES],
+) -> Result<Value, String> {
+    let key = static_key(id, peer_pub_hex)?;
+    let own_pub = hex_bytes(&id.pubkey, "pubkey", Some(32))?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &own_pub,
+            },
+        )
+        .map_err(|_| "AES-256-GCM 加密失败".to_string())?;
+    Ok(serde_json::json!({
+        "v": STATIC_ENVELOPE_VERSION,
+        "nonce": hex::encode(nonce),
+        "ciphertext": hex::encode(ct),
+    }))
+}
+
+/// client→hub 业务请求加密：把内层明文 JSON bytes 包成 v2 信封（aad = client pubkey），
+/// remote.rs 再放到外层 `{"pubkey": …, "enc": env}`。nonce 每次随机。
+pub fn encrypt_to_peer(
+    id: &ClientIdentity,
+    peer_pub_hex: &str,
+    plaintext: &[u8],
+) -> Result<Value, String> {
+    let mut nonce = [0u8; NONCE_BYTES];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|e| format!("生成 nonce 随机数失败：{e}"))?;
+    encrypt_with_nonce(id, peer_pub_hex, plaintext, nonce)
+}
+
+/// 解开对端（hub）发来的 v2 信封，返回明文 bytes。aad = 发送方 = 对端 pubkey
+/// （envelope.py `decrypt_static` aad_pub_hex）。v≠2 / tag 校验失败 → Err。
+pub fn decrypt_from_peer(
+    id: &ClientIdentity,
+    peer_pub_hex: &str,
+    env: &Value,
+) -> Result<Vec<u8>, String> {
+    if env.get("v").and_then(Value::as_u64).unwrap_or(0) != STATIC_ENVELOPE_VERSION {
+        let v = env.get("v");
+        return Err(format!("不支持的信封版本 {v:?}（应为 {STATIC_ENVELOPE_VERSION}）"));
+    }
+    let nonce = hex_bytes(&str_field(env, "nonce")?, "nonce", Some(NONCE_BYTES))?;
+    let ct = hex_bytes(&str_field(env, "ciphertext")?, "ciphertext", None)?;
+    if ct.len() < 16 {
+        return Err("ciphertext 长度非法（应含 16B GCM tag）".to_string());
+    }
+    let key = static_key(id, peer_pub_hex)?;
+    let peer_pub = hex_bytes(peer_pub_hex, "peer_pub", Some(32))?; // aad = 发送方（对端）
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let plain = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &ct,
+                aad: &peer_pub,
+            },
+        )
+        .map_err(|_| {
+            "AES-GCM 解密失败：信封不是发给本机 / 对端密钥不符 / 被篡改".to_string()
+        })?;
+    Ok(plain)
 }
 
 // ── 3. TOFU hub.json ────────────────────────────────────────────────────────
@@ -301,5 +421,75 @@ mod tests {
         };
         let env: Value = serde_json::from_str(ENV).unwrap();
         assert!(decrypt_auth(&id, &env).is_err());
+    }
+
+    // ── v2 静态信道向量（与 backend/scripts/test_wire.py 同一组固定密钥/nonce）──
+    const V2_CLIENT_PUB: &str = "84bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0";
+    const V2_CLIENT_SECRET: &str =
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const V2_HUB_PUB: &str = "207bba70bc66309baa582a6ac120fd52d68026c51f6326f8ccedcbd2c1b7eb82";
+    const V2_HUB_SECRET: &str =
+        "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
+    const V2_NONCE: [u8; NONCE_BYTES] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    const V2_REQ_PLAIN: &str = r#"{"worker_id":"84bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0","current_hex":"0000000000000001"}"#;
+    const V2_REQ_CIPHER: &str = "0e89f99a89a1b2c96728c353804794531da7c1403e201177cf686d47fde1c85f4f87e001c8bb1dfc8ab991b79b2b894361b8d1d44b7bd6b051fcc3f30902880973b6cb3599207691fcc0d21f1f791bde58d1b1a81df19b74f5b77f36b48510b4f53870079134091d03ed2bdd094846cac812bf7c750e4c4ea14047adbf4a0078b8";
+    const V2_RESP_PLAIN: &str = r#"{"ok":true}"#;
+    const V2_RESP_CIPHER: &str = "0e89e19ed9f0a3c94d24daabe641db20610853acd4a509b0da3ce2";
+
+    fn v2_id() -> ClientIdentity {
+        ClientIdentity {
+            pubkey: V2_CLIENT_PUB.to_string(),
+            secret: V2_CLIENT_SECRET.to_string(),
+        }
+    }
+
+    #[test]
+    fn v2_encrypt_matches_python_request_vector() {
+        // client→hub 请求方向：Rust 加密（固定 nonce）应与 python encrypt_static 产出的
+        // ciphertext 逐字节一致（aad = client 自身 pubkey）。
+        let env = encrypt_with_nonce(&v2_id(), V2_HUB_PUB, V2_REQ_PLAIN.as_bytes(), V2_NONCE)
+            .expect("encrypt");
+        assert_eq!(env["v"].as_u64(), Some(STATIC_ENVELOPE_VERSION));
+        let nonce_hex = hex::encode(V2_NONCE);
+        assert_eq!(env["nonce"].as_str(), Some(nonce_hex.as_str()));
+        assert_eq!(env["ciphertext"].as_str(), Some(V2_REQ_CIPHER));
+    }
+
+    #[test]
+    fn v2_decrypts_python_response_vector() {
+        // hub→client 响应方向：Rust 解密 python encrypt_static(hub_secret,…) 的信封
+        // （aad = hub 自身 pubkey = 本 client 视角的对端）。
+        let env = serde_json::json!({
+            "v": STATIC_ENVELOPE_VERSION,
+            "nonce": hex::encode(V2_NONCE),
+            "ciphertext": V2_RESP_CIPHER,
+        });
+        let plain = decrypt_from_peer(&v2_id(), V2_HUB_PUB, &env).expect("decrypt");
+        assert_eq!(plain, V2_RESP_PLAIN.as_bytes());
+    }
+
+    #[test]
+    fn v2_static_pair_key_is_symmetric() {
+        // client 用 (client_sec, hub_pub)、hub 用 (hub_sec, client_pub) 应派生出同一把 K。
+        let k_client = static_key(&v2_id(), V2_HUB_PUB).unwrap();
+        let hub_id = ClientIdentity {
+            pubkey: V2_HUB_PUB.to_string(),
+            secret: V2_HUB_SECRET.to_string(),
+        };
+        let k_hub = static_key(&hub_id, V2_CLIENT_PUB).unwrap();
+        assert_eq!(k_client, k_hub);
+        // 方向性：aad 绑定发送方，所以「hub 加密 → client 解密」才是本机可自证的一对
+        // （client 只能解 hub 发来的响应；自己发的请求要 hub 那边解）。
+        let env = encrypt_to_peer(&hub_id, V2_CLIENT_PUB, V2_RESP_PLAIN.as_bytes())
+            .expect("hub encrypt");
+        let plain = decrypt_from_peer(&v2_id(), V2_HUB_PUB, &env).expect("client decrypt");
+        assert_eq!(plain, V2_RESP_PLAIN.as_bytes());
+        // 对端换钥（不是真 hub）→ 解不开。
+        let other_hub = ClientIdentity {
+            pubkey: "2b6e171dcdeb17ea0cef3f95b1e3f3f9e8b8bb8a8f2a1b0c1d2e3f4a5b6c7d8e9".to_string(),
+            secret: "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50".to_string(),
+        };
+        // 用错误 hub 公钥解密（pair-key 派生自错误对端）→ GCM tag 失败。
+        assert!(decrypt_from_peer(&v2_id(), &other_hub.pubkey, &env).is_err());
     }
 }
