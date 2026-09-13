@@ -59,6 +59,8 @@ pub struct Cli {
     ///   [gpu] enabled = true|false              (default true; GPU used only if a device is available)
     ///   [puzzle] database = "<path>"            (required when mode = "puzzle")
     ///   [remote] uri = "<url>"                  (required when mode = "remote")
+    ///   [remote] npub_sha256 = "<64hex>"        (hub identity pin; required when identity.json exists)
+    ///   [remote] identity = "<path>"            (default <cwd>/identity.json)
     #[arg(long)]
     pub config: Option<PathBuf>,
 

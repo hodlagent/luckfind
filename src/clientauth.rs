@@ -1,12 +1,19 @@
 //! client-auth：启动时用本地 Nostr 身份与 lan-hub 握手，解开 hub 的加密信封
-//! 拿 hub 的 Nostr 公钥（TOFU），视为验证通过。
+//! 拿 hub 的 Nostr 公钥，与配置里钉住的摘要比对，视为验证通过。
 //!
 //! 背景（lan-hub `backend/app/envelope.py`，2026-09 定版）：client 首次 auth 时还
 //! 不知道 hub 的公钥（它正要从中取得），静态 `ECDH(hub_sec, client_pub)` 会死锁，
 //! 所以 hub 用 **一次性 ECDH 密钥**（ECIES）把 `{hub_pubkey, server_time}` 加密到
 //! 本 client 的 pubkey 上，明文 POST 只做登记。本模块用本地私钥 + 信封里携带的
-//! `ephemeral_pubkey` 解密——解得开 = 声明的 pubkey 与本地私钥匹配（未被人冒充/篡改）；
-//! 解开后学到的 `hub_pubkey` 写入 `hub.json`（TOFU），跨启动校验 hub 身份未变。
+//! `ephemeral_pubkey` 解密——解得开 = 声明的 pubkey 与本地私钥匹配（未被人冒充/篡改）。
+//!
+//! **但这只证明「收件人能解开」，不证明「发送方持 hub 私钥」**——ECIES 的发送方用
+//! 一次性密钥，任何人都能对着本 client 的公钥封一个自称 hub 的信封。所以「首次接触
+//! 就学会 hub 公钥」（TOFU）不是信任根：LAN 中间人只要抢在真 hub 之前应答第一次握手，
+//! 就能把本机的私钥/命中交到它手上。这里改为**钉摘要**（[`verify_hub_pinned`]）：
+//! 配置 `[remote] npub_sha256` 预先钉住 hub 身份，没有可被冒充的首次接触，也不落任何
+//! 状态文件。摘要 = `sha256(hub 的 npub 文本)`，与 hub 机 `identity.json` 的
+//! `npub_sha256` 字段、`scripts/nostr.py` 同口径（[`npub_sha256`]）。
 //!
 //! 算法（与 envelope.py 逐字节一致，见其模块 docstring）：
 //! - 公钥按 Nostr 惯例取 x-only（32B）。**双方都对 x-only 做 even 升点**（`02‖x`）
@@ -30,15 +37,15 @@
 //! pubkey（`decrypt_from_peer` 的对端即发送方）。细节见 envelope.py / docs/remote-api.md。
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use bech32::{Bech32, Hrp};
 use rand::TryRng;
 use secp256k1::ecdh::shared_secret_point;
 use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -61,6 +68,9 @@ pub struct ClientIdentity {
 #[derive(Debug, Clone)]
 pub struct AuthReply {
     pub hub_pubkey: String,
+    /// hub 的时间戳。生产代码不再读它（身份校验已由钉摘要取代），保留是因为信封
+    /// 解密单测拿它断言「整份明文都对得上 python 向量」。
+    #[allow(dead_code)]
     pub server_time: String,
 }
 
@@ -68,15 +78,6 @@ pub struct AuthReply {
 struct IdentityFile {
     pubkey: String,
     secret_key: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HubState {
-    hub_pubkey: String,
-    server_time: String,
-    base: String,
-    first_seen: String,
-    last_seen: String,
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
@@ -104,32 +105,6 @@ fn str_field(obj: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("缺少字符串字段 {key}"))
-}
-
-fn now_stamp() -> String {
-    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-/// 以 0600 权限写文件（身份/TOFU 文件绝不公开）。非 unix 回退普通写。
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        let mut f = opts
-            .open(path)
-            .map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("写 {} 失败：{e}", path.display()))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes).map_err(|e| format!("写 {} 失败：{e}", path.display()))
-    }
 }
 
 // ── 1. 身份加载 ─────────────────────────────────────────────────────────────
@@ -218,8 +193,8 @@ pub fn decrypt_auth(id: &ClientIdentity, env: &Value) -> Result<AuthReply, Strin
     let payload: Value = serde_json::from_slice(&plain)
         .map_err(|e| format!("解密后不是合法 JSON：{e}"))?;
     Ok(AuthReply {
-        // 统一小写（对齐另两端：hub 恒发小写、vanity 显式 .lower()）——TOFU 的
-        // hub.json 字符串比较是大小写敏感的，收口成小写避免将来 hub 侧大小写漂移误报。
+        // 统一小写（对齐另两端：hub 恒发小写、vanity 显式 .lower()）——钉扎摘要按
+        // npub 文本算，收口成小写避免将来 hub 侧大小写漂移导致摘要对不上。
         hub_pubkey: str_field(&payload, "hub_pubkey")?.to_ascii_lowercase(),
         server_time: str_field(&payload, "server_time")?,
     })
@@ -330,61 +305,48 @@ pub fn decrypt_from_peer(
     Ok(plain)
 }
 
-// ── 3. TOFU hub.json ────────────────────────────────────────────────────────
+// ── 3. hub 身份钉扎（取代 TOFU hub.json）────────────────────────────────────
 
-/// hub.json 与 identity.json 同目录。
-pub fn hub_json_path(identity_path: &Path) -> PathBuf {
-    identity_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join("hub.json"))
-        .unwrap_or_else(|| PathBuf::from("hub.json"))
+/// Nostr 的 bech32 人类可读前缀（npub = 公钥、nsec = 私钥）。小写 4 字符，满足
+/// BIP-173 的 [33,126] 可打印 ASCII 约束，恒为合法 hrp。
+const NPUB_HRP: &str = "npub";
+
+/// 把 32B x-only pubkey（64-hex）编成 Nostr `npub1…`。
+///
+/// **用 bech32（BIP-173），不是 bech32m**：NIP-19 的地址就是这个校验和变体，换一个
+/// 会得到完全不同的尾校验和，与 hub 的 `nostr.py::npub` 对不上。8→5 bit 的 convertbits
+/// 由 bech32 crate 内部完成，与 python `convertbits(data, 8, 5, True)` 一致。
+pub fn npub_of(pubkey_hex: &str) -> Result<String, String> {
+    let bytes = hex_bytes(pubkey_hex, "pubkey", Some(32))?;
+    // "npub" 恒合法（非空、全小写 ASCII）；仍走 Result 而非 unwrap，不留 panic 路径。
+    let hrp = Hrp::parse(NPUB_HRP).map_err(|e| format!("npub hrp 非法（内部错误）：{e}"))?;
+    bech32::encode::<Bech32>(hrp, &bytes).map_err(|e| format!("npub 编码失败：{e}"))
 }
 
-/// 握手成功后把 hub 公钥记入 TOFU。若旧记录与新公钥**不一致** → Err（调用方 exit 2：
-/// hub 的 Nostr 身份不应改变；确需接受新 hub 时删除 hub.json 后重试）。一致则幂等
-/// 更新 last_seen（first_seen 保留）。
-pub fn remember_hub(path: &Path, reply: &AuthReply, base: &str) -> Result<(), String> {
-    let now = now_stamp();
-    let mut first_seen = now.clone();
+/// hub 身份钉扎摘要 = **`npub` 文本**的 SHA-256（小写 hex）——与 hub 机
+/// `backend/data/identity.json` 的 `npub_sha256` 字段、`scripts/nostr.py` 同一口径。
+///
+/// 注意哈希的是 npub **字符串**的 utf-8 字节，**不是** pubkey 的 32B 原始字节：
+/// 摘要要能和 hub 侧直接对拍，口径必须逐字节一致。全仓只此一处定义。
+pub fn npub_sha256(pubkey_hex: &str) -> Result<String, String> {
+    Ok(hex::encode(Sha256::digest(npub_of(pubkey_hex)?.as_bytes())))
+}
 
-    if let Some(text) = fs::read_to_string(path).ok() {
-        match serde_json::from_str::<HubState>(&text) {
-            Ok(prev) => {
-                if prev.hub_pubkey != reply.hub_pubkey {
-                    return Err(format!(
-                        "TOFU hub 身份变化：{} 此前记录 {}，本次握手拿到 {}。\n        hub 的 Nostr 公钥不应改变；确需接受新 hub 身份时删除 {} 后重试。",
-                        path.display(),
-                        abbrev(&prev.hub_pubkey),
-                        abbrev(&reply.hub_pubkey),
-                        path.display(),
-                    ));
-                }
-                first_seen = prev.first_seen;
-            }
-            Err(_) => {
-                // hub.json 损坏：按无记录处理（重新写），不因坏文件误拒新握手。
-                first_seen = now.clone();
-            }
-        }
+/// 校验 auth 信封里学到的 hub 公钥是否就是配置钉住的那一个（[`npub_sha256`] 比对）。
+///
+/// 钉摘要与直接钉 npub 强度等价（SHA-256 抗原像），好处是钉扎值本身不泄露 hub 身份。
+/// `pinned` 先 trim + 折成小写（手抄进配置的大小写/空白不该误判）；实算值恒为小写 hex。
+pub fn verify_hub_pinned(hub_pubkey: &str, pinned: &str) -> Result<(), String> {
+    let got = npub_sha256(hub_pubkey)?; // 先算：失败即返回，也保证下面的前缀切片安全
+    let want = pinned.trim().to_ascii_lowercase();
+    if got != want {
+        return Err(format!(
+            "hub 身份与配置的 [remote] npub_sha256 不符：\n        配置 {want}\n        实得 {got}\n        \
+             实得 npub {}\n        若确实换过 hub，请用上面的摘要更新 config 后重试。",
+            npub_of(hub_pubkey)?,
+        ));
     }
-
-    let state = HubState {
-        hub_pubkey: reply.hub_pubkey.clone(),
-        server_time: reply.server_time.clone(),
-        base: base.to_string(),
-        first_seen,
-        last_seen: now,
-    };
-    let text = serde_json::to_string_pretty(&state)
-        .map_err(|e| format!("序列化 hub.json 失败：{e}"))?;
-    write_private(path, text.as_bytes())
-}
-
-/// 打印用：取 16 位前缀 + “…”（公钥完整 64-hex 已存 hub.json，不进日志）。
-fn abbrev(s: &str) -> String {
-    let p: String = s.chars().take(16).collect();
-    format!("{p}…")
+    Ok(())
 }
 
 #[cfg(test)]
@@ -491,5 +453,55 @@ mod tests {
         };
         // 用错误 hub 公钥解密（pair-key 派生自错误对端）→ GCM tag 失败。
         assert!(decrypt_from_peer(&v2_id(), &other_hub.pubkey, &env).is_err());
+    }
+
+    // ── hub 钉扎向量：pubkey → npub → sha256(npub 文本)，与 hub（python）已知值对齐 ──
+    // 取自 hub 机 backend/data/identity.json；`bin/config.toml` 的 [remote] npub_sha256
+    // 也是这个值，等于把「配置里的钉扎值确实对得上真 hub」这条也锁进测试。
+    const PIN_HUB_PUB: &str = "cda87e1ddb41430d6f9ce267b6b048c9b105b5bf2002c5aeac97e0cf6dbb04ae";
+    const PIN_HUB_NPUB: &str = "npub1ek58u8wmg9ps6muuufnmdvzgexcstddlyqpvtt4vjlsv7mdmqjhq44q9wl";
+    const PIN_HUB_SHA: &str = "709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55";
+
+    #[test]
+    fn npub_matches_hub_vector() {
+        assert_eq!(npub_of(PIN_HUB_PUB).unwrap(), PIN_HUB_NPUB);
+        // 大写 hex 是同一个公钥（hex_bytes 接受 A-F）→ 同一 npub。
+        assert_eq!(
+            npub_of(&PIN_HUB_PUB.to_ascii_uppercase()).unwrap(),
+            PIN_HUB_NPUB
+        );
+    }
+
+    #[test]
+    fn npub_sha256_hashes_the_npub_text() {
+        let got = npub_sha256(PIN_HUB_PUB).unwrap();
+        assert_eq!(got, PIN_HUB_SHA);
+        assert_eq!(got.len(), 64);
+        assert!(got.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        // 锁死「哈希 npub 文本」这条口径：若哪天误改成哈希 32B pubkey 原始字节，值就变了。
+        let raw = Sha256::digest(hex::decode(PIN_HUB_PUB).unwrap());
+        assert_ne!(got, hex::encode(raw));
+    }
+
+    #[test]
+    fn npub_of_rejects_non_32b_pubkeys() {
+        assert!(npub_of("").is_err());
+        assert!(npub_of("zz").is_err()); // 非 hex
+        assert!(npub_of(&"11".repeat(31)).is_err()); // 31B
+        assert!(npub_of(&"11".repeat(33)).is_err()); // 33B
+    }
+
+    #[test]
+    fn verify_hub_pinned_accepts_only_the_pinned_digest() {
+        assert!(verify_hub_pinned(PIN_HUB_PUB, PIN_HUB_SHA).is_ok());
+        // 手抄进配置的大小写/空白容错。
+        let sloppy = format!("  {}  ", PIN_HUB_SHA.to_ascii_uppercase());
+        assert!(verify_hub_pinned(PIN_HUB_PUB, &sloppy).is_ok());
+        // 另一个 hub（v1 向量的 HUB_PUBKEY）→ 拒绝。
+        let e = verify_hub_pinned(HUB_PUBKEY, PIN_HUB_SHA).unwrap_err();
+        assert!(e.contains(PIN_HUB_SHA), "错误文案要带上配置侧的摘要：{e}");
+        // 非法 hub pubkey / 空 pin → Err 而非 panic（前缀/切片安全）。
+        assert!(verify_hub_pinned("not-hex", PIN_HUB_SHA).is_err());
+        assert!(verify_hub_pinned(PIN_HUB_PUB, "").is_err());
     }
 }

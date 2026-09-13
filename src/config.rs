@@ -45,6 +45,9 @@
 //!
 //! [remote]                        # required when mode = "remote"
 //! uri = "http://192.168.1.10:42069"
+//! # Hub identity pin: sha256 of the hub's npub text.  Required whenever
+//! # identity.json is present — auth refuses to proceed without it.
+//! npub_sha256 = "709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -169,6 +172,22 @@ pub struct RemoteSection {
     /// Local Nostr identity file for startup auth.  Absent ⇒ `<cwd>/identity.json`
     /// (same cwd-discovery semantics as the config file).
     pub identity: Option<String>,
+    /// Hub identity pin — `sha256` of the hub's `npub` **text**, lowercase hex.
+    /// Take it from the hub machine's `backend/data/identity.json`
+    /// (`npub_sha256` field, `scripts/nostr.py -f <file> verify` checks it).
+    ///
+    /// This replaces TOFU: the hub's Nostr identity must be pinned up front,
+    /// because the v1 auth envelope is ECIES (sender uses a throwaway key) and
+    /// therefore only proves the *recipient* could decrypt — never that the
+    /// sender holds the hub's key.  A LAN impersonator can answer the very
+    /// first handshake, so "learn the hub key on first contact" is not a trust
+    /// anchor.  A digest is as strong as pinning the npub itself (SHA-256
+    /// preimage resistance) without disclosing the hub identity in the file.
+    ///
+    /// Absent ⇒ auth refuses to run with an identity (fail closed, exit 2);
+    /// kept verbatim here — trimming/case folding happens in
+    /// [`crate::clientauth::verify_hub_pinned`].
+    pub npub_sha256: Option<String>,
 }
 
 impl Config {
@@ -256,6 +275,7 @@ mod tests {
         assert!(cfg.btc.check_uncompressed_pk.is_none());
         assert!(cfg.puzzle.database.is_none());
         assert!(cfg.remote.uri.is_none());
+        assert!(cfg.remote.npub_sha256.is_none());
         // Absent `[btc]` keys default to both serialisations checked.
         assert_eq!(cfg.btc_check(), BtcCheck { compressed: true, uncompressed: true });
     }
@@ -283,6 +303,7 @@ mod tests {
 
             [remote]
             uri = "http://192.168.1.10:42069"
+            npub_sha256 = "709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.mode.as_deref(), Some("puzzle"));
@@ -296,6 +317,33 @@ mod tests {
         assert_eq!(cfg.btc_check(), BtcCheck { compressed: false, uncompressed: true });
         assert_eq!(cfg.puzzle.database.as_deref(), Some("bin/71.db"));
         assert_eq!(cfg.remote.uri.as_deref(), Some("http://192.168.1.10:42069"));
+        assert_eq!(
+            cfg.remote.npub_sha256.as_deref(),
+            Some("709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55")
+        );
+    }
+
+    #[test]
+    fn remote_pin_is_optional_and_kept_verbatim() {
+        // Absent ⇒ None.  Whether that is fatal is remote.rs's decision (it is:
+        // fail closed when an identity is present) — the config layer just parses.
+        let cfg: Config = toml::from_str("[remote]\nuri = \"http://h:1\"").unwrap();
+        assert!(cfg.remote.npub_sha256.is_none());
+
+        // Kept verbatim: trim/case folding happens in clientauth::verify_hub_pinned,
+        // so a hand-copied uppercase digest still parses to exactly what was written.
+        let cfg: Config = toml::from_str(
+            "[remote]\nnpub_sha256 = \"709036F6387523B2203BC46047A2F13383E5EC48E86A64DDBADA2A776CC00C55\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.remote.npub_sha256.as_deref(),
+            Some("709036F6387523B2203BC46047A2F13383E5EC48E86A64DDBADA2A776CC00C55")
+        );
+
+        // No `deny_unknown_fields`: an unknown `[remote]` key doesn't fail the parse.
+        let cfg: Config = toml::from_str("[remote]\nuri = \"http://h:1\"\nfuture_key = 1").unwrap();
+        assert!(cfg.remote.npub_sha256.is_none());
     }
 
     #[test]

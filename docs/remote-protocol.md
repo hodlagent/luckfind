@@ -53,7 +53,8 @@
 | `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
 | `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
 | `check_compressed_pk` / `check_uncompressed_pk` | 默认均 true | 决定 worker 把压缩（33B）/非压缩（65B）公钥的 hash160 与目标比较；被禁用的序列化在 CPU/GPU 热路径上不再计算。**不改变 hub 协议**——chunk 照常领取扫描，只是命中判定只看启用的序列化。**例外**：pow 窗口上压缩哈希必须算（proof 定义在压缩公钥上），CPU 侧只在有 proof 时多算一次、GPU 侧经 `configure_chunk` 强制开，真实 target 的开关语义由 CPU 重验块把关 | `[btc]` 配置段 → `BtcCheck`，贯穿 CPU `scan_chunk`/`worker_loop` 与 GPU shader/kernel |
-| `identity`（`[remote]` 段） | 缺省 `<cwd>/identity.json` | 本地 Nostr 身份文件（`identify` / `nostr.py create` 产出的 5 字段 JSON，0600）。**存在 = auth 轨开关**：启动 auth + 业务全走 v2 静态信道信封（§3）；**缺失 → 明文匿名昵称运行**（worker_id = 昵称，用户 2026-09 拍板）；**在但损坏/不自洽 → exit 2**（不静默降级） | `src/clientauth.rs::load_identity`（自检 secret→pubkey 派生一致） |
+| `identity`（`[remote]` 段） | 缺省 `<cwd>/identity.json` | 本地 Nostr 身份文件（`identify` / `nostr.py create` 产出的 JSON，0600）。**存在 = auth 轨开关**：启动 auth + 业务全走 v2 静态信道信封（§3）；**缺失 → 明文匿名昵称运行**（worker_id = 昵称，用户 2026-09 拍板）；**在但损坏/不自洽 → exit 2**（不静默降级） | `src/clientauth.rs::load_identity`（自检 secret→pubkey 派生一致） |
+| `npub_sha256`（`[remote]` 段） | 无 | **hub 身份钉扎摘要** = `sha256(hub 的 npub 文本)`，小写 hex；取自 hub 机 `backend/data/identity.json` 的 `npub_sha256` 字段。auth 拿到 hub 公钥后转 npub 算摘要比对，不符 → exit 2。**有 identity 文件而缺此键 → exit 2**（fail closed，不回落 TOFU）；无 identity 文件（匿名轨）不需要它 | `src/clientauth.rs::verify_hub_pinned` / `npub_sha256` |
 | HTTP 连接超时 | 5s | 防 hub 挂死卡线程 | `HubClient::new` |
 | HTTP 单请求超时 | 15s | 同上 | `HubClient::new` |
 | auth 网络重连 | 每 2s 一次，上限 90s | `POST /api/auth` 传输层错误的有界重试（同 `connect()`） | `remote.rs::maybe_authenticate` |
@@ -105,9 +106,19 @@ hub 把活跃/keys 回流进其 `clients` 行（auth 轨记账）；自由文本
 `K = SHA-256(x(ECDH(己方秘密, even-lift(hub 公钥))))`，AES-256-GCM，aad = 发送方 =
 己方 pubkey）；响应体若是 `{"enc": {...}}`（hub 加密回，aad = hub 公钥）→ 先解出明文
 再按原 typed struct 解析。明文旧 hub / 匿名轨不包不解。**非 2xx 语义不变**（404/409 照旧
-判 lease 丢）；信封在但解密失败 → fatal exit 2（对端不是当初 auth 的那台 hub = TOFU 违背）。
+判 lease 丢）；信封在但解密失败 → fatal exit 2（对端不是 auth 时钉住的那台 hub = 钉扎违背）。
 实现：`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` +
 `remote.rs::sealed_body/unseal_response`。
+
+> **注：hub 身份为什么钉摘要而不是 TOFU（2026-09 拍板）**
+> v1 auth 信封是 ECIES——发送方（hub）用**一次性**密钥，所以「解得开」只证明**收件人**
+> 能解、**不证明发送方持有 hub 私钥**：任何人都能对着本 client 的公钥封一个自称 hub 的
+> 信封。于是「首次握手就学会 hub 公钥」（TOFU）不是信任根——LAN 中间人只要抢在真 hub
+> 之前应答第一次握手即可，而 win/done 会带着私钥走那条信道。改为在配置里钉住
+> `[remote] npub_sha256`：没有可被冒充的首次接触，也不落任何状态文件（旧 `hub.json`
+> 不再读写，磁盘上的残留文件无副作用）。钉摘要与直接钉 npub 强度等价（SHA-256 抗原像），
+> 好处是钉扎值本身不泄露 hub 身份；缺失即 exit 2（fail closed，不回落 TOFU）。
+> 同一套模型见 `vanity_worker.py::HUB_NPUB_SHA256`。
 
 响应/错误约定：
 
@@ -148,7 +159,9 @@ worker                                   hub (lan-hub)
    ├─ 读 identity.json（`[remote] identity` 覆盖，缺省 <cwd>/identity.json）
    │     **不存在** → 明文匿名昵称运行：worker_id = 昵称，跳过全部 auth，业务不加密
    │     （打印 `[remote] 未发现 identity.json — 明文匿名昵称运行（worker_id = 昵称）`）
-   └─ 存在：自检由 secret_key 派生 pubkey 与文件一致（不自洽 → exit 2）
+   └─ 存在：要求 `[remote] npub_sha256` 已配置
+      │     **缺失 → exit 2**（fail closed：不知对端是谁就不出示身份、不建加密信道）
+      └─ 自检由 secret_key 派生 pubkey 与文件一致（不自洽 → exit 2）
       └─ POST /api/auth        ──────────→ {pubkey: <64hex>, name: <昵称>, version: 1}
            · name = 昵称（旧自由文本 worker_id，--worker-id / 主机名），只供 hub UI 显示
            · 此后**干活端点的 worker_id 一律用 <pubkey>**（worker_id 双语义，见上表下方注）
@@ -158,10 +171,12 @@ worker                                   hub (lan-hub)
                                              nonce, ciphertext}, client}
       └─ 用本地私钥 + ephemeral_pubkey 解 AES-256-GCM 信封（ECIES v1，src/clientauth.rs）
          · tag 校验失败（非发给这把私钥/被篡改）→ exit 2
-         · 解开 → 学到 hub_pubkey → 校验是合法曲线点 → 打印 `[remote] auth ok · hub=<前缀…>`
+         · 解开 → 学到 hub_pubkey → 校验是合法曲线点（对端加密信道要对它做 ECDH）
+         · hub_pubkey → npub → sha256(npub 文本) 与配置 npub_sha256 比对
+           · 不符 → exit 2（打印配置值/实得值与实得 npub，便于核对或换 hub 后更新配置）
+           · 相符 → 打印 `[remote] auth ok · hub_sha256=<摘要前缀…>`（日志不含 hub 身份）
          · hub_pubkey 存内存（client.hub_pubkey）→ 此后业务 POST 全走 v2 信封（见 §3）
-      └─ 写 hub.json TOFU（与 identity.json 同目录，0600）
-         · 已存 hub_pubkey ≠ 新解出的 → exit 2（删 hub.json 以接受新 hub 身份）
+      └─ 不落任何状态文件：钉扎值来自配置，没有可被冒充的「首次接触」（§3 注）
    └─ pending+running == 0  → 直接退出「nothing to do」
 
 ② 领取 chunk（每个线程 ≤1 个）
@@ -396,10 +411,10 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 |---|---|---|
 | 心跳常量 / 旋转预算（config 解析传入） | `remote.rs::HEARTBEAT_INTERVAL`/`CLAIM_IDLE`；`main.rs::resolve_rotate` | `config.py::RECLAIM_TIMEOUT`/`RECLAIM_INTERVAL` |
 | HTTP 封装与超时 | `remote.rs::HubClient`（impl 块） | `routes.py` |
-| 启动 client-auth（条件门禁）+ 解信封 + TOFU | `remote.rs::maybe_authenticate`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
+| 启动 client-auth（条件门禁）+ 解信封 + 钉摘要 | `remote.rs::maybe_authenticate`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
 | 业务 v2 静态信道信封（包/解） | `HubClient::sealed_body`/`unseal_response`；`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` | `routes.py` 前 `transport.py`/`wire.py`（透明中间件） |
 | identity.json 自检 | `clientauth.rs::load_identity` | —（hub 侧由 `nostr.py` 生成） |
-| hub.json TOFU（hub 身份跨启动校验） | `clientauth.rs::remember_hub` | — |
+| hub 身份钉扎（npub 摘要 vs `[remote] npub_sha256`） | `clientauth.rs::npub_of`/`npub_sha256`/`verify_hub_pinned` | `nostr.py::npub_sha256`（生成 `identity.json` 的该字段） |
 | 启动 connect + hash160 校验 | `remote.rs::connect` | `routes.py::status` |
 | **pow 任务解析/校验** | `ClaimedChunk::pow_task` | `PuzzleService.claim`（组装 `task`）+ `powproof.build_task` |
 | **pow digest（升序 32B-BE → SHA256）** | `remote.rs::hashed_proof_key` | `powproof.py::expected_digest_for` |

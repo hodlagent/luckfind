@@ -270,6 +270,9 @@ database = "bin/71.db"           #   → run: bin/luckfind --config luckfind.tom
 
 # [remote]                       # required when mode = "remote"
 # uri = "http://192.168.1.10:42069"
+# Hub identity pin = sha256 of the hub's npub text (from the hub machine's
+# backend/data/identity.json).  Required whenever identity.json is present.
+# npub_sha256 = "709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55"
 ```
 
 ## Performance

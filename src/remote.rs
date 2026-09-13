@@ -277,8 +277,9 @@ fn is_lease_lost(e: &ureq::Error) -> bool {
 }
 
 /// 内部错误出口：本地身份 / hub 公钥不自洽、RNG 失败、对端响应信封解不开等。auth 已把
-/// 两把 key 校验过（合法曲线点 + TOFU 一致），真走到这里 = 不该裸跑明文继续扫的内部状态
-/// 或「对端不是当初 auth 的那个 hub」——带原因 exit 2（与 auth 门禁同级，绝不静默降级）。
+/// 两把 key 校验过（合法曲线点 + 摘要与钉扎值一致），真走到这里 = 不该裸跑明文继续扫的
+/// 内部状态或「对端不是 auth 时钉住的那个 hub」——带原因 exit 2（与 auth 门禁同级，
+/// 绝不静默降级）。
 fn fatal(msg: impl std::fmt::Display) -> ! {
     eprintln!("[remote] {msg}");
     std::process::exit(2);
@@ -340,8 +341,9 @@ struct HubClient {
     /// 已 auth 的本地身份（`identity.json` 存在、握手通过后才有）。None = 明文匿名昵称运行
     /// （worker_id = 昵称，业务请求不加密，旧行为）。
     identity: Option<clientauth::ClientIdentity>,
-    /// hub 的 Nostr 公钥（解开 auth ECIES 信封拿到、TOFU 校验一致后收下）。与 `identity`
-    /// 恒同 Some/None；Some 时业务请求体用它对端派生 pair-key 做 v2 密封、2xx 响应解封。
+    /// hub 的 Nostr 公钥（解开 auth ECIES 信封拿到、npub 摘要与 `[remote] npub_sha256`
+    /// 钉扎值比对通过后收下）。与 `identity` 恒同 Some/None；Some 时业务请求体用它对端
+    /// 派生 pair-key 做 v2 密封、2xx 响应解封。
     hub_pubkey: Option<String>,
 }
 
@@ -433,8 +435,8 @@ impl HubClient {
     }
 
     /// 2xx 业务响应解封为 JSON Value：auth 模式且 hub 把 body 加密成 `{"enc": v2}` →
-    /// 用本地私钥 + hub 公钥解回明文 JSON（**解不开 = 对端不是当初 auth 的那个 hub**，
-    /// TOFU 违背 → exit 2，绝不把进度/命中状态当明文裸读）；明文旧 hub / 匿名模式 → 原样。
+    /// 用本地私钥 + hub 公钥解回明文 JSON（**解不开 = 对端不是 auth 时钉住的那个 hub**，
+    /// 钉扎违背 → exit 2，绝不把进度/命中状态当明文裸读）；明文旧 hub / 匿名模式 → 原样。
     fn unseal_response(&self, resp: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, ureq::Error> {
         let body: serde_json::Value = resp.into_body().read_json()?;
         Ok(match (&self.identity, &self.hub_pubkey) {
@@ -754,6 +756,7 @@ pub fn run(
     remote_url: &str,
     nickname: String,
     identity_path: &Path,
+    hub_pin: Option<&str>,
     n_workers: usize,
     heartbeat_secs: f64,
     output_dir: Option<&Path>,
@@ -770,16 +773,16 @@ pub fn run(
 
     // ── 1b. client-auth gate（identity.json 在才走；缺 → 明文匿名昵称运行）────
     // claim 之前先声明身份：明文 POST 登记 + 解开 hub 的加密信封拿 hub_pubkey
-    // （`maybe_authenticate`），并把 hub 公钥 TOFU 进 hub.json、身份收进 client——
-    // 此后 claim/heartbeat/done/win/release 的请求体自动 v2 密封、响应解封。验证不过
-    // 直接 exit 2；**文件在 = 期望 auth，绝不静默降级为明文扫描**；文件缺失才明文匿名
-    // 昵称运行（用户 2026-09 拍板：opt-in by omission）。
+    // （`maybe_authenticate`），校验它与 `hub_pin`（`[remote] npub_sha256`）一致、
+    // 身份收进 client——此后 claim/heartbeat/done/win/release 的请求体自动 v2 密封、
+    // 响应解封。验证不过直接 exit 2；**文件在 = 期望 auth，绝不静默降级为明文扫描**；
+    // 文件缺失才明文匿名昵称运行（用户 2026-09 拍板：opt-in by omission）。
     //
     // worker_id 双语义（hub docs/remote-api.md §1）：auth 轨把 `nickname`（旧自由文本
     // worker_id，--worker-id / 主机名）只作为 auth 的 `name` 上报供 hub UI 显示，干活端点
     // （claim/heartbeat/done/win/release）的 worker_id 一律用本机身份 pubkey（auth 轨记账）；
     // 无 identity.json 则 worker_id = 昵称，走匿名轨（零账本，旧行为不变）。
-    let worker_id: String = maybe_authenticate(&mut client, identity_path, &nickname)
+    let worker_id: String = maybe_authenticate(&mut client, identity_path, &nickname, hub_pin)
         .unwrap_or_else(|| nickname);
     let client = Arc::new(client);
 
@@ -1087,27 +1090,41 @@ fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
 /// 启动 client-auth（`POST /api/auth`，docs/remote-protocol.md 时序 ①a）——**只在
 /// `identity_path` 存在时走**：加载本地 `identity.json` 身份 → 明文登记（`name` = 昵称，
 /// 供 hub UI 显示）→ 解开 hub 返回的加密信封拿 `hub_pubkey` → 校验它是合法曲线点（业务
-/// v2 密封要对它做 ECDH）→ TOFU 写入 `hub.json` → 把 `identity` + `hub_pubkey` 收进
-/// client（此后 claim/heartbeat/… 请求体自动 v2 密封）。打印 `[remote] auth ok · hub=<前缀…>`。
+/// v2 密封要对它做 ECDH）→ 校验它的 npub 摘要 == `hub_pin`（钉扎，取代 TOFU）→ 把
+/// `identity` + `hub_pubkey` 收进 client（此后 claim/heartbeat/… 请求体自动 v2 密封）。
+/// **先判摘要在前、曲线点在后的顺序是刻意的**，与 vanity_worker.py 对齐（见下）。
+/// 打印 `[remote] auth ok · hub_sha256=<摘要前缀…>`——**日志里不出现 hub 身份**。
 ///
 /// **返回 `Some(己方 pubkey, 小写 64-hex)`**——run() 把它作为干活端点（claim/heartbeat/
 /// done/win/release）的 worker_id，hub 才据此把该 client 计入 auth 轨（worker_id 双语义，
 /// docs/remote-api.md §1）。
 ///
 /// `identity_path` **缺失** → 明文匿名昵称运行（worker_id = 昵称，业务请求不加密，旧行为）：
-/// 打一行日志并返回 `None`，不 exit。文件**在**但损坏/不自洽、auth 被拒（403 whitelist /
-/// 422 非法 pubkey 等）、信封解密失败、hub 公钥非法、TOFU 身份变化 → 一律带原因 exit 2
-/// （放身份文件 = 期望 auth，绝不静默降级为明文扫描）。网络层错误同 `connect()` 有界重试
-/// （≤90s、2s 步进）后 exit 2。
+/// 打一行日志并返回 `None`，不 exit（没有 auth 轨就没有 hub 身份可钉）。文件**在**但
+/// `hub_pin` 缺失、损坏/不自洽、auth 被拒（403 whitelist / 422 非法 pubkey 等）、信封解密
+/// 失败、hub 公钥非法、**摘要与钉扎值不符** → 一律带原因 exit 2（放身份文件 = 期望 auth，
+/// 绝不静默降级为明文扫描）。网络层错误同 `connect()` 有界重试（≤90s、2s 步进）后 exit 2。
 fn maybe_authenticate(
     client: &mut HubClient,
     identity_path: &Path,
     name: &str,
+    hub_pin: Option<&str>,
 ) -> Option<String> {
     if !identity_path.exists() {
         term_line("[remote] 未发现 identity.json — 明文匿名昵称运行（worker_id = 昵称）");
         return None;
     }
+    // 期望 auth 但没有钉扎值 = 无法判断对端是不是真 hub → 拒绝（fail closed），且在
+    // **任何 auth I/O 之前**：不 POST /api/auth，即不出示本机身份、不建立加密信道
+    // （connect() 的 /api/status 已先跑过，那一步不带身份）。回退 TOFU 会重新引入可被
+    // 冒充的「首次接触」，正是这次要消掉的东西。
+    let Some(pin) = hub_pin else {
+        eprintln!(
+            "[remote] 配置缺少 [remote] npub_sha256 —— 拒绝带身份连接 hub。\n        \
+             从 hub 机的 identity.json 取 npub_sha256 填进 config 后重试。"
+        );
+        std::process::exit(2);
+    };
     let identity = clientauth::load_identity(identity_path).unwrap_or_else(|e| {
         eprintln!("[remote] {e}");
         std::process::exit(2);
@@ -1139,20 +1156,25 @@ fn maybe_authenticate(
             }
         }
     };
+    // 钉扎校验（取代 TOFU hub.json）：hub 公钥的 npub 摘要必须等于 [remote] npub_sha256。
+    // **排在曲线点校验之前**——先确认"对面是不是那台 hub"，再谈它的 key 好不好用：
+    // 冒充者塞来的 key 多半也不是合法曲线点，曲线点先判会把「身份不符」误报成
+    // 「hub 公钥非法」，指向错误的方向。顺序与 vanity_worker.py 的 auth_register 一致。
+    // 且必须在下面那行 auth ok 之前——否则被冒充的 hub 会先看到「auth ok」再 exit 2。
+    clientauth::verify_hub_pinned(&reply.hub_pubkey, pin).unwrap_or_else(|e| {
+        eprintln!("[remote] {e}");
+        std::process::exit(2);
+    });
     // hub 公钥必须是合法曲线点（业务 v2 密封对它做 ECDH 派生 pair-key）——派生一次作证明；
-    // 非法（被篡改/坏 hub）→ exit 2，不带着坏 key 开始加密扫描。
+    // 非法（被篡改/坏 hub）→ exit 2，不带着坏 key 开始加密扫描。走到这里摘要已对上，
+    // 所以这条只可能是"真 hub 的文件本身坏了"，报「公钥非法」才是准确诊断。
     clientauth::static_key(&identity, &reply.hub_pubkey).unwrap_or_else(|e| {
         eprintln!("[remote] hub 公钥非法，无法建立业务加密信道：{e}");
         std::process::exit(2);
     });
-    term_line(&format!("[remote] auth ok · hub={}…", &reply.hub_pubkey[..16]));
-
-    // TOFU：hub_pubkey 持久化，跨启动校验 hub 身份未变（变化 → remember_hub Err → exit 2）。
-    let hub_path = clientauth::hub_json_path(identity_path);
-    clientauth::remember_hub(&hub_path, &reply, &client.base).unwrap_or_else(|e| {
-        eprintln!("[remote] {e}");
-        std::process::exit(2);
-    });
+    // 日志只打摘要前缀，不打 hub 公钥：钉扎值本身不泄露 hub 身份，日志也不该泄露。
+    let pin_prefix: String = pin.trim().chars().take(16).collect();
+    term_line(&format!("[remote] auth ok · hub_sha256={pin_prefix}…"));
 
     // 身份 + hub 公钥收进 client：此后所有业务请求自动 v2 密封（sealed_body / unseal_response）。
     let own_pubkey = identity.pubkey.clone();

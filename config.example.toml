@@ -75,3 +75,9 @@ uri = "http://192.168.18.69:42069"
 # 本地 Nostr 身份文件（启动 auth 用，声明 client pubkey + 解开 hub 信封）。
 # 缺省 = 本目录 identity.json（与 config 自动发现同 cwd 语义）。
 # identity = "identity.json"
+#
+# hub 身份钉扎摘要 = sha256(hub 的 npub 文本)，小写 hex；取自 hub 机
+# backend/data/identity.json 的 npub_sha256 字段（`scripts/nostr.py -f <file> verify`
+# 可校验该文件自洽）。auth 拿到 hub 公钥后转 npub 算摘要比对，不符即 exit 2。
+# **有 identity 文件时必须配**（缺失 → exit 2，fail closed）；匿名轨不需要。
+npub_sha256 = "709036f6387523b2203bc46047a2f13383e5ec48e86a64ddbada2a776cc00c55"

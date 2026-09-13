@@ -264,6 +264,8 @@ fn main() {
             remote_url,
             cli.worker_id(),
             &identity_path,
+            // hub 身份钉扎摘要（`[remote] npub_sha256`）：有身份文件时缺失即 exit 2。
+            cfg.remote.npub_sha256.as_deref(),
             cpu_workers,
             cli.heartbeat,
             Some(Path::new(&cli.output_dir)),
