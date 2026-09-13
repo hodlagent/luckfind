@@ -87,7 +87,7 @@
 | `/api/chunks/claim` | POST | `{worker_id, count, capability}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk |
 | `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
 | `/api/chunks/{id}/done` | POST | `{worker_id}` | 整段扫完：置 finished、删 lease |
-| `/api/win` | POST | `{worker_id, chunk_id}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved |
+| `/api/win` | POST | `{worker_id, chunk_id, private_key?}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved。`private_key`（64 位小写 hex）**只在 auth 轨带**——hub 据此另存 key 文件并自动扫币（见 §7.4） |
 | `/api/chunks/{id}/release` | POST | `{worker_id, current_hex?, end_hex?}` | 旋转/放弃：保存进度、回退 pending、删 lease；**pow 窗口上 = 弃整窗**（见 §8） |
 | `/api/pow` | POST | `{worker_id, task_id, chunk_id, hashed_proof_key}` | **pow 全窗 digest 提交**（Phase 2，取代 pow 窗口上的 done）：hub 校验 `expected_digest` 相等 → 按任务窗口终态化 chunk + verified 记账，返回 `{ok, task_id, chunk_id, keys_scanned, solved}`（见 §8） |
 
@@ -129,7 +129,9 @@ hub 把活跃/keys 回流进其 `clients` 行（auth 轨记账）；自由文本
 - 心跳 `keys`/`rate` 是瞬态指标，hub 只存内存、不落库（`metrics.py`）。
 - solved 落盘：`POST /api/win` 后 hub 在 `backend/data/` 写
   `{puzzle_number}_{timestamp}.txt`（worker_id/chunk_id，**不含私钥**）；文件存在即
-  solved，重启不丢。
+  solved，重启不丢。auth 轨带了 `private_key` 时另写一份
+  `{puzzle_number}_{timestamp}_key.txt`（`0600`）——key 文件独立于记录文件、不参与
+  solved 判定，且被 `win.py::_win_files()` 过滤掉，**绝不进 `/api/status` 回显**。
 
 ---
 
@@ -187,7 +189,7 @@ worker                                   hub (lan-hub)
    └─ 扫完（**有 pow 任务**）：POST /api/pow ───────────→ {worker_id, task_id,
         chunk_id, hashed_proof_key}
         （hub 校验全窗 digest → 终态化 + verified 记账；**此窗口不得调 done**，见 §8）
-   └─ 命中：POST /api/win ──────────────→ {worker_id, chunk_id}
+   └─ 命中：POST /api/win ──────────────→ {worker_id, chunk_id, private_key?}
         （打印 [HIT]；hub 落 win 记录、置 solved；整个 run 停止，
           其它 worker 在下一次 claim/心跳读到 solved 也停止）
 
@@ -265,13 +267,22 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
    只有 404/409 才代表该 chunk 的 lease 已不归我们（`is_lease_lost`，`remote.rs:113`）。
 4. **`win` ≠ `done`**。`/api/win` 只在命中时调用：除了 done 的最终化，还会让 hub 落
    win 记录文件并置 puzzle solved，从而广播停止其它 worker。扫完一整个区间（没命中）
-   仍走 `done`。`/api/win` 不带私钥——私钥只留在命中 worker 本地的 `aman_*.txt`。
-5. **proof 命中 ≠ 命中**。pow 窗口里扫到某个 proof 的 hash160 只是"确实扫过这个位置"
+   仍走 `done`。
+5. **私钥只在 auth 轨随 `win` 上报**（`remote.rs` 的 `HubClient::win_body`）。判据就是
+   `sealed_body` 的同一个开关——`identity`（`identity.json`）在不在：**在** → body 会被
+   v2 信封密封，`private_key`（64 位小写 hex）一并上行，hub 另存
+   `{puzzle_number}_{ts}_key.txt`（`0600`）并**立刻自动扫币**（派生地址校验 `== target`
+   后把余额扫到 `[btc] vault`，hub `remote-api.md` §22）；**不在**（匿名昵称轨）→ body
+   是明文 HTTP，**一律不发私钥**，hub 记 `no-key`，私钥只留本地 `aman_*.txt`，事后由
+   运维走 `python3 -m app.sweep --key` 手工补扫。
+   自动扫币的时限意义：私钥一解出全网谁都能扫走那笔奖金，"命中 → 广播"的窗口期直接
+   决定钱是否到手——所以 auth 轨上这一发是**有意**的取舍，不是漏发。
+6. **proof 命中 ≠ 命中**。pow 窗口里扫到某个 proof 的 hash160 只是"确实扫过这个位置"
    的证据，**不停机、不进 `matches`、不打印 `[HIT]`、不设 `hit_flag`/`stop_flag`**
    （那两个标志全队共享，误设会让整支机队停下），只记进独立的 `found_proofs` sink，
    然后接着扫。命中（真实 target）始终优先：同一个 key 又中 target 又是 proof 时走
    `matched` → `/api/win`。
-6. **pow 窗口的 `done` 恒被 409 挡**。冻结窗口只能靠 `/api/pow` 收敛；`rotate` 在
+7. **pow 窗口的 `done` 恒被 409 挡**。冻结窗口只能靠 `/api/pow` 收敛；`rotate` 在
    pow 窗口上被强制关闭（`eff_rotate = None`），因为中途 park 等于弃掉整窗、无部分
    credit。
 

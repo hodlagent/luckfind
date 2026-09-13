@@ -17,7 +17,13 @@
 //! persists the win record and marks the puzzle solved.  That state is
 //! broadcast on claim / heartbeat / status responses, and every worker stops
 //! promptly when it sees it (mid-claim workers abort on the next heartbeat;
-//! idle workers exit on the next claim).
+//! idle workers exit on the next claim).  On the **auth track** the hit's
+//! private key rides along in that request (the body is sealed by then), which
+//! is what lets the hub sweep the prize funds to `[btc] vault` right away —
+//! the window between someone deriving the key and someone sweeping it is what
+//! decides whether the money is actually collected (hub `remote-api.md` §22).
+//! The anonymous track's body is plaintext HTTP, so it never carries the key;
+//! the key stays in the local `aman_*.txt` and is swept by hand afterwards.
 //!
 //! Crash recovery is the hub's job: a worker that dies (or loses the network)
 //! stops heartbeating, and the hub reclaims the lease after its `[reclaim]
@@ -503,10 +509,41 @@ impl HubClient {
         Ok(())
     }
 
+    /// `/api/win` 的明文请求体。**私钥只在 auth 轨带**：这里的判据 `self.identity`
+    /// 就是 `sealed_body` 决定"包不包 v2 信封"的同一个开关——两处若判得不一样，
+    /// 匿名明文轨就会把私钥裸传给 hub。
+    fn win_body(
+        &self,
+        chunk_id: u32,
+        worker_id: &str,
+        private_key: Option<&str>,
+    ) -> serde_json::Value {
+        let mut body = json!({ "worker_id": worker_id, "chunk_id": chunk_id });
+        if self.identity.is_some() {
+            if let Some(k) = private_key {
+                body["private_key"] = json!(k);
+            }
+        }
+        body
+    }
+
     /// 命中上报（取代 done）：hub 落 win 记录 + 置 puzzle solved。409（已被别的
     /// worker 先标记 solved）按 lease 丢失处理即可——本 worker 放弃本 chunk。
-    fn win(&self, chunk_id: u32, worker_id: &str) -> Result<(), ureq::Error> {
-        let body = self.sealed_body(&json!({ "worker_id": worker_id, "chunk_id": chunk_id }));
+    ///
+    /// `private_key`（64 位小写 hex）**只在 auth 轨**随请求上行（见 [`Self::win_body`]）：
+    /// hub 收到非空 `private_key` 会另存 `{puzzle_number}_{ts}_key.txt`（`0600`）并触发
+    /// **自动扫币**——用私钥派生地址、校验 `== meta.target` 后把余额全额扫到
+    /// `[btc] vault`（hub `remote-api.md` §22）。匿名昵称轨的 body 是**明文 HTTP**，
+    /// 私钥绝不明文过 LAN，该轨一律省略此字段（hub 记 `no-key`），私钥只留本地
+    /// `aman_*.txt`，事后由运维走 `python3 -m app.sweep --key` 手工补扫。
+    fn win(
+        &self,
+        chunk_id: u32,
+        worker_id: &str,
+        private_key: Option<&str>,
+    ) -> Result<(), ureq::Error> {
+        let body = self.win_body(chunk_id, worker_id, private_key);
+        let body = self.sealed_body(&body);
         let _ = self
             .agent
             .post(&self.url("/api/win"))
@@ -1424,7 +1461,10 @@ fn remote_worker(
         if outcome.matched {
             // Win: report the hit to the hub (`/api/win` — hub 落 win 记录 + 置
             // solved), then stop (scan_chunk already set stop_flag + hit_flag).
-            if let Err(e) = client.win(chunk_id, worker_id) {
+            // auth 轨随请求带上私钥（信封密封）→ hub 立刻自动扫币；匿名轨省略，
+            // 私钥只留本地 `aman_*.txt`（见 `HubClient::win`）。
+            let sk_hex = hex::encode(outcome.sk);
+            if let Err(e) = client.win(chunk_id, worker_id, Some(&sk_hex)) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
                         "[remote] win failed ({e}) — hub will reclaim the chunk"
@@ -1793,6 +1833,9 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         let mut current = start_bytes; // next key NOT yet covered
         let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
         let mut hit = false; // CPU-verified match → this chunk is the winner
+        // 命中私钥，供收尾的 `/api/win` 上报（auth 轨才发，见 `HubClient::win`）。
+        // `verified` 的作用域只到匹配块内，故在这里单独带出来。
+        let mut hit_key: Option<[u8; 32]> = None;
         let mut lease_lost = false;
         // 心跳报告 hub 已 solved（别的 worker 命中）→ 提前退出，不 park。
         let mut solved = false;
@@ -1927,6 +1970,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                         };
                         if let Some(first) = verified.first() {
                             hit = true;
+                            hit_key = Some(first.private_key);
                             // 命中即停：首个命中的 worker 立即打印（含私钥）并通知
                             // 所有 worker 停止。
                             if hit_flag
@@ -1990,7 +2034,10 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         if hit {
             // Win: report the hit to the hub (`/api/win` — hub 落 win 记录 + 置
             // solved), then stop (the scan already set stop_flag + hit_flag).
-            if let Err(e) = client.win(chunk_id, worker_id) {
+            // auth 轨随请求带上私钥（信封密封）→ hub 立刻自动扫币；匿名轨省略
+            // （见 `HubClient::win`）。多命中时只报首个——与 `[HIT]` 打印同源。
+            let sk_hex = hit_key.map(hex::encode);
+            if let Err(e) = client.win(chunk_id, worker_id, sk_hex.as_deref()) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
                         "[remote] win failed ({e}) — hub will reclaim the chunk"
@@ -2337,5 +2384,42 @@ mod tests {
         let r: PowResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(r.keys_scanned, 0);
         assert!(!r.solved);
+    }
+
+    // ── /api/win 请求体：私钥只在 auth 轨带 ────────────────────────────────
+
+    /// 命中私钥（64 位小写 hex）只允许出现在**会被密封**的 win 请求体里。hub 收到
+    /// 非空 `private_key` 会另存 key 文件并触发自动扫币（`remote-api.md` §22），
+    /// 而匿名轨的 body 是明文 HTTP —— 这个开关就是私钥不上 LAN 明文的唯一防线。
+    #[test]
+    fn win_body_carries_private_key_only_on_auth_track() {
+        let mut client = HubClient::new("http://127.0.0.1:1");
+        let key = "11".repeat(32);
+
+        // 匿名昵称轨（无 identity）：body 明文 → 绝不带私钥，hub 记 `no-key`。
+        let anon = client.win_body(7, "mac-mini", Some(&key));
+        assert_eq!(anon["worker_id"], "mac-mini");
+        assert_eq!(anon["chunk_id"], 7);
+        assert!(
+            anon.get("private_key").is_none(),
+            "匿名明文轨不得携带私钥：{anon}"
+        );
+
+        // auth 轨（identity 在 → `sealed_body` 会封 v2 信封）→ 带上私钥。
+        client.identity = Some(clientauth::ClientIdentity {
+            pubkey: "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
+                .to_string(),
+            secret: "22".repeat(32),
+        });
+        let sealed = client.win_body(7, "mac-mini", Some(&key));
+        assert_eq!(sealed["worker_id"], "mac-mini");
+        assert_eq!(sealed["chunk_id"], 7);
+        assert_eq!(sealed["private_key"], key);
+
+        // 无命中私钥（调用点传 None）→ 字段缺省，hub 照样走 no-key 路径。
+        assert!(client
+            .win_body(7, "mac-mini", None)
+            .get("private_key")
+            .is_none());
     }
 }
