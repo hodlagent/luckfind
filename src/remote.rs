@@ -165,11 +165,16 @@ struct ChunkTaskRaw {
 
 /// 校验过的 pow 任务。由 `ClaimedChunk::pow_task` 构造——畸形任务返回 `None`
 /// （调用方按无 pow 语义走并弃窗，绝不 `fatal()`：hub 侧 bug 不该杀掉整机队）。
+///
+/// **只留消费者真正要的两样**：任务 id（`/api/pow` 回执凭据）与 proof 集（扫描
+/// 要比的目标 + digest 的槽数）。任务窗 `x`/`y` 不在此留存——它在 `pow_task()` 里
+/// 被解析并校验（可解析、`x < y`、且恒等于该项的 `current_hex`/`end_hex`），校验
+/// 完即丢弃：调用方扫的就是 grant 项那对边界，留着等于把同一个值存两遍。
+/// （曾有一臂"窗口比声明 capability 宽"的警告读 `t.x`，a017649 删掉后这两个字段
+/// 就成了纯死重量——`cargo check --all-targets` 看不见，因为单测还在读。）
 #[derive(Debug, Clone)]
 pub(crate) struct PowTask {
     pub task_id: u64,
-    pub x: [u8; 32],
-    pub y: [u8; 32],
     pub proof_hash160s: Vec<[u8; 20]>,
 }
 
@@ -255,10 +260,10 @@ impl ClaimedChunk {
             ));
             return None;
         }
+        // `x`/`y` 到此使命已尽：上面两道校验（== grant 项边界、`x < y`）是它们
+        // 存在的全部理由，窗口本身由调用方从 `current_hex`/`end_hex` 取。
         Some(PowTask {
             task_id: raw.task_id,
-            x,
-            y,
             proof_hash160s,
         })
     }
@@ -2213,9 +2218,10 @@ mod tests {
         let resp: ClaimResponse = serde_json::from_str(&json).unwrap();
         let t = resp.chunks[0].pow_task().expect("well-formed task");
         assert_eq!(t.task_id, 42);
-        assert_eq!(t.x, be(10));
-        assert_eq!(t.y, be(1000));
         assert_eq!(t.proof_hash160s, vec![h160(0xAA), h160(0xBB)]);
+        // 窗口本身不再进 `PowTask`，但"任务窗 == grant 项边界"这道校验仍在
+        // `pow_task()` 里 —— 由 `malformed_tasks_fall_back_to_none` 的
+        // "window mismatch" 与 `degenerate_task_window_is_rejected` 锁着。
     }
 
     #[test]
