@@ -30,11 +30,11 @@
                     └─────────────────────────────────────────────┘
 ```
 
-关键设计（`remote.rs:1-27`）：
+关键设计（`src/remote.rs` 模块头注释）：
 
 - **hub 是唯一写者**。worker 从不打开本地 `.db`，断点位置全部通过 HTTP 上报。
 - **lease 以 chunk id 区分**，不以 worker 区分——所有线程共享同一个 `worker_id`
-  （`remote.rs:1188-1192` 的 `remote_worker` 文档注释）。
+  （`remote.rs::remote_worker` 的文档注释）。
 - **崩溃恢复是 hub 的职责**：worker 死了/断网 → 心跳停止 → hub 超时回收 lease，
   chunk 回退 pending 并**保留最后上报的位置**。
 - **Phase 2 pow**：已登记 client 的 claim 可能带 `task`（N 个 proof hash160），
@@ -48,8 +48,8 @@
 
 | 常量/配置 | 值 | 作用 | 位置 |
 |---|---|---|---|
-| `HEARTBEAT_INTERVAL` | 30s | 扫描期间的心跳节流 | `remote.rs:49` |
-| `CLAIM_IDLE` | 2s | 无 chunk 可领时的重试间隔 | `remote.rs:53` |
+| `HEARTBEAT_INTERVAL` | 30s | 扫描期间的心跳节流 | `remote.rs::HEARTBEAT_INTERVAL` |
+| `CLAIM_IDLE` | 2s | 无 chunk 可领时的重试间隔 | `remote.rs::CLAIM_IDLE` |
 | `rotate_keys` (CPU) | 默认 2²⁷ = 134,217,728 keys | CPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `cpu_rotate_keys`；`0` 禁用） |
 | `gpu_rotate_keys` (GPU) | 默认 2³¹ = 2,147,483,648 keys | GPU 每扫满即 park + 重领；同时作为 claim `capability` 声明给 hub | `main.rs` `resolve_rotate`（CLI/配置 `gpu_rotate_keys`；`0` 禁用） |
 | `check_compressed_pk` / `check_uncompressed_pk` | 默认均 true | 决定 worker 把压缩（33B）/非压缩（65B）公钥的 hash160 与目标比较；被禁用的序列化在 CPU/GPU 热路径上不再计算。**不改变 hub 协议**——chunk 照常领取扫描，只是命中判定只看启用的序列化。**例外**：pow 窗口上压缩哈希必须算（proof 定义在压缩公钥上），CPU 侧只在有 proof 时多算一次、GPU 侧经 `configure_chunk` 强制开，真实 target 的开关语义由 CPU 重验块把关 | `[btc]` 配置段 → `BtcCheck`，贯穿 CPU `scan_chunk`/`worker_loop` 与 GPU shader/kernel |
@@ -123,9 +123,9 @@ hub 把活跃/keys 回流进其 `clients` 行（auth 轨记账）；自由文本
   client 已登记时出现；缺省 = 无 pow 语义，一切照旧），形状见 §8。
 - **heartbeat 成功**返回 `{ok, solved}`——`solved=true` 让正在扫 chunk 的 worker
   **提前放弃本 claim**（下轮 claim 退出），不必等一轮扫完。
-- **404**：chunk 无 lease（`_require_owner`，`puzzle.py:166`）→ lease 已丢。
-- **409**：chunk 被别的 worker 持有（`puzzle.py:168`）→ lease 已丢；`/api/win` 的
-  409 表示 puzzle 已被其他 worker 先标记 solved。
+- **404**：chunk 无 lease（`puzzle.py::PuzzleService._require_owner`）→ lease 已丢。
+- **409**：chunk 被别的 worker 持有（同上，`LeaseError(409, …)` 分支）→ lease 已丢；
+  `/api/win` 的 409 表示 puzzle 已被其他 worker 先标记 solved。
 - 心跳 `keys`/`rate` 是瞬态指标，hub 只存内存、不落库（`metrics.py`）。
 - solved 落盘：`POST /api/win` 后 hub 在 `backend/data/` 写
   `{puzzle_number}_{timestamp}.txt`（worker_id/chunk_id，**不含私钥**）；文件存在即
@@ -201,10 +201,10 @@ worker                                   hub (lan-hub)
 
 | 方向 | 心跳/release 携带字段 | 含义 |
 |---|---|---|
-| Forward | `current_hex` | 下一个待扫 key（`remote.rs:726`） |
-| Reverse | `end_hex` | 收缩后的独占上界 = `sk + 1`，`current` 保持 start 不动（`remote.rs:727`） |
+| Forward | `current_hex` | 下一个待扫 key（`remote.rs::ChunkUpdateBody::current_hex`） |
+| Reverse | `end_hex` | 收缩后的独占上界 = `sk + 1`，`current` 保持 start 不动（`remote.rs::ChunkUpdateBody::end_hex`） |
 
-hub 侧 `puzzle.py:184-200`：`current_hex`/`end_hex` 任一非空即落库对应列，然后
+hub 侧 `puzzle.py::PuzzleService.heartbeat`：`current_hex`/`end_hex` 任一非空即落库对应列，然后
 `heartbeat_at` 刷新为当前时间。旧客户端不传 `end_hex` 行为完全不变（向后兼容）。
 
 ---
@@ -219,11 +219,11 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
  └─► heartbeat 每次重置 30s 定时器 ─► 最后心跳 +120s 处判定过期，最多再 15s 内回收
 ```
 
-- **心跳 30s ≪ 回收 120s = 4 倍裕量**（`remote.rs:11` 注释同样强调）。
-- Hub 的 `reclaim_loop` 每 **15s** 扫一次 `worker_leases`（`main.py:26-35`），按
-  `heartbeat_at < now - 120s` 判过期（`puzzle.py:338-340`）。因此实际回收发生在
+- **心跳 30s ≪ 回收 120s = 4 倍裕量**（`remote.rs` 常量区注释同样强调）。
+- Hub 的 `reclaim_loop`（`main.py::reclaim_loop`）每 **15s** 扫一次 `worker_leases`，按
+  `heartbeat_at < now - 120s` 判过期（`puzzle.py::PuzzleService.reclaim`）。因此实际回收发生在
   「最后一次心跳后 120s ~ 135s」之间的某一刻，而非精确 120s。
-- 回收动作（`puzzle.py:342-347`）：running → pending（保留 `current`）+ 删除 lease。
+- 回收动作（同一个 `PuzzleService.reclaim`）：running → pending（保留 `current`）+ 删除 lease。
   下一次 claim 会从该 `current` 继续。
 
 ### 5.1 崩溃恢复（双向兜底）
@@ -232,7 +232,7 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 |---|---|
 | worker 死了 / 断网 | 心跳停止 → hub 120s 后回收，chunk 回退 pending，保留最后上报位置 |
 | worker 活着但 hub 不可达 | 心跳请求超时（15s）→ 只重排节流，不丢 lease；hub 恢复后继续心跳 |
-| hub 重启 | 启动即 `reclaim(conn, 0)`：所有 running 回退 pending（`main.py:54-57`） |
+| hub 重启 | `lifespan` 启动回收：`PuzzleService.reclaim(conn, config.RECLAIM_TIMEOUT)`——只回收**真正过期**（`> RECLAIM_TIMEOUT` 没心跳）的 lease、孤儿与空 pending（`main.py::lifespan`）。**刻意不用 `reclaim(conn, 0)` 全清**：那会把快速重启期间还活着的 worker lease 误杀，慢板子下次心跳直接 409；真崩了的 worker 也会在 timeout 内自然过期，等价崩溃恢复，只是从"立即"变成"≤ timeout" |
 | worker 心跳/release 收到 404/409 | 视为 lease 已丢，放弃本 chunk 重新 claim，绝不崩溃 |
 
 ---
@@ -259,12 +259,12 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 ## 7. 易混淆点
 
 1. **CLI 的 `--heartbeat` ≠ 心跳间隔**。`-H/--heartbeat`（默认 10.0）只控制
-   终端状态行的刷新频率（`args.rs:32-36` 注释明确说明）；真正的 hub lease 心跳
+   终端状态行的刷新频率（`args.rs` 中该选项的帮助文本明确说明）；真正的 hub lease 心跳
    是硬编码的 30s，不受该参数影响。
-2. **status ticker 不参与 lease**。`remote.rs:530` 的 `ticker` 线程每
+2. **status ticker 不参与 lease**。`remote.rs::ticker` 线程每
    `heartbeat_secs` 查一次 `/api/status` 重绘进度行，与 lease 维护完全无关。
 3. **`claim` 失败 ≠ lease 丢失**。transport 错误（hub 慢/挂）只 sleep 2s 重试；
-   只有 404/409 才代表该 chunk 的 lease 已不归我们（`is_lease_lost`，`remote.rs:113`）。
+   只有 404/409 才代表该 chunk 的 lease 已不归我们（`remote.rs::is_lease_lost`）。
 4. **`win` ≠ `done`**。`/api/win` 只在命中时调用：除了 done 的最终化，还会让 hub 落
    win 记录文件并置 puzzle solved，从而广播停止其它 worker。扫完一整个区间（没命中）
    仍走 `done`。
@@ -296,7 +296,8 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 ### 8.1 任务形状
 
 hub 开 `[pow]` 且本 client **已登记**（identity.json 在 → auth 轨）时，claim 的 grant
-项多一个 `task` 对象（`puzzle.py` 的 `task_info`）：
+项多一个 `task` 对象（`puzzle.py::PuzzleService.claim` 内组装，值来自
+`powproof.build_task`）：
 
 ```json
 {"id": 12, "current_hex": "…", "end_hex": "…",
@@ -393,23 +394,23 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 
 | 逻辑 | Rust | hub |
 |---|---|---|
-| 心跳常量 / 旋转预算（config 解析传入） | `remote.rs:56-63`；`main.rs` `resolve_rotate` | `config.py:67-71` |
-| HTTP 封装与超时 | `HubClient`（`remote.rs:300-580`） | `routes.py` |
-| 启动 client-auth（条件门禁）+ 解信封 + TOFU | `remote.rs:1029` `maybe_authenticate`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
-| 业务 v2 静态信道信封（包/解） | `remote.rs:373/392` `sealed_body`/`unseal_response`；`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` | `routes.py` 前 `transport.py`/`wire.py`（透明中间件） |
+| 心跳常量 / 旋转预算（config 解析传入） | `remote.rs::HEARTBEAT_INTERVAL`/`CLAIM_IDLE`；`main.rs::resolve_rotate` | `config.py::RECLAIM_TIMEOUT`/`RECLAIM_INTERVAL` |
+| HTTP 封装与超时 | `remote.rs::HubClient`（impl 块） | `routes.py` |
+| 启动 client-auth（条件门禁）+ 解信封 + TOFU | `remote.rs::maybe_authenticate`；`clientauth.rs` | `routes.py::auth`、`envelope.py` |
+| 业务 v2 静态信道信封（包/解） | `HubClient::sealed_body`/`unseal_response`；`clientauth.rs::static_key/encrypt_to_peer/decrypt_from_peer` | `routes.py` 前 `transport.py`/`wire.py`（透明中间件） |
 | identity.json 自检 | `clientauth.rs::load_identity` | —（hub 侧由 `nostr.py` 生成） |
 | hub.json TOFU（hub 身份跨启动校验） | `clientauth.rs::remember_hub` | — |
-| 启动 connect + hash160 校验 | `remote.rs:954` `connect` | `routes.py` |
-| **pow 任务解析/校验** | `remote.rs:163-223` `ClaimedChunk::pow_task` | `puzzle.py:348-388`（`task_info`） |
-| **pow digest（升序 32B-BE → SHA256）** | `remote.rs:558` `hashed_proof_key` | `powproof.py::expected_digest_for` |
-| **pow 收敛（CPU/GPU 共用）** | `remote.rs:591` `converge_pow`；`HubClient::pow` `remote.rs:513` | `routes.py::pow_submit`、`puzzle.py::verify_pow` |
-| **proof 归类（压缩公钥 hash160）** | `puzzle.rs:2385` `classify_proof`；`proofs`/`found_proofs` 见 `ScanChunkOptions` `puzzle.rs:1107`、`ProofHit` `puzzle.rs:1149` | `powproof.py::compressed_pubkey/hash160` |
-| **GPU 候选表（槽 0 = target，1..=N = proof）** | `gpu/convert.rs::chunk_candidates`；`configure_chunk`（`puzzle.rs:1698` trait + 两 scanner 的 `set_candidates`） | — |
-| CPU worker 主循环 | `remote.rs:1179-1481` | — |
-| GPU worker 主循环 | `remote.rs:1622-2010` | — |
-| status ticker | `remote.rs:1093` | — |
-| lease 归属校验（404/409） | `remote.rs:229` `is_lease_lost` | `puzzle.py:160-168` |
-| 心跳落库 + lease 刷新 | — | `puzzle.py:443-479`（有 active task → 只续租） |
-| done / win / release / pow | `remote.rs:462/473/482/513` | `puzzle.py:605`（release 弃整窗）、`win.py`、`puzzle.py:659`（verify_pow） |
-| solved 广播（claim/heartbeat/status 响应） | `remote.rs` 三处停止点 | `routes.py`、`puzzle.py:solved()` |
-| 回收循环与孤儿清理 | — | `main.py:26-40`、`puzzle.py:326-379` |
+| 启动 connect + hash160 校验 | `remote.rs::connect` | `routes.py::status` |
+| **pow 任务解析/校验** | `ClaimedChunk::pow_task` | `PuzzleService.claim`（组装 `task`）+ `powproof.build_task` |
+| **pow digest（升序 32B-BE → SHA256）** | `remote.rs::hashed_proof_key` | `powproof.py::expected_digest_for` |
+| **pow 收敛（CPU/GPU 共用）** | `remote.rs::converge_pow`；`HubClient::pow` | `routes.py::pow_submit`、`PuzzleService.verify_pow` |
+| **proof 归类（压缩公钥 hash160）** | `puzzle.rs::classify_proof`；`proofs`/`found_proofs` 见 `ScanChunkOptions`、`ProofHit` | `powproof.py::compressed_pubkey/hash160` |
+| **GPU 候选表（槽 0 = target，1..=N = proof）** | `gpu/convert.rs::chunk_candidates`；`configure_chunk`（`puzzle.rs` trait 方法 + 两 scanner 的 `set_candidates`） | — |
+| CPU worker 主循环 | `remote.rs::remote_worker` | — |
+| GPU worker 主循环 | `remote.rs::remote_gpu_worker` | — |
+| status ticker | `remote.rs::ticker` | — |
+| lease 归属校验（404/409） | `remote.rs::is_lease_lost` | `PuzzleService._require_owner` |
+| 心跳落库 + lease 刷新 | — | `PuzzleService.heartbeat`（有 active task → 只续租） |
+| done / win / release / pow | `HubClient::done`/`win`/`release`/`pow` | `PuzzleService.release`（弃整窗）、`win.py::record`、`PuzzleService.verify_pow` |
+| solved 广播（claim/heartbeat/status 响应） | `remote.rs` 三处停止点 | `routes.py`、`PuzzleService.solved` |
+| 回收循环与孤儿清理 | — | `main.py::reclaim_loop`、`PuzzleService.reclaim` |

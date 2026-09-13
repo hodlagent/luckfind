@@ -30,10 +30,10 @@ compressed (33B) and uncompressed (65B) — because either can hash to the targe
 
 Entry: `src/main.rs` → `workers::run` → `worker_loop` (`src/workers.rs`).
 
-**CPU worker** (`src/workers.rs:202`):
+**CPU worker** (`worker_loop`, `src/workers.rs`):
 
 1. **Seed.** `pick_random_puzzle` selects a puzzle weighted by range size
-   (`P ∝ 2^bit`, `src/puzzles.rs:60`); `generate_key_in_range` produces a
+   (`P ∝ 2^bit`, `src/puzzles.rs::pick_random_puzzle`); `generate_key_in_range` produces a
    random key uniformly inside that puzzle's `[2^n, 2^(n+1))` range.  One full
    scalar multiply `pk = sk·G` is performed up front.
 2. **Check.** Serialise compressed + uncompressed, `hash160` both, test
@@ -62,24 +62,24 @@ Deterministic scan of a single puzzle from a worklist file (`.json` one-time
 import → `.db` SQLite runtime format).  Entry: `src/main.rs` → `puzzle::run`
 (`src/puzzle.rs`).
 
-**CPU worker** (`puzzle_worker`, `src/puzzle.rs:1027`):
+**CPU worker** (`puzzle_worker`, `src/puzzle.rs`):
 
 - Claims a random *pending* sub-range chunk (splitting wide ones; the worklist
   caps at 2^24 = 4096×4096 chunks), then scans `current → end` sequentially with
   `key += 1` (each claim also flips a coin for forward/reverse direction).
 - **Single-target comparison:** `h160_eq(&pk_c, target_h160) || h160_eq(&pk_u, target_h160)`
-  (`src/puzzle.rs:1139`) — both pubkey serialisations against the worklist's
+  (inside `puzzle_worker`) — both pubkey serialisations against the worklist's
   one `target_h160`.
 - Wide chunks are parked every `ROTATION_BUDGET` keys (CPU `2^27`, GPU `2^31`)
   and a fresh chunk is claimed, so progress is always resumable.  SQLite holds
   the per-chunk scan position; Ctrl+C writes it back and exits, and the next
   run resumes exactly there.
 
-**GPU worker** (`puzzle_gpu_scan_loop`, `src/puzzle.rs:1552`):
+**GPU worker** (`puzzle_gpu_scan_loop`, `src/puzzle.rs`):
 
 - Dense tiling: `stride = NUM_GPU_THREADS`, a single target candidate, one
   dispatch covers `N·steps_per_call` keys.  Matches are CPU-verified
-  (`btc::hash160 == target_h160`, `src/puzzle.rs:1670`) before being recorded.
+  (`btc::hash160 == target_h160`, inside `puzzle_gpu_scan_loop`) before being recorded.
 
 ### Hit handling (both modes)
 
@@ -101,7 +101,7 @@ The 77 unsolved puzzles ship compiled in as a JSON literal in
 target hash160 and key range `[2^n, 2^(n+1))`; puzzles run from #71 (9 bytes)
 to #160 (20 bytes), covering `[2^70, 2^160)`.  Key generation is
 range-constrained to this space (`PuzzleRange.top_byte_idx` /
-`start_top` / `end_top`, `src/puzzles.rs:22`), a ~2^96× reduction vs the full
+`start_top` / `end_top`, `src/puzzles.rs::PuzzleRange`), a ~2^96× reduction vs the full
 256-bit space.
 
 When a puzzle is solved it is dropped from the embedded set (both the literal
