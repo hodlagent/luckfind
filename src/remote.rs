@@ -512,17 +512,14 @@ impl HubClient {
     /// `/api/win` 的明文请求体。**私钥只在 auth 轨带**：这里的判据 `self.identity`
     /// 就是 `sealed_body` 决定"包不包 v2 信封"的同一个开关——两处若判得不一样，
     /// 匿名明文轨就会把私钥裸传给 hub。
-    fn win_body(
-        &self,
-        chunk_id: u32,
-        worker_id: &str,
-        private_key: Option<&str>,
-    ) -> serde_json::Value {
+    ///
+    /// `private_key` 是**必填**（不是 `Option`）：只有命中才会调 win，而命中必有私钥。
+    /// 做成可选就等于给"忘了传"留了条编译得过、测试全绿、而 hub 永远收到 `no-key`
+    /// 的静默通道。是否**上行**由上面的开关决定，与"有没有"是两回事。
+    fn win_body(&self, chunk_id: u32, worker_id: &str, private_key: &str) -> serde_json::Value {
         let mut body = json!({ "worker_id": worker_id, "chunk_id": chunk_id });
         if self.identity.is_some() {
-            if let Some(k) = private_key {
-                body["private_key"] = json!(k);
-            }
+            body["private_key"] = json!(private_key);
         }
         body
     }
@@ -536,12 +533,7 @@ impl HubClient {
     /// `[btc] vault`（hub `remote-api.md` §22）。匿名昵称轨的 body 是**明文 HTTP**，
     /// 私钥绝不明文过 LAN，该轨一律省略此字段（hub 记 `no-key`），私钥只留本地
     /// `aman_*.txt`，事后由运维走 `python3 -m app.sweep --key` 手工补扫。
-    fn win(
-        &self,
-        chunk_id: u32,
-        worker_id: &str,
-        private_key: Option<&str>,
-    ) -> Result<(), ureq::Error> {
+    fn win(&self, chunk_id: u32, worker_id: &str, private_key: &str) -> Result<(), ureq::Error> {
         let body = self.win_body(chunk_id, worker_id, private_key);
         let body = self.sealed_body(&body);
         let _ = self
@@ -1464,7 +1456,7 @@ fn remote_worker(
             // auth 轨随请求带上私钥（信封密封）→ hub 立刻自动扫币；匿名轨省略，
             // 私钥只留本地 `aman_*.txt`（见 `HubClient::win`）。
             let sk_hex = hex::encode(outcome.sk);
-            if let Err(e) = client.win(chunk_id, worker_id, Some(&sk_hex)) {
+            if let Err(e) = client.win(chunk_id, worker_id, &sk_hex) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
                         "[remote] win failed ({e}) — hub will reclaim the chunk"
@@ -1832,10 +1824,12 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
 
         let mut current = start_bytes; // next key NOT yet covered
         let mut scanned_keys: u64 = 0; // keys covered this claim (rotation)
-        let mut hit = false; // CPU-verified match → this chunk is the winner
-        // 命中私钥，供收尾的 `/api/win` 上报（auth 轨才发，见 `HubClient::win`）。
-        // `verified` 的作用域只到匹配块内，故在这里单独带出来。
-        let mut hit_key: Option<[u8; 32]> = None;
+        // CPU-verified match → this chunk is the winner。**命中与它的私钥是同一个值**：
+        // 收尾的 `/api/win` 必须带上它（auth 轨才发，见 `HubClient::win`），拆成
+        // `hit: bool` + `hit_key: Option` 两个变量就多出一个"命中了但 key 忘了赋值"
+        // 的隐形失败模式，而那条路径上 hub 永远收不到私钥、自动扫币静默失效。
+        // `verified` 的作用域只到匹配块内，故在这里把 key 带出来。
+        let mut hit: Option<[u8; 32]> = None;
         let mut lease_lost = false;
         // 心跳报告 hub 已 solved（别的 worker 命中）→ 提前退出，不 park。
         let mut solved = false;
@@ -1969,8 +1963,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                             out
                         };
                         if let Some(first) = verified.first() {
-                            hit = true;
-                            hit_key = Some(first.private_key);
+                            hit = Some(first.private_key);
                             // 命中即停：首个命中的 worker 立即打印（含私钥）并通知
                             // 所有 worker 停止。
                             if hit_flag
@@ -2031,13 +2024,12 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
             continue;
         }
 
-        if hit {
+        if let Some(key) = hit {
             // Win: report the hit to the hub (`/api/win` — hub 落 win 记录 + 置
             // solved), then stop (the scan already set stop_flag + hit_flag).
             // auth 轨随请求带上私钥（信封密封）→ hub 立刻自动扫币；匿名轨省略
             // （见 `HubClient::win`）。多命中时只报首个——与 `[HIT]` 打印同源。
-            let sk_hex = hit_key.map(hex::encode);
-            if let Err(e) = client.win(chunk_id, worker_id, sk_hex.as_deref()) {
+            if let Err(e) = client.win(chunk_id, worker_id, &hex::encode(key)) {
                 if !is_lease_lost(&e) {
                     term_line(&format!(
                         "[remote] win failed ({e}) — hub will reclaim the chunk"
@@ -2391,13 +2383,16 @@ mod tests {
     /// 命中私钥（64 位小写 hex）只允许出现在**会被密封**的 win 请求体里。hub 收到
     /// 非空 `private_key` 会另存 key 文件并触发自动扫币（`remote-api.md` §22），
     /// 而匿名轨的 body 是明文 HTTP —— 这个开关就是私钥不上 LAN 明文的唯一防线。
+    ///
+    /// "调用点忘了传私钥"不由本测试兜底：`win`/`win_body` 的参数是 `&str` 而非
+    /// `Option<&str>`，那个失败模式在编译期就过不去（见 `win_body` 的注释）。
     #[test]
     fn win_body_carries_private_key_only_on_auth_track() {
         let mut client = HubClient::new("http://127.0.0.1:1");
         let key = "11".repeat(32);
 
         // 匿名昵称轨（无 identity）：body 明文 → 绝不带私钥，hub 记 `no-key`。
-        let anon = client.win_body(7, "mac-mini", Some(&key));
+        let anon = client.win_body(7, "mac-mini", &key);
         assert_eq!(anon["worker_id"], "mac-mini");
         assert_eq!(anon["chunk_id"], 7);
         assert!(
@@ -2411,15 +2406,9 @@ mod tests {
                 .to_string(),
             secret: "22".repeat(32),
         });
-        let sealed = client.win_body(7, "mac-mini", Some(&key));
+        let sealed = client.win_body(7, "mac-mini", &key);
         assert_eq!(sealed["worker_id"], "mac-mini");
         assert_eq!(sealed["chunk_id"], 7);
         assert_eq!(sealed["private_key"], key);
-
-        // 无命中私钥（调用点传 None）→ 字段缺省，hub 照样走 no-key 路径。
-        assert!(client
-            .win_body(7, "mac-mini", None)
-            .get("private_key")
-            .is_none());
     }
 }
