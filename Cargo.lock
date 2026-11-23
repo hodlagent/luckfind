@@ -1269,6 +1269,7 @@ dependencies = [
  "cust_derive",
  "hex",
  "lazy_static",
+ "libc",
  "num-bigint",
  "num-integer",
  "num-traits",

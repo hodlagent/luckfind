@@ -386,6 +386,11 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 > ⚠️ 姊妹实现 `vanity_worker_bpi.py::compute_proof_hash` 是**按池端数组顺序拼 64-hex
 > ASCII**——另一套契约，照抄必然 400。上述向量就是那道护栏。
 
+> **响应也要解封**：auth 轨的 2xx body 和其他业务端点一样是 v2 信封
+> （`{"enc": …}`）。必须走 `HubClient::unseal_response` 再读 `keys_scanned` /
+> `solved`；直接明文反序列化会在"全字段 default"的 `PowResp` 上**成功**解析，
+> 静默得到 0 / false（表现为状态行 `vkeys=0`、收敛日志永远 verified 0 keys）。
+
 分支处理：
 
 | 情形 | 动作 |

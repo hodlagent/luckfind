@@ -95,6 +95,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cuda_compiled)'] }
 [build-dependencies]
 # No external build deps -- build.rs uses std::process::Command to invoke nvcc
 
+# 终端宽度（ioctl TIOCGWINSZ）：live 区块必须保证每个 slot 只占一个物理行，
+# 否则相对上移擦除会错位（状态行会不断插入新行）。仅 Unix 需要；Windows 走
+# COLUMNS/默认值兜底。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # 针对 macOS 开启 asm 特性
 [target.'cfg(target_os = "macos")'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }

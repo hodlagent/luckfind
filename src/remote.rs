@@ -115,6 +115,21 @@ struct HubWorker {
 struct HubWorkerChunk {
     #[serde(default)]
     progress_pct: f64,
+    /// pow 窗口的 UI 进度（hub `remote-api.md` §21.5）。旧 hub 无此键 → None，
+    /// 状态行退回位置进度。
+    #[serde(default)]
+    pow: Option<HubChunkPow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubChunkPow {
+    #[serde(default)]
+    total: u32,
+    /// 已自报命中的 proof 数。状态行目前只用 `total > 0` 判断"这是 pow 窗口"
+    /// （k/N 就在 worker live 行里），字段保留供单测校验线上形状。
+    #[serde(default)]
+    #[allow(dead_code)]
+    done: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,7 +643,12 @@ impl HubClient {
             .agent
             .post(&self.url("/api/pow"))
             .send_json(body)?;
-        Ok(resp.into_body().read_json::<PowResp>().unwrap_or_default())
+        // 与 claim/heartbeat 同款：auth 轨的 2xx 响应体是 v2 信封，必须解封后
+        // 才能读到 `keys_scanned` / `solved`。直接 `read_json::<PowResp>()` 会把
+        // `{"enc": ...}` 按"全字段 default"解析成功，静默得到 0/false——表现为
+        // 收敛日志永远 `verified 0 keys`、vkeys 不增长。
+        let value = self.unseal_response(resp)?;
+        Ok(serde_json::from_value::<PowResp>(value).unwrap_or_default())
     }
 }
 
@@ -1279,6 +1299,37 @@ fn maybe_authenticate(
     Some(own_pubkey)
 }
 
+/// 状态行用的紧凑大数：`5_059_143_000 → 5.1G`、`11_972_742 → 12M`、`0 → 0`。
+///
+/// 状态行是**单行原地重绘**的：超过终端宽度就会折行，而 live 区块的擦除是按
+/// 逻辑行数相对上移的（`puzzle.rs::erase_region`），一行折成两行就会把后续重绘
+/// 全部错位。所以这里不追精确（最终报告用 `fmt_comma`），只要压到单行放得下。
+fn fmt_short(n: u64) -> String {
+    const SCALES: [(u64, char); 4] = [
+        (1_000_000_000_000, 'T'),
+        (1_000_000_000, 'G'),
+        (1_000_000, 'M'),
+        (1_000, 'K'),
+    ];
+    for (scale, suffix) in SCALES {
+        if n >= scale {
+            let mut whole = n / scale;
+            // 四舍五入到一位小数；9.96 → 10.0 时进位到整十。
+            let mut tenth = ((n % scale) * 10 + scale / 2) / scale;
+            if tenth >= 10 {
+                whole += 1;
+                tenth = 0;
+            }
+            return if tenth == 0 {
+                format!("{whole}{suffix}")
+            } else {
+                format!("{whole}.{tenth}{suffix}")
+            };
+        }
+    }
+    n.to_string()
+}
+
 /// 状态行尾部的 pow 段：让操作者一眼看出 pow 是真在跑、还是根本没参与。
 ///
 /// - 本进程领过 pow 任务 → `pow=<verified>✓/<attempts> vkeys=<keys> proofs=<n>`。
@@ -1294,7 +1345,7 @@ fn pow_status_segment(progress: &Progress, hub_pow_enabled: bool, auth: bool) ->
             "  pow={}✓/{} vkeys={} proofs={}",
             progress.pow_verified.load(Ordering::Relaxed),
             attempts,
-            fmt_comma(progress.verified_keys.load(Ordering::Relaxed)),
+            fmt_short(progress.verified_keys.load(Ordering::Relaxed)),
             progress.proofs_found.load(Ordering::Relaxed),
         );
     }
@@ -1367,24 +1418,37 @@ fn ticker(
                     .find(|w| w.worker_id == worker_id)
                     .map(|w| {
                         if w.chunks.is_empty() {
-                            format!("{} chunks", w.chunk_count)
-                        } else {
-                            let avg: f64 =
-                                w.chunks.iter().map(|c| c.progress_pct).sum::<f64>()
-                                    / w.chunks.len() as f64;
-                            format!("{} chunks avg {avg:.1}%", w.chunk_count)
+                            return format!("{} chunks", w.chunk_count);
                         }
+                        // pow 窗口的位置进度被 hub 冻结、恒为 0——avg 没有信息量，
+                        // 而每个 worker 的 proof k/N 就在下方 live 行里，状态行不再
+                        // 重复占宽（单行放不下会折行，进而破坏原地重绘）。
+                        if w
+                            .chunks
+                            .iter()
+                            .any(|c| c.pow.as_ref().is_some_and(|p| p.total > 0))
+                        {
+                            return String::new();
+                        }
+                        let avg: f64 =
+                            w.chunks.iter().map(|c| c.progress_pct).sum::<f64>()
+                                / w.chunks.len() as f64;
+                        format!("{} chunks avg {avg:.1}%", w.chunk_count)
                     })
                     .unwrap_or_else(|| "no lease".to_string());
+                let mine_part = if mine.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {mine} ")
+                };
                 format!(
-                    "[remote] pend={} running={} done={} ({:.1}%) {}  keys={} rate={}/s{}",
+                    "[remote] pend={} run={} done={} ({:.1}%){mine_part} keys={} {}/s{}",
                     sum.pending,
                     sum.running,
                     sum.finished,
                     done_pct,
-                    mine,
-                    fmt_comma(total),
-                    fmt_comma(rate.round() as u64),
+                    fmt_short(total),
+                    fmt_short(rate.round() as u64),
                     pow_status_segment(progress, s.pow_enabled, client.identity.is_some()),
                 )
             }
@@ -2593,8 +2657,39 @@ mod tests {
         p.note_proof();
         assert_eq!(
             pow_status_segment(&p, true, true),
-            "  pow=1✓/2 vkeys=1,000 proofs=1"
+            "  pow=1✓/2 vkeys=1K proofs=1"
         );
+    }
+
+    /// 状态行大数压缩：够短才能单行放下（折行会让 live 区块的擦除错位）。
+    #[test]
+    fn fmt_short_compacts_with_rounding() {
+        assert_eq!(fmt_short(0), "0");
+        assert_eq!(fmt_short(999), "999");
+        assert_eq!(fmt_short(1_000), "1K");
+        assert_eq!(fmt_short(1_234), "1.2K");
+        assert_eq!(fmt_short(5_059_143_000), "5.1G");
+        assert_eq!(fmt_short(11_972_742), "12M");
+        assert_eq!(fmt_short(9_960_000_000), "10G"); // 一位小数进位
+        assert_eq!(fmt_short(1_234_567_890_123), "1.2T");
+    }
+
+    /// 旧 hub 的 chunk 没有 `pow` 键：必须解析成 None，状态行退回位置进度；
+    /// 新 hub 的 `{task_id,total,done}` 能读出来（`total` 供状态行判断 pow 窗口）。
+    #[test]
+    fn worker_chunk_pow_is_optional() {
+        let old: HubWorkerChunk =
+            serde_json::from_value(json!({"progress_pct": 42.5})).unwrap();
+        assert!(old.pow.is_none());
+        assert_eq!(old.progress_pct, 42.5);
+
+        let new: HubWorkerChunk = serde_json::from_value(json!({
+            "progress_pct": 0.0,
+            "pow": {"task_id": 42, "total": 6, "done": 3},
+        }))
+        .unwrap();
+        let pow = new.pow.expect("pow 键");
+        assert_eq!((pow.total, pow.done), (6, 3));
     }
 
     /// `pow_enabled` 是 hub 新增的顶层键：旧 hub 不返回 → false（不能因此让

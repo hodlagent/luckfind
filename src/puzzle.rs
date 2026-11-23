@@ -135,13 +135,63 @@ fn erase_region(g: &mut TermLine) {
     g.rows = 0;
 }
 
+/// 终端宽度（列数）。**每行必须只占一个物理行**：live 区块靠「光标相对上移
+/// `rows` 行」擦除（见 `erase_region`），只要有一行在物理上折行，`rows` 就和
+/// 真实行数对不上，下一次重绘会从错误的位置开始——表现就是状态行不断插入新行
+/// 而不是原地更新。
+#[cfg(unix)]
+fn term_cols() -> usize {
+    use std::os::fd::AsRawFd;
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ 只写 winsize；fd 是进程自己的 stderr。
+    let rc = unsafe { libc::ioctl(std::io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 {
+        ws.ws_col as usize
+    } else {
+        fallback_cols()
+    }
+}
+
+#[cfg(not(unix))]
+fn term_cols() -> usize {
+    fallback_cols()
+}
+
+fn fallback_cols() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(120)
+}
+
+/// 把一行裁到 `max` 列以内（超长以 `…` 收尾）。live 区块里的内容都是 ASCII
+/// （状态行 + `w=N`/`GPU` 标签），按 char 计即按显示列计；含中文的普通日志行
+/// 走 `term_line`，不经过这里。
+fn fit_line(line: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if line.chars().count() <= max {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out: String = line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    std::borrow::Cow::Owned(out)
+}
+
 fn draw_region(g: &mut TermLine) {
     let mut n = 0;
+    // 留一列：写满最后一列会触发终端的自动换行（wrap pending），`\n` 之后
+    // 行数就多算了一行。
+    let max = term_cols().saturating_sub(1).max(20);
     for line in &g.slots {
         if line.is_empty() {
             continue;
         }
-        eprint!("\r\x1b[K{line}\n");
+        eprint!("\r\x1b[K{}\n", fit_line(line, max));
         n += 1;
     }
     g.rows = n;
@@ -3268,6 +3318,31 @@ mod tests {
         assert!(!p.outcome.matched);
         assert!(p.proofs.is_empty());
         assert!(!p.stop_flag && !p.hit_flag && p.matches == 0);
+    }
+
+    // ── live 区块的行宽裁剪（防止状态行折行导致重绘错位）──────────────────
+
+    #[test]
+    fn fit_line_keeps_short_lines_untouched() {
+        let s = "  w=0     chunk 42 FWD  pow#7 1/3";
+        assert_eq!(fit_line(s, s.len()), s);
+        assert_eq!(fit_line(s, 200), s);
+    }
+
+    #[test]
+    fn fit_line_truncates_and_marks_long_lines() {
+        let s = "x".repeat(200);
+        let fitted = fit_line(&s, 80);
+        assert_eq!(fitted.chars().count(), 80);
+        assert!(fitted.ends_with('…'));
+        assert!(fitted.chars().all(|c| c == 'x' || c == '…'));
+    }
+
+    #[test]
+    fn fit_line_handles_tiny_budget() {
+        // max=1 → 只有一个省略号（不 panic、不越界）。
+        let fitted = fit_line("abcdef", 1);
+        assert_eq!(fitted, "…");
     }
 
     /// 边界：proof 恰在窗口两端（hub 的 sentinel_ends 恒把最左/最右 proof 钉在
