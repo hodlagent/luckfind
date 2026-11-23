@@ -87,7 +87,7 @@
 | `/api/auth` | POST | `{pubkey, name?, version?}` | **client-auth 登记**（Phase 1，明文握手）：UPSERT 该 client，返回加密信封 `auth`（见下）；hub 自身 Nostr ID 只在信封里、不进明文响应 |
 | `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；顶层 `pow_enabled` = hub 的 pow 紧急总闸（旧 hub 不返回，客户端按 false）；`meta.solved/win` 表明是否已有人命中 |
 | `/api/chunks/claim` | POST | `{worker_id, count, capability, pow?}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk。`pow: true`（仅 auth 轨）请求该窗口的 pow 任务；缺省 = 普通 claim |
-| `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
+| `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?, proofs_done?}` | 刷新 lease + 可选保存进度 + 上报速率指标；`proofs_done` 仅 pow 窗口命中 proof 时带（hub 只做 UI 显示，**不授信、不记账**；旧 hub 忽略该键） |
 | `/api/chunks/{id}/done` | POST | `{worker_id}` | 整段扫完：置 finished、删 lease |
 | `/api/win` | POST | `{worker_id, chunk_id, private_key?}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved。`private_key`（64 位小写 hex）**只在 auth 轨带**——hub 据此另存 key 文件并自动扫币（见 §7.4） |
 | `/api/chunks/{id}/release` | POST | `{worker_id, current_hex?, end_hex?}` | 旋转/放弃：保存进度、回退 pending、删 lease；**pow 窗口上 = 弃整窗**（见 §8） |
@@ -356,6 +356,10 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
   循环，无需改 shader/kernel）；**proofs 非空时强制开压缩比对**，真实 target 的
   `[btc]` 语义由 CPU 重验块按配置开关把关。命中候选一律 CPU 侧重算 hash160 后归类
   （不信任 GPU 标志，与 target 命中同一条原则）。
+- **每命中一个 proof 立刻发一次 heartbeat**（带 `proofs_done = 新命中总数`；CPU 在
+  `on_proof`、GPU 在每次 dispatch 的 proof 增量后），不等 30s 定时心跳——两个 proof
+  在窗口内可能隔得很远，顺带续租。这是**纯 UI 遥测**：hub 只按 chunk 缓存给
+  `/api/status` 显示 `k/N`，既不验证也不记账；窗口能否完成仍只由下节的 digest 决定。
 
 ### 8.3 收敛：`POST /api/pow`
 
@@ -391,7 +395,7 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 
 | 动作 | worker 行为 |
 |---|---|
-| heartbeat | 照常发（hub 忽略进度字段、只续租） |
+| heartbeat | 照常发（hub 忽略进度字段、只续租）；**每命中一个 proof 额外立刻发一次**，带 `proofs_done`（UI 进度，不授信） |
 | `done` | **不调用**（hub 恒 409）——收敛只走 `/api/pow` |
 | rotate（park） | **禁用**：`eff_rotate = None`。中途 park = 弃整窗（hub 无部分 credit、task cancelled） |
 | release | 只在放弃时调（扫不动 / 集齐不足 / 提交失败），参数传 `None, None`——整窗回 pending |

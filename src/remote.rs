@@ -514,6 +514,7 @@ impl HubClient {
         end_hex: Option<String>,
         keys: Option<u64>,
         rate: Option<f64>,
+        proofs_done: Option<u64>,
     ) -> Result<bool, ureq::Error> {
         let body = ChunkUpdateBody {
             worker_id: worker_id.to_string(),
@@ -521,6 +522,7 @@ impl HubClient {
             end_hex,
             keys,
             rate,
+            proofs_done,
         };
         let sealed = self.sealed_body(&body);
         let resp = self
@@ -590,6 +592,7 @@ impl HubClient {
             end_hex,
             keys: None,
             rate: None,
+            proofs_done: None,
         };
         let sealed = self.sealed_body(&body);
         let _ = self
@@ -768,10 +771,15 @@ fn converge_pow(
     }
 }
 
-/// `{worker_id, current_hex?, end_hex?, keys?, rate?}` — only present fields are
-/// sent (the hub's Pydantic model accepts either, `end_hex` being the new
-/// reverse-park field; `keys`/`rate` are transient metrics the hub caches in
-/// memory, and older hubs simply ignore the unknown keys).
+/// `{worker_id, current_hex?, end_hex?, keys?, rate?, proofs_done?}` — only
+/// present fields are sent (the hub's Pydantic model accepts either, `end_hex`
+/// being the new reverse-park field; `keys`/`rate` are transient metrics the hub
+/// caches in memory, and older hubs simply ignore the unknown keys).
+///
+/// `proofs_done` 只在 pow 窗口命中一个 proof 时带上：它是 **UI 遥测**（hub 只在
+/// 内存按 chunk 缓存、给 /api/status 显示 k/N），**不参与验证/记账**——窗口能否
+/// 算完成仍只由全窗 digest 的 `/api/pow` 决定。旧 hub 不认识该字段，按普通心跳
+/// 处理（续租 + keys/rate），行为不退化。
 #[derive(serde::Serialize)]
 struct ChunkUpdateBody {
     worker_id: String,
@@ -783,6 +791,8 @@ struct ChunkUpdateBody {
     keys: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proofs_done: Option<u64>,
 }
 
 // ── entry point ──────────────────────────────────────────────────────────────
@@ -1564,36 +1574,90 @@ fn remote_worker(
             worker_row(&label, chunk_id, Some(dir), task.as_ref(), 0),
         );
 
-        // proof 命中时把同一行原地更新成 `pow#<id> n/N`（不再逐条打日志）。
+        // ── shared heartbeat state (proof hits + position ticks) ──────────
+        // `on_proof` and `on_position` are handed to `scan_chunk` at the same
+        // time, so the throttle/solved/lease state lives in Cells: both
+        // callbacks borrow it immutably and update it through interior
+        // mutability.  `abort_flag` is an AtomicBool because `scan_chunk`
+        // reads it directly on its 2048-cadence boundary check.
+        //
+        // Set by the heartbeat path when the hub reports the lease lost
+        // (404/409) or that someone else solved the puzzle; scan_chunk then
+        // abandons the rest of this claim instead of scanning to the rotation
+        // budget — the hub already reverted the chunk to pending.
+        let lease_lost = std::cell::Cell::new(false);
+        let solved_flag = std::cell::Cell::new(false);
+        let last_hb = std::cell::Cell::new(Instant::now());
+        // Worker-wide cumulative keys at the last heartbeat — the delta over
+        // the heartbeat window is the rate broadcast to the hub (same source
+        // as the status line's `rate=/s`).
+        let last_keys = std::cell::Cell::new(progress.checked.load(Ordering::Relaxed));
+        let abort_flag = AtomicBool::new(false);
+
+        // One heartbeat path for both triggers.  `proofs_done` is Some only on
+        // a proof hit (pow windows): it is UI telemetry the hub caches in
+        // memory, never accounting — convergence still needs the full-window
+        // digest posted to `/api/pow`.
+        let heartbeat =
+            |cur: Option<String>, end: Option<String>, proofs_done: Option<u64>| {
+                if lease_lost.get() || solved_flag.get() {
+                    return;
+                }
+                let keys = progress.checked.load(Ordering::Relaxed);
+                let dt = last_hb.get().elapsed().as_secs_f64();
+                let rate = if dt > 0.1 {
+                    (keys - last_keys.get()) as f64 / dt
+                } else {
+                    0.0
+                };
+                match client.heartbeat(
+                    chunk_id,
+                    worker_id,
+                    cur,
+                    end,
+                    Some(keys),
+                    Some(rate),
+                    proofs_done,
+                ) {
+                    Ok(solved) => {
+                        last_hb.set(Instant::now());
+                        last_keys.set(keys);
+                        if solved {
+                            // 别的 worker 已命中：尽快放弃本 claim（下轮 claim 退出）。
+                            solved_flag.set(true);
+                            abort_flag.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        if is_lease_lost(&e) {
+                            lease_lost.set(true);
+                            abort_flag.store(true, Ordering::Relaxed);
+                        } else {
+                            // Transport error: re-arm the throttle so we retry
+                            // in HEARTBEAT_INTERVAL instead of every 2048 keys.
+                            last_hb.set(Instant::now());
+                        }
+                    }
+                }
+            };
+
+        // proof 命中时把同一行原地更新成 `pow#<id> n/N`（不再逐条打日志），并立刻
+        // 向 hub 报一次进度（不等 30s 心跳——两个 proof 可能隔得很远，顺手续租）。
         let mut on_proof = |found: usize| {
             term_slot(
                 slot,
                 worker_row(&label, chunk_id, Some(dir), task.as_ref(), found),
             );
+            if task.is_some() {
+                let done = found.min(proofs.len()) as u64;
+                heartbeat(None, None, Some(done));
+            }
         };
 
         // ── scan with the shared core ─────────────────────────────────────
-        // The on_position closure sends a heartbeat every HEARTBEAT_INTERVAL
-        // (30s — well under the hub's configurable `[reclaim] timeout_seconds`).
-        // Forward sends `current`, reverse
-        // sends `end` — the two fields carry the full resume position.  If the
-        // hub ever reports the lease lost (404/409), we stop reporting, scan
-        // to the end of the claim, and re-claim; the hub already reverted the
-        // chunk to pending at the last successful heartbeat.
-        let mut lease_lost = false;
-        // Set by the heartbeat closure when the hub reports solved (someone
-        // else found the key); we then abort the scan and skip the release.
-        let mut solved_flag = false;
-        let mut last_hb = Instant::now();
-        // Worker-wide cumulative keys at the last heartbeat — the delta over
-        // the heartbeat window is the rate broadcast to the hub (same source
-        // as the status line's `rate=/s`).
-        let mut last_keys = progress.checked.load(Ordering::Relaxed);
-        // Set by the heartbeat closure when the hub reports the lease lost
-        // (404/409); scan_chunk checks it on its next 2048-cadence stop and
-        // abandons the rest of this claim instead of scanning to the rotation
-        // budget — the hub already reverted the chunk to pending.
-        let abort_flag = AtomicBool::new(false);
+        // `on_position` still sends the periodic 30s heartbeat (lease renewal
+        // + resume position + keys/rate).  `on_proof` piggybacks on the same
+        // path for pow windows.
         let outcome = scan_chunk(ScanChunkOptions {
             target_h160,
             puzzle_number,
@@ -1614,51 +1678,22 @@ fn remote_worker(
             on_proof: Some(&mut on_proof),
             start_elapsed: start,
             on_position: &mut |pos: &ResumePosition| {
-                if lease_lost || last_hb.elapsed() < HEARTBEAT_INTERVAL {
+                if last_hb.get().elapsed() < HEARTBEAT_INTERVAL {
                     return;
                 }
                 let (cur, end) = match dir {
                     ScanDir::Forward => (Some(hex_encode_key(&pos.current)), None),
                     ScanDir::Reverse => (None, Some(hex_encode_key(&pos.end))),
                 };
-                // Broadcast the worker-wide cumulative keys and the rate over
-                // this heartbeat window; the hub keeps them in memory only.
-                let keys = progress.checked.load(Ordering::Relaxed);
-                let dt = last_hb.elapsed().as_secs_f64();
-                let rate = if dt > 0.1 {
-                    (keys - last_keys) as f64 / dt
-                } else {
-                    0.0
-                };
-                match client.heartbeat(chunk_id, worker_id, cur, end, Some(keys), Some(rate)) {
-                    Ok(solved) => {
-                        last_hb = Instant::now();
-                        last_keys = keys;
-                        if solved {
-                            // 别的 worker 已命中：尽快放弃本 claim（下轮 claim 退出）。
-                            solved_flag = true;
-                            abort_flag.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        if is_lease_lost(&e) {
-                            lease_lost = true;
-                            abort_flag.store(true, Ordering::Relaxed);
-                        } else {
-                            // Transport error: re-arm the throttle so we retry
-                            // in HEARTBEAT_INTERVAL instead of every 2048 keys.
-                            last_hb = Instant::now();
-                        }
-                    }
-                }
+                heartbeat(cur, end, None);
             },
         });
 
         // ── report the outcome ───────────────────────────────────────────
-        if lease_lost {
+        if lease_lost.get() {
             continue; // hub already parked our chunk; nothing to finalize
         }
-        if solved_flag {
+        if solved_flag.get() {
             // 别的 worker 已命中：hub 已 solved，无需 release/park——下轮 claim
             // 读到 solved 即退出。
             continue;
@@ -2129,6 +2164,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                     None,
                     Some(keys),
                     Some(rate),
+                    None,
                 ) {
                     Ok(hub_solved) => {
                         last_hb = Instant::now();
@@ -2199,10 +2235,14 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                                     // 按重算的压缩 hash160 归类、不信任 GPU 的
                                     // candidate_index（候选槽索引根本没回传）——
                                     // 与上面"target 命中也要 CPU 重验"同一条原则。
-                                    found_proofs.push(ProofHit {
-                                        index: idx,
-                                        key: ev.private_key,
-                                    });
+                                    // 同一下标只记一次（与 CPU 路径一致），否则
+                                    // 自报的 k/N 会被重复命中虚高。
+                                    if !found_proofs.iter().any(|p| p.index == idx) {
+                                        found_proofs.push(ProofHit {
+                                            index: idx,
+                                            key: ev.private_key,
+                                        });
+                                    }
                                 }
                             }
                             out
@@ -2223,6 +2263,44 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                                     found_proofs.len(),
                                 ),
                             );
+                            // pow 窗口：每命中 proof 立刻向 hub 报一次进度（不等 30s
+                            // 心跳——两个 proof 可能隔得很远，顺手续租）。纯 UI
+                            // 遥测，收敛仍靠扫完整窗后的 /api/pow digest。
+                            if task.is_some() {
+                                let keys = progress.checked.load(Ordering::Relaxed);
+                                let dt = last_hb.elapsed().as_secs_f64();
+                                let rate = if dt > 0.1 {
+                                    (keys - last_keys) as f64 / dt
+                                } else {
+                                    0.0
+                                };
+                                let done = found_proofs.len().min(proofs.len()) as u64;
+                                match client.heartbeat(
+                                    chunk_id,
+                                    worker_id,
+                                    None,
+                                    None,
+                                    Some(keys),
+                                    Some(rate),
+                                    Some(done),
+                                ) {
+                                    Ok(hub_solved) => {
+                                        last_hb = Instant::now();
+                                        last_keys = keys;
+                                        if hub_solved {
+                                            solved = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if is_lease_lost(&e) {
+                                            lease_lost = true;
+                                            break;
+                                        }
+                                        last_hb = Instant::now();
+                                    }
+                                }
+                            }
                         }
                         if let Some(first) = verified.first() {
                             hit = Some(first.private_key);
@@ -2452,6 +2530,31 @@ mod tests {
             "匿名轨不能带 pow（hub 会 400）：{anon}"
         );
         assert_eq!(anon["worker_id"], "pc-1");
+    }
+
+    /// pow proof 进度是**可选**心跳字段：命中 proof 时带 `proofs_done`，普通
+    /// 心跳/释放不带（`skip_serializing_if`）。旧 hub 不认识该键只是忽略，行为
+    /// 退化为普通心跳——所以这里锁住"只在有值时才出现"。
+    #[test]
+    fn heartbeat_body_carries_proofs_done_only_when_present() {
+        let with = ChunkUpdateBody {
+            worker_id: "w".to_string(),
+            current_hex: None,
+            end_hex: None,
+            keys: Some(10),
+            rate: Some(1.0),
+            proofs_done: Some(3),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["proofs_done"], 3);
+        assert_eq!(v["keys"], 10);
+
+        let without = ChunkUpdateBody {
+            proofs_done: None,
+            ..with
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.get("proofs_done").is_none());
     }
 
     // ── 终端可视化（pow 状态）─────────────────────────────────────────────
