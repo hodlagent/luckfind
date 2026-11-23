@@ -37,8 +37,9 @@
   （`remote.rs::remote_worker` 的文档注释）。
 - **崩溃恢复是 hub 的职责**：worker 死了/断网 → 心跳停止 → hub 超时回收 lease，
   chunk 回退 pending 并**保留最后上报的位置**。
-- **Phase 2 pow**：已登记 client 的 claim 可能带 `task`（N 个 proof hash160），
-  扫完整窗后走 `/api/pow` 交全窗 digest 收敛——见 §8。
+- **Phase 2 pow**：auth 轨的 claim 带 `pow: true` 才请求 pow 任务（hub 新契约下由
+  客户端自选），grant 项可能带 `task`（N 个 proof hash160），扫完整窗后走
+  `/api/pow` 交全窗 digest 收敛——见 §8。
 
 ---
 
@@ -84,8 +85,8 @@
 | 端点 | 方法 | 请求体（节选） | 语义 |
 |---|---|---|---|
 | `/api/auth` | POST | `{pubkey, name?, version?}` | **client-auth 登记**（Phase 1，明文握手）：UPSERT 该 client，返回加密信封 `auth`（见下）；hub 自身 Nostr ID 只在信封里、不进明文响应 |
-| `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；`meta.solved/win` 表明是否已有人命中 |
-| `/api/chunks/claim` | POST | `{worker_id, count, capability}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk |
+| `/api/status` | GET | — | puzzle meta + `pending/running/finished` 统计 + 各 worker 概况；顶层 `pow_enabled` = hub 的 pow 紧急总闸（旧 hub 不返回，客户端按 false）；`meta.solved/win` 表明是否已有人命中 |
+| `/api/chunks/claim` | POST | `{worker_id, count, capability, pow?}` | 领取 `count` 个 pending chunk；`capability` 声明"扫多少 keys 后 reclaim"，hub 据此优先分配宽度匹配的 chunk。`pow: true`（仅 auth 轨）请求该窗口的 pow 任务；缺省 = 普通 claim |
 | `/api/chunks/{id}/heartbeat` | POST | `{worker_id, current_hex?, end_hex?, keys?, rate?}` | 刷新 lease + 可选保存进度 + 上报速率指标 |
 | `/api/chunks/{id}/done` | POST | `{worker_id}` | 整段扫完：置 finished、删 lease |
 | `/api/win` | POST | `{worker_id, chunk_id, private_key?}` | **命中上报**（取代 done）：最终化 chunk + hub 落 win 记录、置 puzzle solved。`private_key`（64 位小写 hex）**只在 auth 轨带**——hub 据此另存 key 文件并自动扫币（见 §7.4） |
@@ -130,8 +131,9 @@ hub 把活跃/keys 回流进其 `clients` 行（auth 轨记账）；自由文本
   非法）带 `{detail}`，worker 打印后 exit 2。
 - **claim 成功**返回 `{granted, chunks: [{id, current_hex, end_hex, task?}], solved}`；
   `granted=0` 表示 hub 当前没有可领的 pending chunk；`solved=true` 表示别的 worker
-  已命中 → worker 应停止。**`task` 可选**（Phase 2 pow，只在 hub 开 `[pow]` 且本
-  client 已登记时出现；缺省 = 无 pow 语义，一切照旧），形状见 §8。
+  已命中 → worker 应停止。**`task` 可选**（Phase 2 pow，只在**本 client 是 auth 轨
+  且 claim 带 `pow: true`**、hub 未紧急关闭 `[pow]`、窗口够宽时出现；缺省 = 无 pow
+  语义，一切照旧），形状见 §8。
 - **heartbeat 成功**返回 `{ok, solved}`——`solved=true` 让正在扫 chunk 的 worker
   **提前放弃本 claim**（下轮 claim 退出），不必等一轮扫完。
 - **404**：chunk 无 lease（`puzzle.py::PuzzleService._require_owner`）→ lease 已丢。
@@ -180,7 +182,8 @@ worker                                   hub (lan-hub)
    └─ pending+running == 0  → 直接退出「nothing to do」
 
 ② 领取 chunk（每个线程 ≤1 个）
-   └─ POST /api/chunks/claim ─────────→ {worker_id, count: 1, capability: rotate_keys|gpu_rotate_keys}
+   └─ POST /api/chunks/claim ─────────→ {worker_id, count: 1, capability: rotate_keys|gpu_rotate_keys,
+                                         pow: true（仅 auth 轨）}
    ←──────────────────────────────────── {granted, chunks[0], solved}
    └─ solved=true → 别的 worker 已命中，直接退出
    └─ granted=0：
@@ -310,9 +313,10 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
 
 ### 8.1 任务形状
 
-hub 开 `[pow]` 且本 client **已登记**（identity.json 在 → auth 轨）时，claim 的 grant
-项多一个 `task` 对象（`puzzle.py::PuzzleService.claim` 内组装，值来自
-`powproof.build_task`）：
+本 client 是 **auth 轨**（identity.json 在）且 claim 带 `pow: true`、hub 未紧急关闭
+`[pow]` 时，grant 项多一个 `task` 对象（`puzzle.py::PuzzleService.claim` 内组装，
+值来自 `powproof.build_task`）。**匿名昵称轨不发 `pow`**——hub 对匿名 + `pow:true`
+显式 400，`remote.rs::claim_body` 只在 auth 轨置该字段：
 
 ```json
 {"id": 12, "current_hex": "…", "end_hex": "…",
@@ -398,7 +402,30 @@ keys [1, 2, 3] → 9701f34c80e1ef7f8125e5d4d2d7e19b509e25d26e462d5308b5abb95b647
 > 默认 2⁴¹ 派窗（CPU ~500 kkeys/s 下上千小时）。worker 在挂到 task 时会打警告；**开
 > `[pow]` 就应同时开一个 rotate 预算**（窗口宽度 = 声明 capability，一个租约正好扫完）。
 
-### 8.5 回归锚点
+### 8.5 终端可视化（pow 状态）
+
+pow 进度显示在终端底部的 **live 区块**里：slot 0 = 全局状态行（ticker），其后
+**每个 worker 一行、列表固定**，内容原地重绘（ANSI 上移 + 清行），proof 命中只改
+对应 worker 行，不再逐条打日志刷屏。完整日志行（收敛 / 错误 / `[HIT]`）会先擦掉
+区块、打印、再把区块重画到下方。**非 TTY**（输出重定向）时区块不画，`term_slot`
+退化为"内容变化时打一行普通日志"，日志文件里仍有 claim / proof 轨迹。
+
+| 位置 | 输出 | 含义 |
+|---|---|---|
+| 启动 | `[remote] pow: hub_enabled=<bool> · <轨道>` | 总闸（hub 配置）与本机轨道分开说：`auth 轨 · claim 带 pow:true` / `auth 轨 · hub 总闸关闭` / `匿名轨 · 拿不到 pow 任务` / `匿名轨 · hub 总闸关闭` |
+| worker 行（idle） | `w=0     idle` / `starting …` / `stopped` / `cpu-only` | 该线程当前没在扫 / 已退出；GPU 行标签 `GPU` 或 `CUDA[i]` |
+| worker 行（扫描中） | `w=0     chunk 17373973 FWD  pow#7 2/6` 或 `… plain` | chunk 方向 + pow 任务 id + 已集齐 proof 数；`plain` = 该窗口没挂 pow 任务（窗口过窄 / 总闸关 / 匿名轨） |
+| 收敛 | `[pow] <backend> w=… task=… 收敛 ✅ verified <y−x> keys (session <N>✓ <keys> keys)` | 单窗 verified 工作量 + 本进程累计 |
+| 状态行（slot 0） | `… rate=<r>/s  pow=<verified>✓/<attempts> vkeys=<keys> proofs=<n>` | 仅在本进程领过 pow 任务时出现；`attempts` 含弃窗重领、`verified` 只数成功收敛 —— 两个数之差即损耗 |
+| 状态行（未领到任务） | `pow=hub-off` / `pow=on(notask)` / `pow=off(anon)` | 解释"为什么没有 pow"：总闸关 / 开着但窗口都太窄（`build_task` 不挂任务）/ 匿名轨接不到 |
+| 结束汇总 | `Pow : <verified>✓/<attempts> windows, <keys> verified keys, <proofs> proofs` | 仅走过 pow 时打印；与状态行同口径的会话总计 |
+
+计数都在 `Progress`（`pow_attempts` / `pow_verified` / `verified_keys` / `proofs_found`），
+本地模式恒 0，状态行只在有 pow 活动时追加该段。worker 行由 `remote.rs::worker_row`
+渲染、`puzzle.rs::term_slot(idx, text)` 原地更新；实现见 `puzzle.rs` 顶部
+"terminal output coordination"。
+
+### 8.6 回归锚点
 
 `task` 缺失（旧 hub / 匿名昵称轨 / 窗口过窄 `powproof.build_task` 返回 None）⇒
 `pow_task() == None` ⇒ 上述所有分支短路，worker 行为与未接 pow 时逐字节一致。

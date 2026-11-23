@@ -84,33 +84,131 @@ const MAX_CHUNKS: usize = 1 << 24;
 pub(crate) const ROTATION_BUDGET: u64 = 1u64 << 27;
 
 // ── terminal output coordination ─────────────────────────────────────────────
-// The heartbeat rewrites a single status line in place with `\r` (no trailing
-// newline).  Full log lines (claims, errors, final report) must first
-// terminate any open status line so they start at column 0 instead of the
-// cursor's mid-line position.  `TERM_LINE` serializes the two so a claim line
-// can't be clobbered by a status rewrite (or vice versa).
+// 终端底部有一块 **live 区块**：slot 0 = 全局状态行（ticker），slot 1.. = 每个
+// worker 一行（task / proof 进度）。区块用 ANSI 相对上移 + 逐行清空原地重绘——
+// 行数固定，不随日志滚动；任何完整日志行（`term_line`）都会先擦掉区块、打印
+// 日志、再把区块重画到下方，所以日志不会把区块顶乱。
+//
+// 非 TTY（输出重定向到文件/管道）时区块不画：`term_status` 静默丢弃，`term_slot`
+// 退化成"内容变化时打一行普通日志"——日志文件里照样能看到每次 claim / proof 进展，
+// 且不会混入光标控制序列。
 
 struct TermLine {
-    open: bool,
+    /// 已绘制到屏幕上的区块行数（光标停在区块下一行的行首）。
+    rows: usize,
+    /// 各 slot 的当前内容；空字符串 = 该行不显示。slot 0 = 全局状态行。
+    slots: Vec<String>,
 }
 
-static TERM_LINE: Mutex<TermLine> = Mutex::new(TermLine { open: false });
+static TERM_LINE: Mutex<TermLine> = Mutex::new(TermLine {
+    rows: 0,
+    slots: Vec::new(),
+});
 
-/// Rewrite the in-place status line (carriage return + ANSI clear-to-EOL).
+static STDERR_IS_TTY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn stderr_is_tty() -> bool {
+    use std::io::IsTerminal;
+    *STDERR_IS_TTY.get_or_init(|| std::io::stderr().is_terminal())
+}
+
+fn lock_term() -> std::sync::MutexGuard<'static, TermLine> {
+    TERM_LINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 擦掉已绘制的区块，光标回到区块首行行首。用相对上移 + 逐行清空，**不用换行
+/// 下移**——换行在屏幕底部会触发滚动，滚一次行数就对不上了。
+fn erase_region(g: &mut TermLine) {
+    if g.rows == 0 {
+        return;
+    }
+    eprint!("\x1b[{}A", g.rows);
+    for i in 0..g.rows {
+        eprint!("\r\x1b[K");
+        if i + 1 < g.rows {
+            eprint!("\x1b[1B");
+        }
+    }
+    if g.rows > 1 {
+        eprint!("\x1b[{}A", g.rows - 1);
+    }
+    g.rows = 0;
+}
+
+fn draw_region(g: &mut TermLine) {
+    let mut n = 0;
+    for line in &g.slots {
+        if line.is_empty() {
+            continue;
+        }
+        eprint!("\r\x1b[K{line}\n");
+        n += 1;
+    }
+    g.rows = n;
+}
+
+fn set_slot_locked(g: &mut TermLine, idx: usize, text: String) {
+    if g.slots.get(idx) == Some(&text) {
+        return;
+    }
+    if g.slots.len() <= idx {
+        g.slots.resize(idx + 1, String::new());
+    }
+    g.slots[idx] = text;
+    erase_region(g);
+    draw_region(g);
+}
+
+/// 重绘 live 区块的第 `idx` 行（0 = 全局状态行，1.. = 每 worker）。内容未变时不
+/// 重绘，避免 ticker / worker 的空转调用闪烁。
+pub(crate) fn term_slot(idx: usize, text: String) {
+    let mut g = lock_term();
+    if !stderr_is_tty() {
+        // 非 TTY：退化成行日志（内容变化才打），日志文件里仍有 claim/proof 轨迹。
+        if g.slots.get(idx) == Some(&text) {
+            return;
+        }
+        if g.slots.len() <= idx {
+            g.slots.resize(idx + 1, String::new());
+        }
+        g.slots[idx] = text.clone();
+        if !text.is_empty() {
+            eprintln!("{}", text.trim_start());
+        }
+        return;
+    }
+    set_slot_locked(&mut g, idx, text);
+}
+
+/// 清掉整个 live 区块（收尾报告前调用，避免陈旧 worker 行留在屏幕上）。
+pub(crate) fn term_clear_region() {
+    if !stderr_is_tty() {
+        return;
+    }
+    let mut g = lock_term();
+    erase_region(&mut g);
+    g.slots.clear();
+}
+
+/// 原地重绘全局状态行（ticker 用）。非 TTY 下直接丢弃。
 pub(crate) fn term_status(s: &str) {
-    let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
-    eprint!("\r{s}\x1b[K");
-    g.open = true;
+    if !stderr_is_tty() {
+        return;
+    }
+    let mut g = lock_term();
+    set_slot_locked(&mut g, 0, s.to_string());
 }
 
 /// Emit a full log line, terminating any open status line first.
 pub(crate) fn term_line(s: &str) {
-    let mut g = TERM_LINE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.open {
-        eprint!("\r\n"); // drop the cursor to column 0 of the next line
-        g.open = false;
+    let mut g = lock_term();
+    if stderr_is_tty() {
+        erase_region(&mut g);
     }
     eprintln!("{s}");
+    if stderr_is_tty() {
+        draw_region(&mut g);
+    }
 }
 
 // ── worklist JSON shape ──────────────────────────────────────────────────────
@@ -1141,6 +1239,9 @@ pub(crate) struct ScanChunkOptions<'a> {
     /// proof 命中的收集槽。**刻意与 `matches` 分开**：proof 命中不是 win，绝不进
     /// `MatchEvent`，绝不设 `hit_flag`/`stop_flag`，也就绝不流向 `report.rs`/`got.txt`。
     pub found_proofs: &'a mut Vec<ProofHit>,
+    /// proof 新命中回调，参数 = 已收集的 proof 数（去重后）。只给 remote 轨把进度
+    /// 画进终端 live 区块；本地模式 / 测试传 `None`，热路径不受影响。
+    pub on_proof: Option<&'a mut dyn FnMut(usize)>,
 }
 
 /// 本次 claim 扫到的一个 proof key。`index` 指向 claim 的 `proof_hash160s` 下标，
@@ -1190,6 +1291,7 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         on_position,
         proofs,
         found_proofs,
+        mut on_proof,
     } = opts;
 
     let reverse = dir == ScanDir::Reverse;
@@ -1329,10 +1431,21 @@ pub(crate) fn scan_chunk(opts: ScanChunkOptions<'_>) -> ScanOutcome {
         // x+1 / y−1，单趟正扫或反扫都必然经过全部 proof，不会漏。
         if has_proofs {
             if let Some(idx) = classify_proof(&h_c, proofs) {
+                // 同一次线性扫描里每个 proof 下标只可能命中一次（sink 由调用方
+                // 每 claim 新建）；仍按"新下标"记数，避免调用方复用 sink 时虚高。
+                let duplicate = found_proofs.iter().any(|h| h.index == idx);
                 found_proofs.push(ProofHit {
                     index: idx,
                     key: sk.secret_bytes(),
                 });
+                if !duplicate {
+                    progress.note_proof();
+                    // 终端 live 区块的 proof 进度由调用方原地更新（remote 轨），
+                    // 不再逐条打印日志——一个 2³¹ 宽的窗口会扫很久，行日志会刷屏。
+                    if let Some(on_proof) = on_proof.as_mut() {
+                        on_proof(found_proofs.len());
+                    }
+                }
             }
         }
 
@@ -1520,6 +1633,7 @@ fn puzzle_worker(
             abort_flag: None,
             proofs: &[],
             found_proofs: &mut local_proof_sink,
+            on_proof: None,
             start_elapsed: start,
             on_position: &mut |pos: &ResumePosition| {
                 let mut ctx = ctx.lock().unwrap_or_else(|e| e.into_inner());
@@ -2994,6 +3108,7 @@ mod tests {
             abort_flag: None,
             proofs,
             found_proofs: &mut found,
+            on_proof: None,
             start_elapsed: Instant::now(),
             on_position: &mut |_pos: &ResumePosition| {},
         });

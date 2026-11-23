@@ -45,10 +45,9 @@ use crate::clientauth;
 use crate::config::BtcCheck;
 use crate::progress::Progress;
 use crate::puzzle::{
-    self, abbr_hex, hash160_from_hex, hex_encode_key, parse_hex_key, parse_hex_key_checked,
-    scan_chunk,
-    term_line, term_status, ProofHit, PuzzleScannerBackend, ResumePosition, ScanChunkOptions,
-    ScanDir,
+    self, hash160_from_hex, hex_encode_key, parse_hex_key, parse_hex_key_checked, scan_chunk,
+    term_clear_region, term_line, term_slot, term_status, ProofHit, PuzzleScannerBackend,
+    ResumePosition, ScanChunkOptions, ScanDir,
 };
 use crate::workers::{fmt_comma, MatchEvent};
 
@@ -77,6 +76,11 @@ struct HubStatus {
     summary: HubSummary,
     #[serde(default)]
     workers: Vec<HubWorker>,
+    /// hub 的 pow 紧急总闸（`[pow] enabled`）。**只说明 hub 允许派 pow**，不代表本
+    /// client 会走 pow——那由 claim 是否带 `pow: true` 决定（旧 hub 不返回 → false）。
+    /// 终端状态行用它区分 `pow=hub-off` / `pow=on(notask)` / 匿名轨。
+    #[serde(default)]
+    pow_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +285,8 @@ fn is_lease_lost(e: &ureq::Error) -> bool {
 /// 内部状态或「对端不是 auth 时钉住的那个 hub」——带原因 exit 2（与 auth 门禁同级，
 /// 绝不静默降级）。
 fn fatal(msg: impl std::fmt::Display) -> ! {
+    // 可能从 worker 线程触发：先擦 live 区块再打错误，别让消息盖在 worker 行上。
+    term_clear_region();
     eprintln!("[remote] {msg}");
     std::process::exit(2);
 }
@@ -454,20 +460,41 @@ impl HubClient {
         })
     }
 
+    /// Claim 请求体。**pow 是客户端自选**（lan-hub `POST /api/chunks/claim` 的
+    /// `pow` 字段）：hub 只在本次 claim 带 `pow: true` 时为交出的窗口挂 `task`，
+    /// 缺省 = 普通 claim（done 直过）。这里**只在 auth 轨置 true**——匿名昵称轨
+    /// 没有已登记 pubkey，hub 对 `"pow": true` 会显式 400；不带字段才是它的普通
+    /// claim。抽成纯函数，单测才能锁住「匿名不发、auth 发」这个契约。
+    fn claim_body(worker_id: &str, count: usize, capability: u64, auth: bool) -> serde_json::Value {
+        let mut body = json!({
+            "worker_id": worker_id,
+            "count": count,
+            "capability": capability,
+        });
+        if auth {
+            body["pow"] = serde_json::Value::Bool(true);
+        }
+        body
+    }
+
     /// Claim `count` pending chunks, declaring how many keys this worker scans
     /// before it reclaims (`capability`).  The hub uses the capability to prefer
     /// handing out chunks it won't have to split mid-scan; 0 = hub default 2^41.
+    /// auth 轨同时带 `pow: true`（见 `claim_body`）：本 client 已实现 proof 比对，
+    /// 主动进 pow 模式才能恢复 verified 记账；窗口过窄/总闸关时 hub 不带 `task`，
+    /// 自动退回普通 done 轨。
     fn claim(
         &self,
         worker_id: &str,
         count: usize,
         capability: u64,
     ) -> Result<ClaimResponse, ureq::Error> {
-        let body = self.sealed_body(&json!({
-            "worker_id": worker_id,
-            "count": count,
-            "capability": capability
-        }));
+        let body = self.sealed_body(&Self::claim_body(
+            worker_id,
+            count,
+            capability,
+            self.identity.is_some(),
+        ));
         let resp = self
             .agent
             .post(&self.url("/api/chunks/claim"))
@@ -670,6 +697,7 @@ fn converge_pow(
     task: &PowTask,
     found: &[ProofHit],
     backend: &str,
+    progress: &Progress,
 ) -> bool {
     let need = task.proof_hash160s.len();
     // 按 proof 下标归位：proof 是**集合**语义（digest 升序后与命中顺序无关），
@@ -701,10 +729,17 @@ fn converge_pow(
     let hashed = hashed_proof_key(&keys);
     match client.pow(worker_id, task.task_id, chunk_id, &hashed) {
         Ok(resp) => {
+            // 会话聚合（状态行 `pow=N✓/M vkeys=…` 的数据源）：verified 计数只在
+            // 这里 +1，弃窗/重扫不记，所以 converged/attempts 才是真实收敛率。
+            progress.note_pow_verified(resp.keys_scanned);
+            let verified = progress.pow_verified.load(Ordering::Relaxed);
+            let vkeys = progress.verified_keys.load(Ordering::Relaxed);
             term_line(&format!(
-                "[pow] {backend} w={worker_id} chunk={chunk_id} task={} 收敛 ✅ verified {} keys",
+                "[pow] {backend} w={worker_id} chunk={chunk_id} task={} 收敛 ✅ verified {} keys \
+                 (session {verified}✓ {} keys)",
                 task.task_id,
                 fmt_comma(resp.keys_scanned),
+                fmt_comma(vkeys),
             ));
             !resp.solved
         }
@@ -769,7 +804,7 @@ pub fn run(
     let mut client = HubClient::new(remote_url);
 
     // ── 1. connect to the hub and read the puzzle meta ─────────────────────
-    let (target_h160, puzzle_number, summary) = connect(&client);
+    let (target_h160, puzzle_number, summary, pow_enabled) = connect(&client);
 
     // ── 1b. client-auth gate（identity.json 在才走；缺 → 明文匿名昵称运行）────
     // claim 之前先声明身份：明文 POST 登记 + 解开 hub 的加密信封拿 hub_pubkey
@@ -784,6 +819,15 @@ pub fn run(
     // 无 identity.json 则 worker_id = 昵称，走匿名轨（零账本，旧行为不变）。
     let worker_id: String = maybe_authenticate(&mut client, identity_path, &nickname, hub_pin)
         .unwrap_or_else(|| nickname);
+    // pow 一行摘要：总闸是 hub 侧配置，走不走 pow 是本机轨道决定的——把两者分开
+    // 说出来，操作者才能分清"hub 开了但匿名轨接不到"与"auth 轨 + 总闸关"。
+    let pow_track = match (client.identity.is_some(), pow_enabled) {
+        (true, true) => "auth 轨 · claim 带 pow:true",
+        (true, false) => "auth 轨 · hub 总闸关闭",
+        (false, true) => "匿名轨 · 拿不到 pow 任务",
+        (false, false) => "匿名轨 · hub 总闸关闭",
+    };
+    term_line(&format!("[remote] pow: hub_enabled={pow_enabled} · {pow_track}"));
     let client = Arc::new(client);
 
     if summary.pending + summary.running == 0 {
@@ -813,6 +857,19 @@ pub fn run(
         0
     };
     let progress = Arc::new(Progress::new((n_workers + gpu_worker_count) as u64));
+    // live 区块的 GPU 行标签——与下面 spawn 时传进 entry 的 label 必须一致，
+    // CUDA 按设备序（CUDA[0]、CUDA[1]…）。
+    let gpu_labels: Vec<String> = if gpu_available {
+        match framework {
+            crate::framework::GpuFramework::WebGpu => vec!["GPU".to_string()],
+            crate::framework::GpuFramework::Cuda => {
+                (0..gpu_worker_count).map(|i| format!("CUDA[{i}]")).collect()
+            }
+            crate::framework::GpuFramework::Auto => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     let matches = Arc::new(Mutex::new(Vec::<MatchEvent>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     // 命中即停：hit_flag 记录首个命中者（赢家负责打印 [HIT]）；stop_flag 由
@@ -838,6 +895,14 @@ pub fn run(
     .expect("[remote] failed to install SIGINT handler");
 
     // ── 3. worker threads + status ticker ──────────────────────────────────
+    // live 区块：slot 0 = 全局状态行（ticker），随后每个 worker 一行。列表从启动
+    // 就固定（workers 列表保持不动），之后只原地改内容。
+    for wid in 0..n_workers {
+        term_slot(1 + wid, worker_idle_row(&format!("w={wid}"), "starting …"));
+    }
+    for (i, label) in gpu_labels.iter().enumerate() {
+        term_slot(1 + n_workers + i, worker_idle_row(label, "starting …"));
+    }
     let start = Instant::now();
     let mut handles = Vec::with_capacity(n_workers);
     for wid in 0..n_workers {
@@ -861,6 +926,7 @@ pub fn run(
                 rotate_keys,
                 start,
                 check,
+                1 + wid,
             )
         }));
     }
@@ -896,6 +962,7 @@ pub fn run(
                 let matches = matches.clone();
                 let stop_flag = stop_flag.clone();
                 let hit_flag = hit_flag.clone();
+                let gpu_label = gpu_labels[0].clone();
                 gpu_handles.push(std::thread::spawn(move || {
                     remote_gpu_worker_entry(
                         &client,
@@ -911,6 +978,8 @@ pub fn run(
                         framework,
                         0, // WebGPU: single device
                         check,
+                        1 + n_workers,
+                        gpu_label,
                     )
                 }));
             }
@@ -926,6 +995,7 @@ pub fn run(
                         let matches = matches.clone();
                         let stop_flag = stop_flag.clone();
                         let hit_flag = hit_flag.clone();
+                        let gpu_label = gpu_labels[dev_idx as usize].clone();
                         gpu_handles.push(std::thread::spawn(move || {
                             remote_gpu_worker_entry(
                                 &client,
@@ -941,6 +1011,8 @@ pub fn run(
                                 framework,
                                 dev_idx,
                                 check,
+                                1 + n_workers + dev_idx as usize,
+                                gpu_label,
                             )
                         }));
                     }
@@ -973,6 +1045,9 @@ pub fn run(
     // running.
     stop_flag.store(true, Ordering::SeqCst);
     let _ = ticker_handle.join();
+    // 收尾报告直接 eprintln（不经过 term_line），先把 live 区块擦掉，免得陈旧的
+    // worker 行留在报告上方。
+    term_clear_region();
 
     let final_matches = {
         match Arc::try_unwrap(matches) {
@@ -998,6 +1073,17 @@ pub fn run(
         start.elapsed().as_secs_f64(),
         start.elapsed().as_secs_f64() / 60.0,
     );
+    // pow 会话汇总：只在真的走过 pow 时打印（本地/匿名/旧 hub 运行不出现）。
+    let pow_attempts = progress.pow_attempts.load(Ordering::Relaxed);
+    if pow_attempts > 0 {
+        eprintln!(
+            "  Pow        : {}✓/{} windows, {} verified keys, {} proofs",
+            progress.pow_verified.load(Ordering::Relaxed),
+            pow_attempts,
+            fmt_comma(progress.verified_keys.load(Ordering::Relaxed)),
+            progress.proofs_found.load(Ordering::Relaxed),
+        );
+    }
     if final_matches.is_empty() {
         eprintln!("  Match      : none");
     } else {
@@ -1027,7 +1113,7 @@ pub fn run(
 /// Fetch `/api/status` once at startup (retrying until the hub is reachable,
 /// up to ~90s), then decode + verify the target hash160 — the same startup
 /// check local puzzle mode performs against its worklist.
-fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
+fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary, bool) {
     let deadline = Instant::now() + Duration::from_secs(90);
     let status = loop {
         match client.status() {
@@ -1084,7 +1170,7 @@ fn connect(client: &HubClient) -> ([u8; 20], Option<u32>, HubSummary) {
         status.summary.running,
         status.summary.finished,
     ));
-    (target_h160, Some(meta.puzzle_number), status.summary)
+    (target_h160, Some(meta.puzzle_number), status.summary, status.pow_enabled)
 }
 
 /// 启动 client-auth（`POST /api/auth`，docs/remote-protocol.md 时序 ①a）——**只在
@@ -1183,6 +1269,39 @@ fn maybe_authenticate(
     Some(own_pubkey)
 }
 
+/// 状态行尾部的 pow 段：让操作者一眼看出 pow 是真在跑、还是根本没参与。
+///
+/// - 本进程领过 pow 任务 → `pow=<verified>✓/<attempts> vkeys=<keys> proofs=<n>`。
+///   attempts 含弃窗重领，verified 只数成功收敛的窗口 → 两个数字的差就是损耗。
+/// - 还没领过任务时，用 hub 的 `pow_enabled` 总闸 + 本机轨道解释原因：匿名昵称轨
+///   永远拿不到 task（claim 不带 pow，hub 对匿名 + pow 显式 400），所以给它
+///   `pow=off(anon)` 而不是静默留白；auth 轨总闸关 → `pow=hub-off`，开着却一直
+///   没任务 → `pow=on(notask)`（多半是窗口都太窄，hub 不挂 task）。
+fn pow_status_segment(progress: &Progress, hub_pow_enabled: bool, auth: bool) -> String {
+    let attempts = progress.pow_attempts.load(Ordering::Relaxed);
+    if attempts > 0 {
+        return format!(
+            "  pow={}✓/{} vkeys={} proofs={}",
+            progress.pow_verified.load(Ordering::Relaxed),
+            attempts,
+            fmt_comma(progress.verified_keys.load(Ordering::Relaxed)),
+            progress.proofs_found.load(Ordering::Relaxed),
+        );
+    }
+    if !auth {
+        return if hub_pow_enabled {
+            "  pow=off(anon)".to_string()
+        } else {
+            String::new()
+        };
+    }
+    if hub_pow_enabled {
+        "  pow=on(notask)".to_string()
+    } else {
+        "  pow=hub-off".to_string()
+    }
+}
+
 /// Background status line: every `heartbeat_secs`, query the hub and rewrite
 /// the in-place line with the global view plus this worker's chunk progress.
 fn ticker(
@@ -1248,7 +1367,7 @@ fn ticker(
                     })
                     .unwrap_or_else(|| "no lease".to_string());
                 format!(
-                    "[remote] pend={} running={} done={} ({:.1}%) {}  keys={} rate={}/s",
+                    "[remote] pend={} running={} done={} ({:.1}%) {}  keys={} rate={}/s{}",
                     sum.pending,
                     sum.running,
                     sum.finished,
@@ -1256,11 +1375,58 @@ fn ticker(
                     mine,
                     fmt_comma(total),
                     fmt_comma(rate.round() as u64),
+                    pow_status_segment(progress, s.pow_enabled, client.identity.is_some()),
                 )
             }
             Err(e) => format!("[remote] hub status unavailable ({e})"),
         };
         term_status(&format!("  {line}"));
+    }
+}
+
+// ── live 区块的 worker 行 ────────────────────────────────────────────────────
+
+/// 一个 worker 在 live 区块里的行文本（`term_slot` 原地重绘）。
+/// 格式：`  w=0     chunk 42 FWD  pow#7 3/6` / `… plain`。
+fn worker_row(
+    label: &str,
+    chunk_id: u32,
+    dir: Option<ScanDir>,
+    task: Option<&PowTask>,
+    proofs: usize,
+) -> String {
+    let mut s = format!("  {label:<8}chunk {chunk_id}");
+    match dir {
+        Some(ScanDir::Forward) => s.push_str(" FWD"),
+        Some(ScanDir::Reverse) => s.push_str(" REV"),
+        None => {}
+    }
+    match task {
+        Some(t) => s.push_str(&format!(
+            "  pow#{} {}/{}",
+            t.task_id,
+            proofs,
+            t.proof_hash160s.len()
+        )),
+        None => s.push_str("  plain"),
+    }
+    s
+}
+
+fn worker_idle_row(label: &str, state: &str) -> String {
+    format!("  {label:<8}{state}")
+}
+
+/// worker 线程退出时把它的行改成 `stopped`——任意 return 路径都覆盖，不必在每个
+/// 分支重复写。行本身不会消失（列表保持固定）。
+struct RowGuard {
+    slot: usize,
+    label: String,
+}
+
+impl Drop for RowGuard {
+    fn drop(&mut self) {
+        term_slot(self.slot, worker_idle_row(&self.label, "stopped"));
     }
 }
 
@@ -1284,7 +1450,14 @@ fn remote_worker(
     rotate_keys: Option<u64>,
     start: Instant,
     check: BtcCheck,
+    slot: usize,
 ) {
+    // live 区块里本 worker 的固定行：label 不变，内容随 claim / proof 原地更新。
+    let label = format!("w={wid}");
+    let _row_guard = RowGuard {
+        slot,
+        label: label.clone(),
+    };
     // Throttle for claim-failure logging so a hub outage prints once / 30s,
     // not once / 2s.
     let mut last_fail_log = Instant::now();
@@ -1293,6 +1466,8 @@ fn remote_worker(
         if stop_flag.load(Ordering::Relaxed) {
             return;
         }
+        // 没在扫时保持 idle（文本不变则 term_slot 不重绘）。
+        term_slot(slot, worker_idle_row(&label, "idle"));
 
         // ── claim one chunk ───────────────────────────────────────────────
         // Claim capability = how many keys this worker scans before reclaiming
@@ -1343,6 +1518,9 @@ fn remote_worker(
         // 项下发。缺省 `None` ⇒ 下面的每条分支都退回今日的老路（旧 hub / 匿名
         // 昵称轨 / 窗口过窄都不带 `task`），行为逐字节一致（回归锚点）。
         let task = chunk.pow_task();
+        if task.is_some() {
+            progress.note_pow_claim();
+        }
         let proofs: Vec<[u8; 20]> = task
             .as_ref()
             .map(|t| t.proof_hash160s.clone())
@@ -1379,12 +1557,20 @@ fn remote_worker(
         } else {
             ScanDir::Forward
         };
-        term_line(&format!(
-            "[claim] w={wid} chunk={chunk_id} range={}..{} dir={}",
-            abbr_hex(&start_bytes),
-            abbr_hex(&end_bytes),
-            if reverse { "REV" } else { "FWD" },
-        ));
+        // live 区块里本 worker 的行切到"正在扫这个 chunk"。range 由 chunk id
+        // 在 hub UI 可查，这里只留方向和 pow 进度，避免行过长。
+        term_slot(
+            slot,
+            worker_row(&label, chunk_id, Some(dir), task.as_ref(), 0),
+        );
+
+        // proof 命中时把同一行原地更新成 `pow#<id> n/N`（不再逐条打日志）。
+        let mut on_proof = |found: usize| {
+            term_slot(
+                slot,
+                worker_row(&label, chunk_id, Some(dir), task.as_ref(), found),
+            );
+        };
 
         // ── scan with the shared core ─────────────────────────────────────
         // The on_position closure sends a heartbeat every HEARTBEAT_INTERVAL
@@ -1425,6 +1611,7 @@ fn remote_worker(
             abort_flag: Some(&abort_flag),
             proofs: &proofs,
             found_proofs: &mut found_proofs,
+            on_proof: Some(&mut on_proof),
             start_elapsed: start,
             on_position: &mut |pos: &ResumePosition| {
                 if lease_lost || last_hb.elapsed() < HEARTBEAT_INTERVAL {
@@ -1514,7 +1701,15 @@ fn remote_worker(
                 // 走全窗 digest 提交；返回 false ⇒ 整个 worker 停机（puzzle 已
                 // solved），true ⇒ 继续 claim 下一块。
                 Some(t) => {
-                    if !converge_pow(client, worker_id, chunk_id, t, &found_proofs, "cpu") {
+                    if !converge_pow(
+                        client,
+                        worker_id,
+                        chunk_id,
+                        t,
+                        &found_proofs,
+                        "cpu",
+                        progress,
+                    ) {
                         return;
                     }
                 }
@@ -1593,6 +1788,8 @@ fn remote_gpu_worker_entry(
     framework: crate::framework::GpuFramework,
     device_index: u32,
     check: BtcCheck,
+    slot: usize,
+    label: String,
 ) {
     // Only the CUDA arm consumes `device_index` (WebGPU always uses device 0);
     // silence the unused-param warning in a non-CUDA build.
@@ -1605,6 +1802,7 @@ fn remote_gpu_worker_entry(
                     term_line(&format!(
                         "[remote] GPU unavailable ({e}) — running CPU-only."
                     ));
+                    term_slot(slot, worker_idle_row(&label, "cpu-only"));
                     return;
                 }
             };
@@ -1619,6 +1817,7 @@ fn remote_gpu_worker_entry(
                     term_line(&format!(
                         "[remote] GpuScanner::new failed ({e}) — running CPU-only."
                     ));
+                    term_slot(slot, worker_idle_row(&label, "cpu-only"));
                     return;
                 }
             };
@@ -1639,8 +1838,9 @@ fn remote_gpu_worker_entry(
                 hit_flag,
                 rotate_keys,
                 start,
-                "GPU",
+                &label,
                 check,
+                slot,
             );
         }
         crate::framework::GpuFramework::Cuda => {
@@ -1654,6 +1854,7 @@ fn remote_gpu_worker_entry(
                             term_line(&format!(
                                 "[remote] CUDA device #{device_index} init failed ({e}) — running CPU-only on this card."
                             ));
+                            term_slot(slot, worker_idle_row(&label, "cpu-only"));
                             return;
                         }
                     };
@@ -1666,9 +1867,6 @@ fn remote_gpu_worker_entry(
                 scanner.num_candidates = 1;
                 scanner.check_compressed_pk = check.compressed as u32;
                 scanner.check_uncompressed_pk = check.uncompressed as u32;
-                // Per-card label so [claim] / [HIT] lines identify the GPU.
-                // Compute before `scanner` is moved into the worker.
-                let backend_label = format!("CUDA[{}]", scanner.device_index());
                 remote_gpu_worker(
                     client,
                     worker_id,
@@ -1681,13 +1879,15 @@ fn remote_gpu_worker_entry(
                     hit_flag,
                     rotate_keys,
                     start,
-                    &backend_label,
+                    &label,
                     check,
+                    slot,
                 );
             }
             #[cfg(not(feature = "cuda"))]
             {
                 term_line("[remote] CUDA feature not compiled — running CPU-only.");
+                term_slot(slot, worker_idle_row(&label, "cpu-only"));
             }
         }
         crate::framework::GpuFramework::Auto => {
@@ -1725,7 +1925,13 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
     start: Instant,
     backend_label: &str,
     check: BtcCheck,
+    slot: usize,
 ) {
+    // live 区块里本 GPU worker 的固定行。
+    let _row_guard = RowGuard {
+        slot,
+        label: backend_label.to_string(),
+    };
     // Per-dispatch coverage (keys) once the scanner is configured.  Constant
     // once calibrated: `steps_per_call` defaults to 1 at construction.
     let dispatch_keys = crate::gpu::NUM_GPU_THREADS as u64
@@ -1738,6 +1944,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         if stop_flag.load(Ordering::Relaxed) {
             return;
         }
+        term_slot(slot, worker_idle_row(backend_label, "idle"));
 
         // ── claim one chunk ───────────────────────────────────────────────
         // Claim capability = how many keys this worker scans before reclaiming
@@ -1780,6 +1987,9 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
 
         // ── pow 任务（Phase 2）：与 CPU 路径同款装配 ────────────────────────
         let task = chunk.pow_task();
+        if task.is_some() {
+            progress.note_pow_claim();
+        }
         let proofs: Vec<[u8; 20]> = task
             .as_ref()
             .map(|t| t.proof_hash160s.clone())
@@ -1787,11 +1997,17 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
         let mut found_proofs: Vec<ProofHit> = Vec::new();
         let eff_rotate = if task.is_some() { None } else { rotate_keys };
 
-        term_line(&format!(
-            "[claim] w={backend_label} chunk={chunk_id} range={}..{}",
-            abbr_hex(&start_bytes),
-            abbr_hex(&end_bytes),
-        ));
+        // live 区块：本 GPU worker 的行切到该 chunk（GPU 恒正向扫描）。
+        term_slot(
+            slot,
+            worker_row(
+                backend_label,
+                chunk_id,
+                Some(ScanDir::Forward),
+                task.as_ref(),
+                0,
+            ),
+        );
 
         // ── per-chunk candidate table + check switches ─────────────────────
         // 槽 0 = target，槽 1..=N = proof hash160。**proofs 非空时强制开压缩
@@ -1947,7 +2163,9 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                     if !batch_matches.is_empty() {
                         // Collect CPU-verified matches inside the lock, then
                         // drop the lock before printing ([HIT] is never emitted
-                        // under it).
+                        // under it).  proof 命中同理：锁内只写 sink，终端提示
+                        // 留到锁外逐条打印。
+                        let proof_before = found_proofs.len();
                         let verified: Vec<MatchEvent> = {
                             let mut g = matches.lock().unwrap_or_else(|e| e.into_inner());
                             let mut out = Vec::new();
@@ -1989,6 +2207,23 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                             }
                             out
                         };
+                        // proof 命中把本 worker 的行原地更新（不再逐条打日志）。
+                        let new_proofs = found_proofs.len() - proof_before;
+                        if new_proofs > 0 {
+                            for _ in 0..new_proofs {
+                                progress.note_proof();
+                            }
+                            term_slot(
+                                slot,
+                                worker_row(
+                                    backend_label,
+                                    chunk_id,
+                                    Some(ScanDir::Forward),
+                                    task.as_ref(),
+                                    found_proofs.len(),
+                                ),
+                            );
+                        }
                         if let Some(first) = verified.first() {
                             hit = Some(first.private_key);
                             // 命中即停：首个命中的 worker 立即打印（含私钥）并通知
@@ -2083,6 +2318,7 @@ fn remote_gpu_worker<S: PuzzleScannerBackend>(
                         t,
                         &found_proofs,
                         backend_label,
+                        progress,
                     ) {
                         return;
                     }
@@ -2197,6 +2433,86 @@ mod tests {
         concat.extend_from_slice(&be(0x100));
         use sha2::{Digest, Sha256};
         assert_eq!(hashed_proof_key(&[be(0x100), be(0x0FF)]), hex::encode(Sha256::digest(&concat)));
+    }
+
+    /// **客户端自选 pow**：auth 轨的 claim 必须带 `pow: true`（否则 hub 新契约下
+    /// 不挂 task，verified 记账静默消失）；匿名昵称轨**不能**带——hub 对匿名 + pow
+    /// 回 400，带了就等于把明文匿名客户端打成无法领取。
+    #[test]
+    fn claim_body_requests_pow_only_on_auth_track() {
+        let auth = HubClient::claim_body("84bf", 1, 1 << 20, true);
+        assert_eq!(auth["pow"], json!(true));
+        assert_eq!(auth["worker_id"], "84bf");
+        assert_eq!(auth["count"], 1);
+        assert_eq!(auth["capability"], 1 << 20);
+
+        let anon = HubClient::claim_body("pc-1", 1, 1 << 20, false);
+        assert!(
+            anon.get("pow").is_none(),
+            "匿名轨不能带 pow（hub 会 400）：{anon}"
+        );
+        assert_eq!(anon["worker_id"], "pc-1");
+    }
+
+    // ── 终端可视化（pow 状态）─────────────────────────────────────────────
+
+    /// live 区块的 worker 行：chunk + 方向 + pow 任务进度；无任务标 `plain`。
+    #[test]
+    fn worker_row_shows_task_and_proof_progress() {
+        let task = PowTask {
+            task_id: 7,
+            proof_hash160s: vec![h160(1), h160(2), h160(3)],
+        };
+        assert_eq!(
+            worker_row("w=0", 42, Some(ScanDir::Forward), Some(&task), 1),
+            "  w=0     chunk 42 FWD  pow#7 1/3"
+        );
+        assert_eq!(
+            worker_row("w=1", 43, Some(ScanDir::Reverse), None, 0),
+            "  w=1     chunk 43 REV  plain"
+        );
+        assert_eq!(worker_idle_row("GPU", "idle"), "  GPU     idle");
+    }
+
+    /// 状态行 pow 段：没领过任务时解释"为什么没有"（匿名轨 / 总闸关 / 还没派到），
+    /// 领过之后显示会话收敛率与 verified 工作量。
+    #[test]
+    fn pow_status_segment_reports_track_then_session() {
+        let p = Progress::new(0);
+        assert_eq!(pow_status_segment(&p, true, false), "  pow=off(anon)");
+        assert_eq!(pow_status_segment(&p, false, false), "");
+        assert_eq!(pow_status_segment(&p, true, true), "  pow=on(notask)");
+        assert_eq!(pow_status_segment(&p, false, true), "  pow=hub-off");
+
+        p.note_pow_claim();
+        p.note_pow_claim(); // 弃窗重领也算一次 attempt
+        p.note_pow_verified(1_000);
+        p.note_proof();
+        assert_eq!(
+            pow_status_segment(&p, true, true),
+            "  pow=1✓/2 vkeys=1,000 proofs=1"
+        );
+    }
+
+    /// `pow_enabled` 是 hub 新增的顶层键：旧 hub 不返回 → false（不能因此让
+    /// 反序列化失败，否则整个 status ticker 每轮都报 unavailable）。
+    #[test]
+    fn hub_status_reads_pow_enabled_with_old_hub_fallback() {
+        let new: HubStatus = serde_json::from_value(json!({
+            "meta": {"puzzle_number": 71, "target": "1abc", "solved": false},
+            "summary": {"pending": 3, "running": 1, "finished": 2},
+            "pow_enabled": true,
+        }))
+        .expect("new hub status");
+        assert!(new.pow_enabled);
+        assert_eq!(new.summary.pending, 3);
+
+        let old: HubStatus = serde_json::from_value(json!({
+            "meta": {"puzzle_number": 71, "target": "1abc"},
+            "summary": {"pending": 0, "running": 0},
+        }))
+        .expect("old hub status");
+        assert!(!old.pow_enabled);
     }
 
     // ── claim 响应反序列化 ─────────────────────────────────────────────────
