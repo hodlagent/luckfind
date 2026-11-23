@@ -195,6 +195,10 @@ worker                                   hub (lan-hub)
       POST /api/chunks/{id}/heartbeat → {worker_id, current|end, keys, rate}
          · forward 发 current_hex，reverse 发 end_hex —— 两字段各承载完整续扫位置
          · keys/rate = 整机累计 keys + 该窗口速率（hub 内存缓存）
+   └─ pow 窗口每命中一个 proof 立即再发一次（不等 30s，顺手续租）：
+      POST /api/chunks/{id}/heartbeat → {worker_id, keys, rate, proofs_done: k}
+         · 纯 UI 遥测：hub 只缓存给 /api/status 显示 k/N，**不授信、不记账**
+         · 非 pow chunk 没有 proof，永远不会带这个字段
    └─ 响应 solved=true → 别的 worker 已命中，**提前放弃本 claim**（下轮 claim 退出）
    └─ 心跳 404/409 → lease 已丢，放弃本 chunk 直接重新 claim（绝不崩溃）
 
@@ -299,7 +303,9 @@ claim     心跳     心跳     心跳        hub 判过期       下次回收�
    的证据，**不停机、不进 `matches`、不打印 `[HIT]`、不设 `hit_flag`/`stop_flag`**
    （那两个标志全队共享，误设会让整支机队停下），只记进独立的 `found_proofs` sink，
    然后接着扫。命中（真实 target）始终优先：同一个 key 又中 target 又是 proof 时走
-   `matched` → `/api/win`。
+   `matched` → `/api/win`。每记下一个新 proof 还会立刻发一次带 `proofs_done` 的
+   heartbeat——只用于 hub UI 的 `k/N` 显示，**不产生部分 credit**；窗口能否完成仍只看
+   集齐全部 proof 后的全窗 digest。
 7. **pow 窗口的 `done` 恒被 409 挡**。冻结窗口只能靠 `/api/pow` 收敛；`rotate` 在
    pow 窗口上被强制关闭（`eff_rotate = None`），因为中途 park 等于弃掉整窗、无部分
    credit。
